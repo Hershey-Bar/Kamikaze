@@ -560,5 +560,47 @@ def get_guidance() -> dict:
     }
 
 
+@mcp.tool()
+def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant: str = "", package_type: str = "",
+                     container_volume: str = "", frames_per_view: int = 6, pause_s: float = 4.0) -> dict:
+    """Guided 4-angle enrollment (front, back, side, detail) of the object in front of the camera.
+
+    Starts a session with the structured metadata, then captures `frames_per_view` frames per view, waiting
+    `pause_s` seconds before each so the object can be rotated. Returns the final enrollment status.
+    """
+    body = {"raw_name": raw_name, "category": category, "brand": brand, "variant": variant,
+            "package_type": package_type, "container_volume": container_volume, "frames_per_view": frames_per_view}
+    status = _receiver_call("POST", "/api/enroll/start", {k: v for k, v in body.items() if v not in ("", None)}, timeout=10.0)
+    if not status.get("ok"):
+        return status
+    for view in ("front", "back", "side", "detail"):
+        time.sleep(max(0.0, pause_s))
+        status = _receiver_call("POST", "/api/enroll/capture", {"view": view, "wait": True, "timeout": 30}, timeout=45.0)
+        if not status.get("ok"):
+            _receiver_call("POST", "/api/enroll/cancel", {}, timeout=5.0)
+            return status
+    return _receiver_call("GET", "/api/enroll/status", timeout=5.0)
+
+
+@mcp.tool()
+def fetch_cad_asset(raw_name: str, category: str = "", brand: str = "", variant: str = "", force: bool = False) -> dict:
+    """Find, download and cache a 3D GLB model for a product (Sketchfab -> Poly Pizza -> GitHub -> procedural fallback).
+
+    Returns {"title", "model_url", "thumbnail_url", "status", "source", "glb_url"} where glb_url is served from /static/models.
+    """
+    import cad_retriever
+    import taxonomy
+
+    meta = taxonomy.parse_metadata({k: v for k, v in {"raw_name": raw_name, "category": category, "brand": brand,
+                                                       "variant": variant}.items() if v})
+    return cad_retriever.retrieve(taxonomy.label_from_metadata(meta), meta, force=force)
+
+
+@mcp.tool()
+def get_pose_telemetry() -> dict:
+    """Latest estimated physical pose {"pitch", "yaw", "roll"} (degrees) of the object held in front of the camera."""
+    return _receiver_call("GET", "/api/pose", timeout=5.0)
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
