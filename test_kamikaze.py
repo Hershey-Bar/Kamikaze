@@ -69,7 +69,7 @@ class RpcTests(unittest.TestCase):
             self.assertEqual(sent[0][2:], ["set_pixels", [0, 255, 0, 50, 8]])
             result = mcp_server.trigger_guidance("test", "Rotate")
             self.assertEqual(result, {"action": "reorient", "message": "Rotate"})
-            self.assertEqual(sent[-1][3], [255, 150, 0, 40, 4])
+            self.assertEqual(sent[-1][3], [255, 120, 0, 40, 4])
 
         dead = mcp_server._RouterClient("/nonexistent/sock")
         with mock.patch.object(mcp_server, "_router", dead):

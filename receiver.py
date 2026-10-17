@@ -58,6 +58,8 @@ from mcp_server import (
 )
 
 log = logging.getLogger("kamikaze.receiver")
+for _noisy in ("httpx", "httpx2", "httpcore", "httpcore2", "huggingface_hub"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 CONF_HIGH = float(os.environ.get("KAMIKAZE_CONF_HIGH", "0.75"))
 CONFIRM_FRAMES = int(os.environ.get("KAMIKAZE_CONFIRM", "3"))
@@ -68,6 +70,11 @@ VLM_TTL = float(os.environ.get("KAMIKAZE_VLM_TTL", "4.0"))
 VLM_TIMEOUT = float(os.environ.get("KAMIKAZE_VLM_TIMEOUT", "20"))
 VLM_ALWAYS = os.environ.get("KAMIKAZE_VLM_ALWAYS", "0") == "1"
 MAX_FRAME_BYTES = 5 * 1024 * 1024
+CLIP_MODEL_ID = os.environ.get("KAMIKAZE_CLIP_MODEL", "openai/clip-vit-base-patch16")
+CLIP_ENABLED = os.environ.get("KAMIKAZE_CLIP", "1") == "1"
+CLIP_THREADS = int(os.environ.get("KAMIKAZE_CLIP_THREADS", "8"))
+CLIP_QUANT = os.environ.get("KAMIKAZE_CLIP_QUANT", "1") != "0"
+CLIP_FAMILY_MIN = float(os.environ.get("KAMIKAZE_CLIP_FAMILY_MIN", "0.4"))
 
 GUIDANCE_PROMPTS = {
     "phone": "Rotate 90° to show the camera island or branding",
@@ -287,6 +294,128 @@ class VlmWorker:
 
 
 # --------------------------------------------------------------------------------------
+# Local neural classifier: CLIP zero-shot over the constrained target domain (CPU torch)
+# --------------------------------------------------------------------------------------
+
+CAN_PROMPTS = {
+    "Coca-Cola Classic": ["a red Coca-Cola soda can", "a can of classic Coca-Cola with red label"],
+    "Diet Coke": ["a silver Diet Coke soda can", "a can of Diet Coke with silver and red label"],
+    "Coke Zero": ["a black Coke Zero soda can", "a can of Coca-Cola Zero Sugar, black with red"],
+    "Pepsi": ["a blue Pepsi soda can", "a can of Pepsi cola with blue label and globe logo"],
+    "Sprite": ["a green Sprite soda can", "a can of Sprite lemon-lime soda, green"],
+}
+PHONE_TEMPLATES = (
+    "a photo of an {} smartphone",
+    "the back of an {} showing its camera module",
+    "a person holding an {}",
+)
+NEGATIVE_PROMPTS = (
+    "a photo of a person's face", "a photo of an empty room", "a photo of a hand", "a photo of a desk",
+    "a photo of a laptop computer", "a photo of a keyboard", "a photo of a wall", "a photo of a water bottle",
+    "a photo of a coffee mug", "a blurry photo", "a photo of a tablet", "a photo of a TV remote control",
+    "a photo of a wallet", "a photo of a pen", "a photo of a person sitting", "a dark photo",
+)
+CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+
+
+class ClipClassifier:
+    """Zero-shot image/text matching against every target label plus background negatives."""
+
+    def __init__(self, model_id: str, threads: int) -> None:
+        import torch
+        from transformers import AutoTokenizer, CLIPModel
+
+        torch.set_num_threads(threads)
+        self.torch = torch
+        self.model = CLIPModel.from_pretrained(model_id).eval()
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.size = int(self.model.config.vision_config.image_size)
+        self.quantized = False
+
+        self.labels: list[str | None] = []
+        prompt_groups: list[list[str]] = []
+        for label in PHONE_LABELS:
+            self.labels.append(label)
+            prompt_groups.append([t.format(label) for t in PHONE_TEMPLATES])
+        for label in CAN_LABELS:
+            self.labels.append(label)
+            prompt_groups.append(CAN_PROMPTS[label])
+        for neg in NEGATIVE_PROMPTS:
+            self.labels.append(None)
+            prompt_groups.append([neg])
+
+        rows = []
+        with torch.inference_mode():
+            for prompts in prompt_groups:
+                tokens = tokenizer(prompts, padding="max_length", max_length=77, truncation=True, return_tensors="pt")
+                feats = self._as_tensor(self.model.get_text_features(**tokens))
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                mean = feats.mean(dim=0)
+                rows.append(mean / mean.norm())
+        self.text = torch.stack(rows)
+        self.scale = float(self.model.logit_scale.detach().exp())
+        self.n_phone = len(PHONE_LABELS)
+        self.n_target = len(TARGET_LABELS)
+        # Variants of one generation (Base/Pro/Pro Max, Base/Plus/Ultra) are scored together as a "series".
+        self.series = [re.sub(r" (Pro Max|Pro|Plus|Ultra)$", "", label) for label in PHONE_LABELS]
+        if CLIP_QUANT:
+            # The vision tower is the per-frame cost; int8 dynamic quantization is ~3x faster on the Arm CPU.
+            self.model.vision_model = torch.ao.quantization.quantize_dynamic(
+                self.model.vision_model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+            self.quantized = True
+
+    @staticmethod
+    def _as_tensor(out):
+        return out if hasattr(out, "norm") else out.pooler_output
+
+    def _preprocess(self, image: Image.Image):
+        w, h = image.size
+        scale = self.size / min(w, h)
+        image = image.resize((max(self.size, round(w * scale)), max(self.size, round(h * scale))), Image.BICUBIC)
+        w, h = image.size
+        left, top = (w - self.size) // 2, (h - self.size) // 2
+        arr = np.asarray(image.crop((left, top, left + self.size, top + self.size)), dtype=np.float32) / 255.0
+        arr = (arr - CLIP_MEAN) / CLIP_STD
+        return self.torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0)
+
+    def probabilities(self, image: Image.Image) -> np.ndarray:
+        torch = self.torch
+        with torch.inference_mode():
+            feats = self._as_tensor(self.model.get_image_features(pixel_values=self._preprocess(image)))
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            return torch.softmax(self.scale * feats @ self.text.T, dim=-1)[0].numpy()
+
+    def classify(self, image: Image.Image) -> Detection:
+        probs = self.probabilities(image)
+        target = probs[: self.n_target]
+        phone_p = float(target[: self.n_phone].sum())
+        can_p = float(target[self.n_phone :].sum())
+        category = "phone" if phone_p >= can_p else "can"
+        family_p = max(phone_p, can_p)
+        if family_p < CLIP_FAMILY_MIN:
+            return Detection(None, None, round(float(target.max()), 3), "clip", f"background p={1 - family_p:.2f}")
+        if category == "can":
+            best = self.n_phone + int(np.argmax(target[self.n_phone :]))
+            return Detection(
+                TARGET_LABELS[best], category, round(float(target[best]), 3), "clip",
+                f"can family p={family_p:.2f}",
+            )
+        series_p: dict[str, float] = {}
+        for name, p in zip(self.series, target[: self.n_phone]):
+            series_p[name] = series_p.get(name, 0.0) + float(p)
+        top_series = max(series_p, key=series_p.get)
+        best = max(
+            (i for i, name in enumerate(self.series) if name == top_series), key=lambda i: target[i]
+        )
+        return Detection(
+            TARGET_LABELS[best], category, round(series_p[top_series], 3), "clip",
+            f"phone family p={family_p:.2f}, series {top_series} p={series_p[top_series]:.2f}",
+        )
+
+
+# --------------------------------------------------------------------------------------
 # Orchestrator
 # --------------------------------------------------------------------------------------
 
@@ -334,8 +463,13 @@ class Orchestrator:
                 "seq": self._seq,
             }
 
+    @staticmethod
+    def _set_green() -> None:
+        ok = actuate_modulino(0, 255, 0, 50, 8)
+        log.info("Recognition LEDs: set_pixels(0, 255, 0, 50, 8) -> %s", "ok" if ok else "FAILED")
+
     def _do_lock(self, det: Detection, epoch: int) -> None:
-        self._led_pool.submit(actuate_modulino, 0, 255, 0, 50, 8)
+        self._led_pool.submit(self._set_green)
         try:
             asset = search_3d_asset(det.label)
         except Exception:
@@ -429,6 +563,22 @@ class Orchestrator:
 fast_classifier = ColorShapeClassifier()
 vlm = VlmWorker(VLM_CMD)
 orchestrator = Orchestrator()
+clip: ClipClassifier | None = None
+clip_lock = threading.Lock()
+
+
+def load_clip() -> ClipClassifier | None:
+    if not CLIP_ENABLED:
+        return None
+    try:
+        t0 = time.perf_counter()
+        model = ClipClassifier(CLIP_MODEL_ID, CLIP_THREADS)
+        model.probabilities(Image.new("RGB", (model.size, model.size)))
+        log.info("Loaded %s on CPU in %.1fs", CLIP_MODEL_ID, time.perf_counter() - t0)
+        return model
+    except Exception:
+        log.exception("CLIP model unavailable; falling back to color/shape heuristic")
+        return None
 
 
 def classify_frame(image: Image.Image, hint: str | None) -> Detection:
@@ -436,6 +586,9 @@ def classify_frame(image: Image.Image, hint: str | None) -> Detection:
         label = match_label(hint)
         if label:
             return Detection(label, label_category(label), 1.0, "hint")
+    if clip is not None:
+        with clip_lock:
+            return clip.classify(image)
     det = fast_classifier.classify(image)
     if vlm.enabled:
         if VLM_ALWAYS or det.category is not None:
@@ -518,11 +671,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("KAMIKAZE_PORT", "5000")))
     args = parser.parse_args()
 
+    global clip
+    clip = load_clip()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
     log.info(
-        "Kamikaze receiver on %s:%d | VLM %s | targets: %d phones, %d cans",
-        args.host, args.port, "enabled" if vlm.enabled else "disabled (color/shape only)",
+        "Kamikaze receiver on %s:%d | backend %s | targets: %d phones, %d cans",
+        args.host, args.port,
+        f"CLIP ({CLIP_MODEL_ID})" if clip else ("color/shape + VLM cmd" if vlm.enabled else "color/shape heuristic"),
         len(PHONE_LABELS), len(CAN_LABELS),
     )
     try:

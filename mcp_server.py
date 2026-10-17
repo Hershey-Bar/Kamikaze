@@ -408,7 +408,7 @@ def actuate_modulino(r: int, g: int, b: int, brightness: int, count: int) -> boo
 @mcp.tool()
 def trigger_guidance(reason: str, prompt_user: str) -> dict:
     """Light 4 amber LEDs and tell the user how to reposition the object."""
-    ok = actuate_modulino(255, 150, 0, 40, 4)
+    ok = actuate_modulino(255, 120, 0, 40, 4)
     log.info("Guidance (%s): %s [leds=%s]", reason, prompt_user, "ok" if ok else "unavailable")
     return {"action": "reorient", "message": prompt_user}
 
