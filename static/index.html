@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kamikaze · Edge Visual Retrieval</title>
+<style>
+  :root { --bg:#0b1020; --panel:#121a30; --line:#24304f; --text:#e5e9f5; --mute:#8b97b8; --green:#10b981; --amber:#f59e0b; --blue:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; letter-spacing:.08em; }
+  header span { color:var(--mute); font-size:12px; }
+  #hud { margin:14px 20px 0; padding:14px 18px; border-radius:10px; font-size:18px; font-weight:600; background:var(--blue); transition:background .25s; }
+  #hud.IDENTIFIED { background:var(--green); }
+  #hud.GUIDING { background:var(--amber); color:#1a1200; animation:pulse 1.1s ease-in-out infinite; }
+  #hud.SEARCHING { background:var(--blue); }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.65; } }
+  main { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:16px; padding:16px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .panel h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase; letter-spacing:.1em; color:var(--mute); }
+  .stage { position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:8px; overflow:hidden; }
+  .stage canvas, .stage svg { position:absolute; inset:0; width:100%; height:100%; }
+  model-viewer { width:100%; aspect-ratio:4/3; background:radial-gradient(circle at 50% 40%, #1b2747, #0b1020); border-radius:8px; --poster-color:transparent; }
+  #viewerLabel { margin-top:8px; color:var(--mute); font-size:12px; min-height:1.4em; }
+  .grid { display:grid; grid-template-columns: repeat(2,1fr); gap:8px; }
+  .stat { background:#0d1428; border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .stat b { display:block; font-size:11px; color:var(--mute); text-transform:uppercase; letter-spacing:.08em; font-weight:500; }
+  .stat span { font-size:18px; font-variant-numeric: tabular-nums; }
+  .leds { display:flex; gap:6px; margin-top:10px; align-items:center; }
+  .led { width:18px; height:18px; border-radius:50%; background:#1b2340; border:1px solid var(--line); transition:background .2s, box-shadow .2s; }
+  .led.on { box-shadow:0 0 10px currentColor; }
+  .row { display:flex; gap:8px; margin-top:6px; }
+  input[type=text] { flex:1; min-width:0; background:#0d1428; border:1px solid var(--line); color:var(--text); padding:9px 10px; border-radius:8px; font:inherit; }
+  button { background:var(--blue); border:0; color:#fff; padding:9px 14px; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--mute); padding:2px 8px; font-weight:500; }
+  .bar { height:8px; background:#0d1428; border-radius:4px; overflow:hidden; margin-top:10px; }
+  .bar > div { height:100%; width:0; background:var(--green); transition:width .15s; }
+  #enrollMsg { margin-top:6px; min-height:1.4em; color:var(--mute); font-size:12px; }
+  ul#classes { list-style:none; padding:0; margin:10px 0 0; display:flex; flex-wrap:wrap; gap:6px; }
+  ul#classes li { background:#0d1428; border:1px solid var(--line); border-radius:999px; padding:3px 4px 3px 10px; font-size:12px; display:flex; align-items:center; gap:6px; }
+  ul#classes li.active { border-color:var(--green); color:var(--green); }
+  .stack { display:flex; flex-direction:column; gap:16px; }
+  footer { padding:0 20px 20px; color:var(--mute); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>KAMIKAZE</h1>
+  <span id="conn">connecting…</span>
+</header>
+
+<div id="hud" class="SEARCHING">Place target object inside the central alignment box.</div>
+
+<main>
+  <div class="stack">
+    <section class="panel">
+      <h2>Live camera</h2>
+      <div class="stage">
+        <canvas id="cam" width="640" height="480"></canvas>
+        <svg viewBox="0 0 640 480" preserveAspectRatio="none">
+          <defs><mask id="m"><rect width="640" height="480" fill="#fff"/><rect x="128" y="48" width="384" height="384" rx="14" fill="#000"/></mask></defs>
+          <rect width="640" height="480" fill="rgba(0,0,0,.45)" mask="url(#m)"/>
+          <rect id="reticle" x="128" y="48" width="384" height="384" rx="14" fill="none" stroke="#3b82f6" stroke-width="3" stroke-dasharray="14 10"/>
+        </svg>
+      </div>
+      <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Telemetry</h2>
+      <div class="grid">
+        <div class="stat"><b>Top-1 match</b><span id="tLabel">—</span></div>
+        <div class="stat"><b>Similarity</b><span id="tSim">—</span></div>
+        <div class="stat"><b>Margin Δ</b><span id="tMargin">—</span></div>
+        <div class="stat"><b>Embed latency</b><span id="tEmbed">—</span></div>
+        <div class="stat"><b>Total / frame</b><span id="tTotal">—</span></div>
+        <div class="stat"><b>Frame rate</b><span id="tFps">—</span></div>
+        <div class="stat"><b>LEDs</b><span id="tLed">—</span></div>
+        <div class="stat"><b>Backend</b><span id="tBackend" style="font-size:13px">—</span></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section class="panel">
+      <h2>3D asset</h2>
+      <model-viewer id="viewer" src="/static/models/default.glb" camera-controls auto-rotate shadow-intensity="1"
+                    exposure="1.1" camera-orbit="45deg 75deg 1.5m" interaction-prompt="none" alt="Matched 3D model"></model-viewer>
+      <div id="viewerLabel">Showing default model.</div>
+    </section>
+
+    <section class="panel">
+      <h2>Few-shot enrollment</h2>
+      <div style="color:var(--mute);font-size:12px">Hold the object inside the box, name it, then capture the next 12 frames.</div>
+      <div class="row">
+        <input type="text" id="label" placeholder="label, e.g. coke_can" maxlength="40" autocomplete="off">
+        <button id="enrollBtn">Capture 12 frames</button>
+      </div>
+      <div class="bar"><div id="bar"></div></div>
+      <div id="enrollMsg"></div>
+      <ul id="classes"></ul>
+    </section>
+  </div>
+</main>
+<footer>Embeddings run on-device (Arm CPU · ExecuTorch/XNNPACK). Source: <code>/api/state</code>, <code>/api/asset</code>.</footer>
+
+<script>
+  // Local copy first (works offline on the board); fall back to the CDN when it has not been vendored.
+  (function () {
+    const s = document.createElement('script');
+    s.type = 'module';
+    s.src = '/static/vendor/model-viewer.min.js';
+    s.onerror = () => {
+      const c = document.createElement('script');
+      c.type = 'module';
+      c.src = 'https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js';
+      document.head.appendChild(c);
+    };
+    document.head.appendChild(s);
+  })();
+
+  const $ = (id) => document.getElementById(id);
+  const COLORS = { IDENTIFIED: '#10b981', GUIDING: '#f59e0b', SEARCHING: '#3b82f6' };
+  const ledEls = [];
+  for (let i = 0; i < 8; i++) { const d = document.createElement('div'); d.className = 'led'; $('leds').appendChild(d); ledEls.push(d); }
+
+  const ctx = $('cam').getContext('2d');
+  let frameBusy = false, lastSrc = '', lastLabel = null;
+
+  async function pullFrame() {
+    if (frameBusy) return;
+    frameBusy = true;
+    try {
+      const r = await fetch('/api/frame.jpg?t=' + Date.now(), { cache: 'no-store' });
+      if (r.ok) {
+        const bmp = await createImageBitmap(await r.blob());
+        ctx.drawImage(bmp, 0, 0, 640, 480);
+        bmp.close();
+      }
+    } catch (e) { /* receiver restarting */ }
+    frameBusy = false;
+  }
+
+  function renderLeds(led) {
+    const lit = led && led.ok !== false ? led.count : 0;
+    const color = led ? `rgb(${led.r},${led.g},${led.b})` : '#1b2340';
+    ledEls.forEach((el, i) => {
+      const on = i < lit;
+      el.classList.toggle('on', on);
+      el.style.background = on ? color : '';
+      el.style.color = on ? color : '';
+    });
+  }
+
+  function renderClasses(classes, active) {
+    const ul = $('classes');
+    ul.replaceChildren();
+    Object.entries(classes || {}).forEach(([name, n]) => {
+      const li = document.createElement('li');
+      if (name === active) li.className = 'active';
+      li.append(`${name} · ${n}`);
+      const x = document.createElement('button');
+      x.className = 'ghost'; x.textContent = '×'; x.title = 'Remove ' + name;
+      x.onclick = async () => {
+        if (!confirm('Remove enrolled class "' + name + '"?')) return;
+        await fetch('/api/unenroll', { method: 'POST', body: JSON.stringify({ label: name }) });
+      };
+      li.appendChild(x);
+      ul.appendChild(li);
+    });
+  }
+
+  function renderEnroll(e) {
+    const pct = e.total ? Math.min(100, Math.round(100 * e.collected / e.total)) : 0;
+    $('bar').style.width = (e.active ? pct : (e.done && e.ok ? 100 : 0)) + '%';
+    $('enrollBtn').disabled = !!e.active;
+    if (e.active) $('enrollMsg').textContent = `Capturing "${e.label}": ${e.collected}/${e.total} frames…`;
+    else if (e.done && e.ok) $('enrollMsg').textContent = `Enrolled "${e.label}" (consistency ${e.result ? e.result.consistency : '—'}).`;
+    else if (e.done && e.error) $('enrollMsg').textContent = 'Enrollment failed: ' + e.error;
+  }
+
+  async function pullState() {
+    try {
+      const s = await (await fetch('/api/state', { cache: 'no-store' })).json();
+      const stale = s.frame_age_s === null || s.frame_age_s > 3;
+      $('conn').textContent = stale ? 'receiver up · waiting for camera frames' : `live · ${s.fps} fps`;
+      $('hud').className = s.state;
+      $('hud').textContent = s.guidance;
+      $('reticle').setAttribute('stroke', COLORS[s.state] || COLORS.SEARCHING);
+      $('tLabel').textContent = s.label || '—';
+      $('tSim').textContent = s.label ? (s.similarity * 100).toFixed(1) + '%' : '—';
+      $('tMargin').textContent = s.label ? s.margin.toFixed(3) : '—';
+      $('tEmbed').textContent = s.latency_ms.embed.toFixed(1) + ' ms';
+      $('tTotal').textContent = s.latency_ms.total.toFixed(1) + ' ms';
+      $('tFps').textContent = s.fps.toFixed(1);
+      const led = s.led;
+      $('tLed').textContent = led.ok === false ? 'router offline' : `${led.count}× rgb(${led.r},${led.g},${led.b})`;
+      $('tBackend').textContent = s.backend;
+      renderLeds(led);
+      renderClasses(s.classes, s.confirmed_label);
+      renderEnroll(s.enrollment);
+
+      const src = new URL(s.glb_url, location.href).href;
+      if (src !== lastSrc) { lastSrc = src; $('viewer').setAttribute('src', s.glb_url); }
+      const name = s.confirmed_label;
+      $('viewerLabel').textContent = name
+        ? `${name} · model ${s.asset_status}`
+        : 'Showing default model.';
+      if (name !== lastLabel) {
+        lastLabel = name;
+        if (name) fetch('/api/asset').then(r => r.json()).then(a => a.camera_orbit && $('viewer').setAttribute('camera-orbit', a.camera_orbit)).catch(() => {});
+      }
+    } catch (e) {
+      $('conn').textContent = 'receiver unreachable';
+    }
+  }
+
+  $('enrollBtn').onclick = async () => {
+    const label = $('label').value.trim();
+    if (!label) { $('enrollMsg').textContent = 'Enter a label first.'; return; }
+    $('enrollBtn').disabled = true;
+    try {
+      const r = await fetch('/api/enroll', { method: 'POST', body: JSON.stringify({ label, frames: 12 }) });
+      const j = await r.json();
+      if (!j.ok) $('enrollMsg').textContent = j.error || 'Enrollment rejected.';
+    } catch (e) { $('enrollMsg').textContent = 'Receiver unreachable.'; }
+    pullState();
+  };
+
+  setInterval(pullFrame, 150);
+  setInterval(pullState, 250);
+  pullState();
+</script>
+</body>
+</html>

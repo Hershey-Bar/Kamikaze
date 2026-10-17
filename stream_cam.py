@@ -2,7 +2,9 @@ import cv2
 import requests
 import time
 
-URL = "http://127.0.0.1:5000"
+URL = "http://127.0.0.1:5000/api/frame"
+JPEG_QUALITY = 80
+CROP_FRACTION = 0.60  # must match receiver.CROP_FRACTION (the receiver crops/resizes itself)
 
 # Use DirectShow backend on Windows to prevent MSMF sample reader locks
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -30,8 +32,9 @@ try:
             time.sleep(0.01)
             continue
 
-        frame_resized = cv2.resize(frame, (224, 224))
-        _, encoded_img = cv2.imencode('.jpg', frame_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        ok, encoded_img = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+        if not ok:
+            continue
 
         frame_id += 1
         t_start = time.time()
@@ -43,11 +46,18 @@ try:
                 timeout=3.0
             )
             rtt = (time.time() - t_start) * 1000
-            print(f"[Frame {frame_id:04d}] Transmitted -> Status: {resp.status_code} ({rtt:.1f}ms)")
-        except requests.exceptions.RequestException as e:
+            verdict = resp.json() if resp.ok else {}
+            print(f"[Frame {frame_id:04d}] {resp.status_code} ({rtt:.0f}ms) {verdict.get('state', '?')} "
+                  f"{verdict.get('label')} sim={verdict.get('similarity')}")
+        except (requests.exceptions.RequestException, ValueError) as e:
             print(f"[Frame {frame_id:04d}] Transfer failed: {e}")
 
-        cv2.imshow("Webcam Streamer Preview", frame)
+        h, w = frame.shape[:2]
+        side = int(CROP_FRACTION * min(w, h))
+        x0, y0 = (w - side) // 2, (h - side) // 2
+        preview = frame.copy()
+        cv2.rectangle(preview, (x0, y0), (x0 + side, y0 + side), (246, 130, 59), 2)
+        cv2.imshow("Webcam Streamer Preview", preview)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 

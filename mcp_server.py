@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Kamikaze MCP server: 3D asset retrieval + Modulino Pixels actuation + user guidance.
+"""Kamikaze MCP server: 3D asset retrieval/caching, Modulino Pixels actuation, enrollment and guidance.
 
 Run over stdio:   python mcp_server.py
-Import directly:  from mcp_server import search_3d_asset, actuate_modulino, trigger_guidance
+Import directly:  from mcp_server import set_leds, search_3d_asset, actuate_modulino, trigger_guidance
+
+Tools: search_3d_asset, actuate_modulino, trigger_guidance, enroll_object, get_guidance.
+enroll_object / get_guidance talk to the running receiver.py (the single owner of the prototype bank)
+over its local HTTP API, so an agent can drive the same live state the dashboard shows.
 
 Environment (all optional):
   SKETCHFAB_TOKEN        Sketchfab API token (required for GLB download via the Data API)
   POLY_PIZZA_API_KEY     Poly Pizza API key
   KAMIKAZE_ROUTER_SOCK   Router socket path (default /var/run/arduino-router.sock)
+  KAMIKAZE_RECEIVER_URL  Receiver base URL (default http://127.0.0.1:5000)
+  KAMIKAZE_MODELS_DIR    GLB cache directory (default static/models next to this file)
   KAMIKAZE_FALLBACKS     JSON file overriding/extending the cached model table
                          (default: fallback_models.json next to this file)
   KAMIKAZE_HTTP_TIMEOUT  Per-request network timeout in seconds (default 3.0)
@@ -44,8 +50,14 @@ log = logging.getLogger("kamikaze.mcp")
 
 mcp = FastMCP("kamikaze")
 
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+MODELS_DIR = Path(os.environ.get("KAMIKAZE_MODELS_DIR", STATIC_DIR / "models"))
 ROUTER_SOCK_PATH = os.environ.get("KAMIKAZE_ROUTER_SOCK", "/var/run/arduino-router.sock")
+RECEIVER_URL = os.environ.get("KAMIKAZE_RECEIVER_URL", "http://127.0.0.1:5000").rstrip("/")
 HTTP_TIMEOUT = float(os.environ.get("KAMIKAZE_HTTP_TIMEOUT", "3.0"))
+DOWNLOAD_TIMEOUT = float(os.environ.get("KAMIKAZE_DOWNLOAD_TIMEOUT", "30"))
+MAX_GLB_BYTES = 64 * 1024 * 1024
 RPC_TIMEOUT = 1.0
 ONLINE_CACHE_TTL = 600.0
 USER_AGENT = "kamikaze-edge/1.0"
@@ -200,14 +212,21 @@ def resolve_fallback(query: str) -> dict[str, str] | None:
             entry_key = "sprite"
         elif "coca" in q or "coke" in q or "cola" in q:
             entry_key = "coca-cola"
-        elif any(w in q for w in ("phone", "iphone", "galaxy", "samsung", "apple", "smartphone")):
+        elif any(w in q for w in ("phone", "iphone", "galaxy", "samsung", "apple", "smartphone", "pixel", "android")) \
+                or re.search(r"\bs\s?2\d\b", q):
             entry_key = "_generic_phone"
+            m = re.search(r"\bs\s?(2\d)\b", q)
+            if m:
+                variant = " Ultra" if "ultra" in q else " Plus" if ("plus" in q or "+" in query) else ""
+                title = f"Samsung Galaxy S{m.group(1)}{variant}"
         elif any(w in q for w in ("can", "soda", "drink", "beverage")):
             entry_key = "_generic_can"
     if entry_key is None or entry_key not in FALLBACK_MODELS:
         return None
     entry = dict(FALLBACK_MODELS[entry_key])
-    if title and entry_key.startswith(("iphone", "galaxy")) and entry["title"].startswith(("Apple iPhone", "Samsung Galaxy")):
+    if title and entry_key == "_generic_phone":
+        entry["title"] = title
+    elif title and entry_key.startswith(("iphone", "galaxy")) and entry["title"].startswith(("Apple iPhone", "Samsung Galaxy")):
         entry["title"] = title
     return entry
 
@@ -304,15 +323,8 @@ def _search_online(query: str) -> dict[str, str] | None:
 # --------------------------------------------------------------------------------------
 
 
-@mcp.tool()
-def search_3d_asset(query: str, format: str = "glb") -> dict:
-    """Find a 3D model for a product query (e.g. "Apple iPhone 15 Pro", "Pepsi").
-
-    Tries Sketchfab then Poly Pizza (when API credentials are configured) and falls back to a
-    built-in table of public GLB URLs so live demos survive network failures and rate limits.
-    Returns {"title", "model_url", "thumbnail_url", "status": "online" | "cached"}.
-    Only GLB output is supported; other formats are served as GLB.
-    """
+def lookup_3d_asset(query: str, format: str = "glb") -> dict:
+    """Resolve a query to {"title", "model_url", "thumbnail_url", "status"} without downloading anything."""
     query = (query or "").strip()
     if format.lower() != "glb":
         log.info("Requested format %r unsupported; serving glb", format)
@@ -324,6 +336,87 @@ def search_3d_asset(query: str, format: str = "glb") -> dict:
         return {**cached, "status": "cached"}
     log.warning("No online or cached model for %r", query)
     return {"title": query or "unknown", "model_url": "", "thumbnail_url": "", "status": "cached"}
+
+
+def slugify(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")[:60] or "asset"
+
+
+def local_glb_path(slug: str) -> Path:
+    return MODELS_DIR / f"{slug}.glb"
+
+
+def is_valid_glb(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4) == b"glTF" and path.stat().st_size > 12
+    except OSError:
+        return False
+
+
+_download_locks: dict[str, threading.Lock] = {}
+_download_locks_guard = threading.Lock()
+
+
+def download_glb(url: str, slug: str) -> Path | None:
+    """Download a GLB into the model cache (atomic, magic-checked). Returns the file path or None."""
+    dest = local_glb_path(slug)
+    with _download_locks_guard:
+        lock = _download_locks.setdefault(slug, threading.Lock())
+    with lock:
+        if is_valid_glb(dest):
+            return dest
+        tmp = dest.with_suffix(".part")
+        try:
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, open(tmp, "wb") as out:
+                total = 0
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > MAX_GLB_BYTES:
+                        raise ValueError("GLB exceeds size limit")
+                    out.write(chunk)
+            if not is_valid_glb(tmp):
+                raise ValueError("response is not a binary glTF (GLB)")
+            os.replace(tmp, dest)
+            log.info("Cached %s (%d KB) from %s", dest.name, dest.stat().st_size // 1024, url)
+            return dest
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+            log.warning("GLB download failed for %s: %s", url, exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return None
+
+
+@mcp.tool()
+def search_3d_asset(query: str, format: str = "glb") -> dict:
+    """Find and cache a 3D model for a product query (e.g. "Apple iPhone 15 Pro", "coke_can").
+
+    Tries Sketchfab then Poly Pizza (when API credentials are configured) and falls back to a
+    built-in table of public GLB URLs so live demos survive network failures and rate limits.
+    The chosen GLB is downloaded once into static/models/<query-slug>.glb.
+    Returns {"title", "model_url", "thumbnail_url", "status": "online" | "cached"} plus
+    "glb_url" (the locally served /static/models/... path) when the file is cached on disk.
+    Only GLB output is supported; other formats are served as GLB.
+    """
+    entry = lookup_3d_asset(query, format)
+    slug = slugify(query)
+    if is_valid_glb(local_glb_path(slug)):
+        return {**entry, "glb_url": f"/static/models/{slug}.glb"}
+    candidates = [entry]
+    fallback = resolve_fallback(query or "")
+    if fallback and fallback["model_url"] != entry["model_url"]:
+        candidates.append({**fallback, "status": "cached"})
+    for cand in candidates:
+        if cand["model_url"] and download_glb(cand["model_url"], slug):
+            return {**cand, "glb_url": f"/static/models/{slug}.glb"}
+    return entry
 
 
 class _RouterClient:
@@ -395,22 +488,76 @@ def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(value)))
 
 
-@mcp.tool()
-def actuate_modulino(r: int, g: int, b: int, brightness: int, count: int) -> bool:
-    """Set the Modulino Pixels via the Arduino Router (MessagePack-RPC `set_pixels`).
-
-    r/g/b are 0-255, brightness 0-100, count 0-8 LEDs lit. Returns True on acknowledged success.
-    """
+def set_leds(r: int, g: int, b: int, brightness: int, count: int) -> bool:
+    """Drive the Modulino Pixels via MessagePack-RPC `set_pixels`; True once the router acknowledges."""
     params = [_clamp(r, 0, 255), _clamp(g, 0, 255), _clamp(b, 0, 255), _clamp(brightness, 0, 100), _clamp(count, 0, 8)]
     return _router.call("set_pixels", params)
 
 
 @mcp.tool()
+def actuate_modulino(r: int, g: int, b: int, brightness: int, count: int) -> dict:
+    """Set the 8-pixel Modulino bar (r/g/b 0-255, brightness 0-100, count 0-8 LEDs lit).
+
+    Returns {"success": bool, "r", "g", "b", "brightness", "count"} with the clamped values sent.
+    """
+    params = {
+        "r": _clamp(r, 0, 255), "g": _clamp(g, 0, 255), "b": _clamp(b, 0, 255),
+        "brightness": _clamp(brightness, 0, 100), "count": _clamp(count, 0, 8),
+    }
+    return {"success": set_leds(**params), **params}
+
+
+@mcp.tool()
 def trigger_guidance(reason: str, prompt_user: str) -> dict:
     """Light 4 amber LEDs and tell the user how to reposition the object."""
-    ok = actuate_modulino(255, 120, 0, 40, 4)
+    ok = set_leds(255, 120, 0, 40, 4)
     log.info("Guidance (%s): %s [leds=%s]", reason, prompt_user, "ok" if ok else "unavailable")
     return {"action": "reorient", "message": prompt_user}
+
+
+def _receiver_call(method: str, path: str, body: dict | None = None, timeout: float = 10.0) -> dict:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        f"{RECEIVER_URL}{path}", data=data, method=method,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            return json.loads(exc.read().decode("utf-8"))
+        except ValueError:
+            return {"ok": False, "error": f"receiver returned HTTP {exc.code}"}
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        return {"ok": False, "error": f"receiver unreachable at {RECEIVER_URL}: {exc}"}
+
+
+@mcp.tool()
+def enroll_object(label: str) -> dict:
+    """Few-shot enroll the object currently in front of the camera under `label` (e.g. "coke_can").
+
+    Captures the next 12 live frames from the receiver, stores their L2-normalised centroid in the
+    prototype bank and persists it. Blocks until done. Returns {"ok", "label", "frames", "consistency", ...}.
+    """
+    return _receiver_call("POST", "/api/enroll", {"label": label, "wait": True}, timeout=45.0)
+
+
+@mcp.tool()
+def get_guidance() -> dict:
+    """Return the live guidance prompt: {"state", "message", "action", "label", "confidence", "margin"}."""
+    state = _receiver_call("GET", "/api/state", timeout=5.0)
+    if state.get("ok") is False and "error" in state:
+        return state
+    state_name = state.get("state", "SEARCHING")
+    return {
+        "state": state_name,
+        "message": state.get("guidance", ""),
+        "action": {"IDENTIFIED": "none", "GUIDING": "reorient"}.get(state_name, "present_object"),
+        "label": state.get("label"),
+        "confidence": state.get("confidence"),
+        "margin": state.get("margin"),
+    }
 
 
 if __name__ == "__main__":
