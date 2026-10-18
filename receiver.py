@@ -25,7 +25,9 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
                                      title, thumbnail, likes, views, faces, author, licence, match level
   POST /api/classes/<id>/cad_select  {"uid": "..."} download + quality-check the picked candidate as the class model
   POST /api/classes/<id>/upload_cad  raw GLB body (model/gltf-binary, <= KAMIKAZE_CAD_UPLOAD_MB): operator-supplied model
-  POST /api/classes/<id>/generate_spec   dimension-calibrated GLB from verified published specs (GSMArena / Crown)
+  POST /api/classes/<id>/generate_spec   dimension-calibrated GLB from verified published specs (GSMArena / Crown);
+                                     optional {"layout": {"source", "island", "lenses": [{"x","y","r","h"}]}} = cited
+                                     rear-camera coordinates in mm from the top-left of the back (phones)
   POST /api/classes/<id>/cad_orient  {"auto": true} | {"axis": "x|y|z", "deg": 90} | {"reset": true} | {}: orientation fix
                                      of the cached GLB (glb_orient wrapper node; recorded in the attribution as a change)
   GET|POST /api/settings/mode        {"mode": "online"|"offline", "source": "auto"|"sketchfab"|"polypizza"|"local"|"upload"}
@@ -57,6 +59,10 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
                                      same connection also carries `event: telemetry` every KAMIKAZE_TELEMETRY_PERIOD
   POST /api/db/save | GET /api/db/export   persist / download the enrolled class database
   POST /api/cad/fetch                {"raw_name": "...", "force": true} resolve + (re)harvest the CAD model, with attribution
+  POST /api/label_scan               {"action": "start", "label": "<can class>"} | {"action": "status|cancel|finish"}: live
+                                     360-degree label capture while the can is turned (amber LED bar = coverage, green =
+                                     complete); finish wraps the stitched label on the verified Crown can dimensions
+  GET  /api/label_scan | /api/label_scan/texture.jpg   scan progress / the partial label (RAM only)
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
 Pipeline per frame: Ultralytics YOLO-World v2 (open vocabulary: beverage can / soda can / smartphone / bottle; YOLO26n
@@ -81,7 +87,8 @@ EMA_ALPHA (calibrated confidence), KAMIKAZE_CROP_FRACTION (0.75), KAMIKAZE_POSE_
 KAMIKAZE_POSE_HZ (10, pose worker rate cap),
 KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
 KAMIKAZE_LIGHT_GATE (1|0) / LIGHT_MIN_LUMA (42) / GLARE_LEVEL (250) / GLARE_MAX (0.18), KAMIKAZE_OCR (1|0) / OCR_HZ (3),
-KAMIKAZE_CAD_MODE (online|offline), KAMIKAZE_CAD_SOURCE (auto|sketchfab|polypizza|local), KAMIKAZE_CAD_UPLOAD_MB (35),
+KAMIKAZE_CAD_MODE (online|offline), KAMIKAZE_CAD_SOURCE (auto|sketchfab|polypizza|printables|thingiverse|packaging|local),
+KAMIKAZE_CAD_UPLOAD_MB (35), THINGIVERSE_TOKEN, KAMIKAZE_CAD_ALLOW_NC (0|1),
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
 KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0),
 KAMIKAZE_CAMERA (auto|/dev/videoN|none), KAMIKAZE_CAM_WIDTH/HEIGHT/FPS (1920/1080/30), KAMIKAZE_DECODE_MAX (default 960:
@@ -90,7 +97,8 @@ KAMIKAZE_CAMERA (auto|/dev/videoN|none), KAMIKAZE_CAM_WIDTH/HEIGHT/FPS (1920/108
 Privacy: no raw image is ever written to disk; only 1280-d vectors reach enrolled_classes.pt. The dashboard's live
 view keeps ONE most-recent JPEG in RAM (overwritten every frame, dropped when the stream goes idle, disabled in
 deployment mode). KAMIKAZE_RING_GB > 0 opts in to a RAM ring of recent frames (training mode only, reported in
-/api/telemetry privacy + memory_pools).
+/api/telemetry privacy + memory_pools). A label scan accumulates only a cylindrical label strip in RAM; it reaches
+disk (as the texture inside the class GLB) only when the operator explicitly presses Finish.
 """
 
 from __future__ import annotations
@@ -135,10 +143,12 @@ import cad_harvester
 import color_sig
 import device_taxonomy
 import entity_resolver
+import label_stitch
 import model_library
 import netguard
 import npu as npu_mod
 import onboard_camera
+import packaging
 import pose as pose_mod
 import ocr_fusion
 import taxonomy
@@ -202,8 +212,9 @@ ENROLL_STALE_S = 15.0
 
 CAD_OFFLINE_DEFAULT = os.environ.get("KAMIKAZE_CAD_MODE", "online").strip().lower() == "offline"
 CAD_SOURCE_DEFAULT = os.environ.get("KAMIKAZE_CAD_SOURCE", "auto").strip().lower()
-CAD_SOURCE_NAMES = {"auto": "Auto (Ranked)", "sketchfab": "Sketchfab", "polypizza": "Poly Pizza", "local": "Local Cache",
-                    "upload": "Custom Scan Upload"}
+CAD_SOURCE_NAMES = {"auto": "Auto (Ranked)", "sketchfab": "Sketchfab", "polypizza": "Poly Pizza",
+                    "printables": "Printables 1:1 dummy", "thingiverse": "Thingiverse 1:1 dummy",
+                    "packaging": "Open Food Facts packaging", "local": "Local Cache", "upload": "Custom Scan Upload"}
 CAD_BROWSE_BUDGET_S = float(os.environ.get("KAMIKAZE_CAD_BROWSE_BUDGET", "25"))
 MAX_UPLOAD_BYTES = int(float(os.environ.get("KAMIKAZE_CAD_UPLOAD_MB", "35")) * 1024 * 1024)
 LIGHT_GATE = os.environ.get("KAMIKAZE_LIGHT_GATE", "1") != "0"
@@ -1449,6 +1460,13 @@ def led_params(state: str, score: float) -> tuple[int, int, int, int, int]:
     return (0, 100, 150, 15, 1)
 
 
+def scan_led_params(coverage: float, complete: bool) -> tuple[int, int, int, int, int]:
+    """Amber progress bar while the can label is being scanned; solid green once the full 360 degrees is captured."""
+    if complete:
+        return (0, 255, 0, 50, 8)
+    return (255, 120, 0, 40, max(1, min(8, math.ceil(8 * coverage))))
+
+
 def capture_led_params(collected: int, total: int) -> tuple[int, int, int, int, int]:
     """Blue progress bar while an enrollment view is being captured."""
     return (0, 80, 255, 30, max(1, min(8, math.ceil(8 * collected / max(1, total)))))
@@ -1727,11 +1745,17 @@ class AssetManager:
         return {**cad_harvester.reorient(label, op, axis=axis, deg=deg, category=category),
                 "glb_url": self.peek(label)["glb_url"]}
 
-    def generate(self, label: str) -> dict:
-        return self._explicit(label, lambda: cad_harvester.generate_from_specs(self._product(label)))
+    def generate(self, label: str, layout: dict | None = None) -> dict:
+        return self._explicit(label, lambda: cad_harvester.generate_from_specs(self._product(label), layout=layout))
 
     def attach_library(self, label: str, entry_id: str) -> dict:
         return self._explicit(label, lambda: cad_harvester.use_library(label, entry_id))
+
+    def check_label_scan(self, label: str) -> dict:
+        return cad_harvester.label_scan_spec(self._product(label))
+
+    def install_label(self, label: str, jpeg: bytes, scan: dict) -> dict:
+        return self._explicit(label, lambda: cad_harvester.install_label_scan(self._product(label), jpeg, scan))
 
     def retry_missing(self, labels) -> list[str]:
         """Re-resolve classes that ended NOT_FOUND (e.g. a matching library model was just added)."""
@@ -2080,6 +2104,9 @@ class Pipeline:
         self._infer_lock = threading.Lock()
         self._frame_lock = threading.Lock()
         self._snap_lock = threading.Lock()
+        self._scan_lock = threading.Lock()
+        self._label_scan: label_stitch.LabelStitcher | None = None
+        packaging.set_detector(self._packaging_detector)
         self._latest_jpeg: bytes | None = None  # single most-recent preview frame, in RAM only, overwritten each frame
         self._frame_cv = threading.Condition(self._frame_lock)
         self._frame_seq = 0
@@ -2350,9 +2377,13 @@ class Pipeline:
             message = guidance_message(state, label, score, hint, category, frame.prompt, frame.empty)
             if dark:
                 hint, message = light["issue"], light["message"]
+            scan = self._label_scan
             if self.mv.active:
                 mv = self.mv.status()
                 self.leds.set(capture_led_params(mv["collected"], mv["frames_per_view"]) if capturing else led_params(SEARCHING, 0.0))
+            elif scan is not None and not dark:
+                st = self._feed_label_scan(scan, image)
+                self.leds.set(scan_led_params(st["coverage"], st["complete"]))
             else:
                 self.leds.set(led_params(state, score))
             if state == IDENTIFIED:
@@ -2592,6 +2623,89 @@ class Pipeline:
         }
         return box, ms
 
+    # -- live 360 degree label scan (label_stitch.py; frames and label stay in RAM) --------------------------------
+
+    def _packaging_detector(self, bgr: np.ndarray) -> list[tuple[float, float, float, float, str]]:
+        """packaging.py hook: NPU detector boxes of beverage cans in an Open Food Facts photo."""
+        if self.detector is None:
+            return []
+        image = Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]))
+        with self._infer_lock:
+            dets = self.detector.detect(image)
+        w, h = image.size
+        return [(*d.box, "beverage_can") for d in dets if d.kind(w, h) == "beverage can"]
+
+    def _feed_label_scan(self, scan: label_stitch.LabelStitcher, image: Image.Image) -> dict:
+        target = self._detection.get("target")
+        if not target or target.get("label") != "beverage can":
+            st = scan.status()
+            st["reason"] = "no beverage can detected - hold the can upright inside the reticle"
+            return st
+        w, h = image.size
+        x0, y0, x1, y1 = target["box"]
+        crop = image.crop((int(x0 * w), int(y0 * h), int(round(x1 * w)), int(round(y1 * h))))
+        try:
+            return scan.feed(np.ascontiguousarray(np.asarray(crop)[:, :, ::-1]))
+        except label_stitch.StitchError as exc:
+            st = scan.status()
+            st["reason"] = str(exc)
+            return st
+
+    def label_scan(self, action: str, label: str | None = None) -> dict:
+        """start | status | cancel | finish. finish wraps the stitched 360 degree label on the class's verified can
+        dimensions and installs it as the class model."""
+        with self._scan_lock:
+            scan = self._label_scan
+            if scan is not None and scan.expired():
+                scan = self._label_scan = None
+            if action == "start":
+                label = self._cad_label(normalize_label(label))
+                if self._class_category(label) != "beverage_can":
+                    raise ValueError(f"{label!r} is not a beverage can class - the 360 degree label scan is for cans")
+                self.assets.check_label_scan(label)
+                self._label_scan = label_stitch.LabelStitcher(label)
+                self._bump()
+                return {"ok": True, "active": True, **self._label_scan.status()}
+            if scan is None:
+                if action in ("status", "cancel"):
+                    return {"ok": True, "active": False}
+                raise RuntimeError("no label scan is running")
+            if action == "status":
+                return {"ok": True, "active": True, **scan.status()}
+            if action == "cancel":
+                self._label_scan = None
+                self._bump()
+                return {"ok": True, "active": False, "cancelled": True}
+            if action != "finish":
+                raise ValueError("action must be start, status, cancel or finish")
+        jpeg = scan.texture_jpeg()
+        status = scan.status()
+        result = self.assets.install_label(scan.label, jpeg, status)
+        with self._scan_lock:
+            if self._label_scan is scan:
+                self._label_scan = None
+        self._bump()
+        return {"ok": bool(result.get("glb_url")), "active": False, "label": scan.label, "scan": status,
+                "result": result, "asset": self.assets.peek(scan.label)}
+
+    def _class_category(self, label: str) -> str | None:
+        cat = self.bank.category(label) if hasattr(self.bank, "category") else None
+        if cat:
+            return cat
+        try:
+            return cad_harvester.product_for(label).category
+        except Exception:
+            return None
+
+    def label_scan_preview(self) -> bytes | None:
+        scan = self._label_scan
+        if scan is None:
+            return None
+        try:
+            return scan.texture_jpeg(80, allow_partial=True)
+        except label_stitch.StitchError:
+            return None
+
     def _announce(self, state: str, label: str | None, score: float, margin: float, message: str) -> None:
         if state == IDENTIFIED:
             payload = {"event": "asset_ready", "label": label, "confidence": round(score, 3),
@@ -2690,7 +2804,7 @@ class Pipeline:
         elif action == "generate":
             if self.assets.offline:
                 raise PermissionError("offline mode: spec lookup needs online access")
-            result = self.assets.generate(label)
+            result = self.assets.generate(label, kw["layout"]) if kw.get("layout") else self.assets.generate(label)
         elif action == "orient":
             info = self.assets.orient(label, kw.get("op", "auto"), kw.get("axis", "y"), kw.get("deg", 90.0))
             self._bump()
@@ -2793,6 +2907,7 @@ class Pipeline:
             "led": self.leds.status(),
             "enrollment": self.enroller.status(),
             "multiview": self.mv.status(),
+            "label_scan": self._label_scan.status() if self._label_scan is not None else None,
             "pose": self._pose,
             "category": self._category,
             "best_view": self._best_view,
@@ -3011,6 +3126,13 @@ class Handler(BaseHTTPRequestHandler):
                                     "best_view": snap["best_view"], "category": snap["category"]})
         if path == "/api/enroll/status":
             return self._json(200, {"ok": True, **p.mv.status()})
+        if path == "/api/label_scan":
+            return self._json(200, p.label_scan("status"))
+        if path == "/api/label_scan/texture.jpg":
+            tex = p.label_scan_preview()
+            if tex is None:
+                return self._json(404, {"ok": False, "error": "no label scan in progress"})
+            return self._send(200, tex, "image/jpeg")
         if path == "/api/events":
             return self._sse("telemetry=1" in urllib.parse.urlsplit(self.path).query)
         if path in INGEST_ROUTES[:2] or path in SYNC_FRAME_ROUTES:
@@ -3168,6 +3290,27 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] in (
                 "cad_select", "upload_cad", "generate_spec", "cad_orient"):
             return self._cad_post(parts[2], parts[3], body)
+        if path == "/api/label_scan":
+            try:
+                req = self._json_body(body)
+                action = str(req.get("action") or "status").lower()
+                if action == "finish" and getattr(p.assets, "offline", False):
+                    raise PermissionError("offline mode: the can dimensions lookup needs online access")
+                self._json(200, p.label_scan(action, req.get("label")))
+            except NotEnrolled as exc:
+                self._json(404, {"ok": False, "error": f"class {exc.args[0]!r} is not enrolled"})
+            except label_stitch.StitchError as exc:
+                self._json(409, {"ok": False, "error": str(exc), **p.label_scan("status")})
+            except PermissionError as exc:
+                self._json(409, {"ok": False, "error": str(exc), "offline": True})
+            except RuntimeError as exc:
+                self._json(409, {"ok": False, "error": str(exc)})
+            except (TypeError, ValueError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                log.exception("label scan failed")
+                self._json(502, {"ok": False, "error": str(exc)})
+            return True
         if path == "/api/settings/mode":
             try:
                 req = self._json_body(body)
@@ -3323,7 +3466,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("deg must be a finite angle within [-360, 360]")
                 result = p.cad_action(label, "orient", op=op, axis=axis, deg=deg)
             else:
-                result = p.cad_action(label, "generate")
+                layout = self._json_body(body).get("layout")
+                if layout is not None and not isinstance(layout, dict):
+                    raise ValueError("layout must be a JSON object")
+                result = p.cad_action(label, "generate", layout=layout)
             self._json(200 if result["ok"] else 404, result)
         except NotEnrolled:
             self._json(404, {"ok": False, "error": f"class {raw_id!r} is not enrolled"})

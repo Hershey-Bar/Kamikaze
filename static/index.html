@@ -106,7 +106,13 @@
   .chip s { opacity:.6; }
   .swatch { display:inline-block; width:12px; height:12px; border-radius:3px; border:1px solid var(--line); vertical-align:-2px; margin-right:4px; }
   .step .tgt { color:var(--blue); font-size:11px; margin-top:2px; }
-  .cadbar { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  .scan { display:none; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; padding:8px; border:1px solid var(--amber); border-radius:10px; background:rgba(245,158,11,.08); }
+.scan.show { display:flex; }
+.scan .meter { flex:1 1 140px; height:8px; border-radius:999px; background:rgba(255,255,255,.08); overflow:hidden; }
+.scan .meter i { display:block; height:100%; width:0; background:var(--amber); transition:width .2s; }
+.scan.done .meter i { background:#22c55e; }
+.scan img { width:100%; max-height:90px; object-fit:cover; border-radius:6px; background:#000; }
+.cadbar { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
   .cadbar select { flex:0 0 auto; min-width:0; padding:5px 8px; font-size:12px; }
   .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
   .seg button { background:transparent; color:var(--mute); border-radius:0; padding:5px 12px; font-size:12px; font-weight:600; }
@@ -298,7 +304,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
             <span class="pill" id="syncPill">pose: off</span>
           </span></h2>
         <div class="cadbar">
-          <span class="seg" title="Offline: local verified cache only. Online: Sketchfab / Poly Pizza search">
+          <span class="seg" title="Offline: local verified cache only. Online: 1:1 CAD dummies (Printables / Thingiverse) for phones, Sketchfab / Poly Pizza game art, Open Food Facts packaging photos for cans">
             <button type="button" id="modeOff">Offline</button><button type="button" id="modeOn">Online</button>
           </span>
           <select id="srcSel" title="CAD source (Offline: local cache / uploads only)">
@@ -306,6 +312,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
             <option value="upload">Source: Custom Scan Upload</option>
           </select>
           <button class="ghost" id="browseBtn" type="button" title="Show the top ranked online models for the class on screen">Browse options</button>
+          <button class="ghost" id="scanBtn" type="button" title="Turn the physical can one full revolution in the reticle; its real label is stitched in RAM and wrapped on the verified can dimensions">Scan label 360°</button>
           <span class="pill" id="cadPill">CAD: —</span>
         </div>
         <div class="vstage">
@@ -342,6 +349,15 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
           <button class="ghost" type="button" data-op="auto">Auto-orient</button>
           <button class="ghost" type="button" data-op="reset">Reset</button>
           <span class="pill" id="orientPill">frame: —</span>
+        </div>
+        <div class="scan" id="scanBar">
+          <b>Label scan</b>
+          <span class="meter"><i id="scanMeter"></i></span>
+          <span class="pill" id="scanPill">0%</span>
+          <button type="button" id="scanFinish" disabled>Finish &amp; apply</button>
+          <button class="ghost" type="button" id="scanCancel">Cancel</button>
+          <div class="mute" id="scanMsg" style="flex-basis:100%">Slowly turn the can one full revolution inside the reticle (LEDs: amber = progress, green = complete).</div>
+          <img id="scanImg" alt="Stitched label (RAM preview)">
         </div>
       </section>
 
@@ -899,11 +915,12 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     $('nfBrowse').style.display = offline ? 'none' : '';
     $('nfGen').style.display = offline ? 'none' : '';
     renderOrient(s, glb);
+    renderScan(s, name, offline);
     if (nf && !uploadBusy) {
       $('nfTitle').textContent = s.asset_title || name;
       const why = s.asset_reason || 'No verified 3D model matches this object.';
       const next = offline ? ' Offline mode makes zero network requests: upload a .glb or switch to Online Search.'
-        : ' Pick a ranked online option, upload your own .glb, or generate geometry from verified published dimensions.';
+        : ' Pick a ranked online option, upload your own .glb, scan the can label 360°, or generate geometry from verified published dimensions.';
       if ($('nfReason').dataset.busy !== '1') $('nfReason').textContent = why + next;
     }
     const st = !name ? 'CAD: —' : glb ? `CAD: ${s.asset_badge ? 'estimated' : 'verified'}` : `CAD: ${String(s.asset_status || '').replace('_', ' ')}`;
@@ -917,6 +934,41 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         [['Stay offline', 'ghost', closeModal], ['Switch to Online & Fetch', '', () => { closeModal(); setMode('online'); }]]);
     }
   }
+
+  let scanBusy = false, scanPreviewAt = 0;
+  function renderScan(s, name, offline) {
+    const sc = s.label_scan;
+    $('scanBtn').disabled = !name || offline || !!sc;
+    $('scanBar').classList.toggle('show', !!sc);
+    if (!sc) return;
+    const pct = Math.round(100 * (sc.coverage || 0));
+    $('scanMeter').style.width = pct + '%';
+    $('scanBar').classList.toggle('done', !!sc.complete);
+    $('scanPill').textContent = `${pct}% · ${Math.round(sc.rotation_deg || 0)}° · ${sc.accepted || 0}/${sc.frames || 0} frames`;
+    $('scanFinish').disabled = scanBusy || !sc.complete;
+    if (!scanBusy) $('scanMsg').textContent = sc.complete ? 'Full label captured - press Finish & apply.'
+      : (sc.reason || 'Slowly turn the can one full revolution inside the reticle (LEDs: amber = progress, green = complete).');
+    const now = Date.now();
+    if (sc.frames && now - scanPreviewAt > 1200) { scanPreviewAt = now; $('scanImg').src = `/api/label_scan/texture.jpg?t=${now}`; }
+  }
+  $('scanBtn').onclick = async () => {
+    const id = activeName();
+    if (!id) return;
+    const j = await post('/api/label_scan', { action: 'start', label: id });
+    if (j.ok) $('enrollMsg').textContent = `Label scan started for ${id}: turn the can slowly through 360°.`;
+    pullState();
+  };
+  $('scanCancel').onclick = async () => { await post('/api/label_scan', { action: 'cancel' }); $('scanImg').removeAttribute('src'); pullState(); };
+  $('scanFinish').onclick = async () => {
+    scanBusy = true;
+    $('scanFinish').disabled = true;
+    $('scanMsg').textContent = 'Wrapping the label on the verified can dimensions…';
+    const j = await post('/api/label_scan', { action: 'finish' });
+    scanBusy = false;
+    if (j.ok) { $('enrollMsg').textContent = `Installed the scanned label for ${j.label} (${(j.result && j.result.credit) || 'operator scan'}).`; $('scanImg').removeAttribute('src'); }
+    else $('scanMsg').textContent = (j.result && j.result.reason) || j.error || 'Label scan could not be applied.';
+    pullState();
+  };
 
   async function orientCad(body) {
     const id = activeName();
@@ -1098,7 +1150,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     const src = ['local', 'upload'].includes($('srcSel').value) ? 'auto' : $('srcSel').value;
     const grid = document.createElement('div');
     grid.className = 'cands';
-    grid.textContent = 'Searching Sketchfab / Poly Pizza…';
+    grid.textContent = 'Searching CAD dummies / game-art repositories…';
     modal(`3D model options · ${state.asset_title || id}`,
       'Ranked by match level, likes, downloads and views. Nothing is downloaded until you pick one; every pick is quality-checked and credited.',
       grid, [['Close', 'ghost', closeModal]]);

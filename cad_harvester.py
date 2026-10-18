@@ -16,6 +16,15 @@ Automatic harvest (harvest / retrieve) - exact-product level only:
   <= MAX_GLB_MB and at least one material - primitive placeholders and untextured meshes are deleted and the next
   candidate is tried. If nothing passes, the result is status "not_found" (no substitute model is shown).
 
+Category-aware source order (harvest_steps):
+  smartphone   -> local library -> 1:1 CAD dummies (Printables GraphQL, Thingiverse API with THINGIVERSE_TOKEN; the
+                  mesh must match the exact variant and pass a +/-2.5 % dimension gate against GSMArena, see
+                  cad_dummies.py) -> Sketchfab / Poly Pizza.
+  beverage_can -> local library -> Sketchfab / Poly Pizza (complete artist label) -> Open Food Facts packaging photo
+                  (exact brand / flavour / tier / volume, photo gate, wrapped on a Crown-dimensioned can; see
+                  packaging.py).
+  A live 360 degree label scan of the physical can (label_stitch.py) is an explicit dashboard / MCP action.
+
 User-driven paths (never automatic):
   candidates()          - top ranked models across exact / similar / category levels for a picker UI (no download);
   select()              - download one picked candidate;
@@ -48,7 +57,9 @@ from types import SimpleNamespace
 
 import entity_resolver
 import glb_orient
+import cad_dummies
 import mcp_server as mcp
+import packaging
 import procedural_glb
 import spec_search
 import taxonomy
@@ -69,10 +80,15 @@ FLAVOR_CONFLICT = 12.0
 TIER_CONFLICT = 6.0
 POLY_PIZZA_SEARCH = "https://api.poly.pizza/v1.1/search/{query}"
 LEVEL_SCORE = {"exact": 0.0, "similar": 30.0, "category": 10.0}
-PROVIDERS = ("sketchfab", "polypizza")
-SOURCES = ("auto", "sketchfab", "polypizza", "local", "upload")
+GAME_ART = ("sketchfab", "polypizza")
+DUMMY_SOURCES = ("printables", "thingiverse")
+PROVIDERS = GAME_ART + DUMMY_SOURCES + ("packaging",)
+SOURCES = ("auto",) + PROVIDERS + ("local", "upload")
 OFFLINE_SOURCES = ("local", "upload")  # the only sources that make no network request (dashboard Offline mode)
 SPEC_BADGE = "Estimated Model: Dimensionally Calibrated via Spec Search"
+DUMMY_BADGE = "1:1 CAD dummy - dimensions verified against GSMArena"
+PACKAGING_BADGE = "Real packaging photo on manufacturer can dimensions"
+LABEL_SCAN_BADGE = "Live 360 degree label scan on manufacturer can dimensions"
 
 PHONE_TIERS = {"pro", "max", "plus", "ultra", "mini", "fe", "edge", "air", "lite"}
 CAN_TIER_SYNONYMS = {"zero": "zero", "max": "zero", "diet": "diet", "light": "diet", "lite": "diet"}
@@ -121,6 +137,7 @@ _locks_guard = threading.Lock()
 _blocked_until: dict[str, float] = {}
 _cand_guard = threading.Lock()
 _cand_cache: dict[str, dict[str, "Candidate"]] = {}
+_dummy_cache: dict[str, dict[str, dict]] = {}
 
 
 @dataclass
@@ -693,7 +710,9 @@ def _search_polypizza(product, queries: list[str], level: str, deadline: float) 
 
 
 SOURCE_NAMES = {"sketchfab": "Sketchfab", "polypizza": "Poly Pizza", "local": "Local Cache", "upload": "Custom Scan Upload",
-                "library": "Local Library"}
+                "library": "Local Library", "printables": "Printables (1:1 dummy)",
+                "thingiverse": "Thingiverse (1:1 dummy)", "packaging": "Open Food Facts packaging",
+                "label_scan": "Live label scan"}
 
 
 def _fetch(cand: Candidate, slug: str) -> bool:
@@ -890,6 +909,144 @@ def reorient(class_id: str, op: str, axis: str = "y", deg: float = 90.0, categor
     return info
 
 
+def harvest_steps(product, providers: tuple[str, ...]) -> list[tuple[str, tuple[str, ...]]]:
+    """Ordered (step, providers) plan for the automatic harvest of one product (see module docstring)."""
+    category = getattr(product, "category", "")
+    art = tuple(p for p in GAME_ART if p in providers)
+    dummies = tuple(p for p in DUMMY_SOURCES if p in providers)
+    steps: list[tuple[str, tuple[str, ...]]] = []
+    if category == "smartphone" and dummies:
+        steps.append(("dummies", dummies))
+    if art:
+        steps.append(("game_art", art))
+    if category == "beverage_can" and "packaging" in providers:
+        steps.append(("packaging", ("packaging",)))
+    return steps
+
+
+def _install(product, data: bytes, attr: dict) -> dict:
+    """Write generated / converted GLB bytes + sidecar for product.class_id (caller holds the class lock)."""
+    dest = glb_path(product.class_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".part")
+    tmp.write_bytes(data)
+    ok, why, info = validate_glb(tmp)
+    if not ok:
+        tmp.unlink(missing_ok=True)
+        raise ValueError(f"GLB failed the quality gate: {why}")
+    delete_cached(product.class_id)
+    os.replace(tmp, dest)
+    attr = {"class_id": product.class_id, "canonical_name": product.canonical_name, "quality": info,
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), **attr}
+    _write_json(sidecar_path(product.class_id), attr)
+    write_credits_md()
+    log.info("CAD for %s: %s | %s", product.class_id, attr.get("source"), attribution_line(attr))
+    return attr
+
+
+def _dummy_attr(cand: dict, spec: dict) -> dict:
+    rep = cand.get("report") or {}
+    changes = ["converted to GLB", "re-oriented", "scaled to metres"] + \
+        (["simplified"] if rep.get("triangles", 0) < rep.get("triangles_source", 0) else [])
+    by = f" by {cand['author']}" if cand.get("author") else ""
+    return {
+        "title": cand["title"], "author": cand.get("author", ""), "author_url": cand.get("author_url", ""),
+        "license": cand.get("license", ""), "license_url": cad_dummies.license_link(cand.get("license", "")),
+        "source": SOURCE_NAMES[cand["provider"]], "source_key": cand["provider"], "source_url": cand["source_url"],
+        "thumbnail_url": cand.get("thumbnail_url", ""), "modified": True, "match": "exact", "badge": DUMMY_BADGE,
+        "attribution_text": f"\"{cand['title']}\"{by} ({cand.get('license', '')}) - {cand['source_url']}; "
+                            f"file {cand.get('file', '')}, {', '.join(changes)} by Kamikaze",
+        "file": cand.get("file", ""), "dummy_report": rep, "spec_sources": spec.get("sources", []),
+        "likes": cand.get("likes"), "downloads": cand.get("downloads"), "rank_score": round(cand.get("score", 0.0), 2),
+        "query": cand.get("query", ""),
+    }
+
+
+def _try_dummies(product, deadline: float, providers: tuple[str, ...], cands: list[dict] | None = None) -> dict | None:
+    spec = spec_search.product_specs(product)
+    if not spec.get("verified"):
+        log.info("CAD %s: 1:1 dummies skipped - %s", product.class_id, spec.get("reason"))
+        return None
+    found = cad_dummies.harvest_dummy(product, spec, deadline, providers, cands)
+    if not found:
+        return None
+    cand, glb = found
+    return _install(product, glb, _dummy_attr(cand, spec))
+
+
+def _try_packaging(product) -> dict | None:
+    found = packaging.build(product, {"class_id": product.class_id})
+    if not found:
+        return None
+    attr, glb = found
+    return _install(product, glb, {**attr, "source": SOURCE_NAMES["packaging"], "source_key": "packaging",
+                                   "match": "exact", "badge": PACKAGING_BADGE})
+
+
+def install_dummy(product, providers: tuple[str, ...] = DUMMY_SOURCES, budget_s: float | None = None,
+                  class_id: str | None = None) -> dict:
+    """Explicit 1:1 phone dummy harvest (Printables / Thingiverse) for one product, ignoring game-art sources. The
+    cached model is only replaced when a dummy passes the variant + dimension gate."""
+    product = _coerce(product)
+    if class_id:
+        product = _with_class_id(product, class_id)
+    provs = tuple(p for p in DUMMY_SOURCES if p in providers)
+    if product.category != "smartphone" or not provs:
+        raise ValueError("1:1 dummies are searched for smartphones on printables / thingiverse only")
+    deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
+    with _lock_for(_slug(product.class_id)):
+        attr = _try_dummies(product, deadline, provs)
+    if not attr:
+        names = " + ".join(SOURCE_NAMES[p] for p in provs)
+        return not_found(product.class_id, product.canonical_name,
+                         f"no 1:1 dummy on {names} passed the variant + dimension gate")
+    return _result(product, attr, "online", attr["source_key"], False, attr.get("query", ""))
+
+
+def install_packaging(product, class_id: str | None = None) -> dict:
+    """Explicit Open Food Facts packaging-photo can for one product (verified can size + gated front photo)."""
+    product = _coerce(product)
+    if class_id:
+        product = _with_class_id(product, class_id)
+    if product.category != "beverage_can":
+        raise ValueError("packaging photos are used for beverage cans only")
+    with _lock_for(_slug(product.class_id)):
+        attr = _try_packaging(product)
+    if not attr:
+        return not_found(product.class_id, product.canonical_name,
+                         "no Open Food Facts product passed the brand / flavour / size gate with a usable front photo")
+    return _result(product, attr, "online", "packaging", False)
+
+
+def label_scan_spec(product) -> dict:
+    """Verified can dimensions for a label scan; ValueError (checked before the operator starts turning the can)."""
+    spec = spec_search.product_specs(_coerce(product))
+    if not spec.get("verified"):
+        raise ValueError(f"label scan needs verified can dimensions: {spec.get('reason')}")
+    return spec
+
+
+def install_label_scan(product, label_jpeg: bytes, scan: dict) -> dict:
+    """Build + install a can wrapped with a live 360 degree label scan (label_stitch.py) on verified dimensions."""
+    product = _coerce(product)
+    spec = label_scan_spec(product)
+    meta = {"class_id": product.class_id, "label_scan": scan, "spec_sources": spec["sources"]}
+    glb = procedural_glb.build_from_spec(spec, product.raw_query, meta, label=label_jpeg)
+    src = spec["sources"][0]
+    attr = {
+        "title": f"{product.canonical_name} (live label scan)", "author": "operator camera scan (Kamikaze)",
+        "author_url": PROJECT_URL, "license": "provided by the user", "license_url": "", "source": SOURCE_NAMES["label_scan"],
+        "source_key": "label_scan", "source_url": src["url"], "thumbnail_url": "", "modified": False, "match": "exact",
+        "badge": LABEL_SCAN_BADGE, "spec": spec, "label_scan": scan, "approximations": spec.get("approximations", []),
+        "attribution_text": (f"Label stitched from the operator's live camera ({scan.get('frames', 0)} frames); geometry: "
+                             f"Kamikaze spec generator from {src['publisher']} {spec['diameter_mm']} x "
+                             f"{spec['height_mm']} mm ({src['url']})"),
+    }
+    with _lock_for(_slug(product.class_id)):
+        attr = _install(product, glb, attr)
+    return _result(product, attr, "generated", "label_scan", False)
+
+
 def _finish(product, cand: Candidate, source_name: str, status: str, extra: dict | None = None) -> dict:
     attr = {**_record(product, cand, source_name), **(extra or {})}
     attr.update(_orientation_fields(_auto_orient(product.class_id, product.category)))
@@ -945,19 +1102,30 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
                              "upload a GLB or pick an online source")
         deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
         queries = [q for q, lv in search_plan(product) if lv == "exact"]
-        found = None
-        if queries:
+        steps = harvest_steps(product, providers)
+        for step, provs in steps:
+            if time.monotonic() > deadline:
+                break
             try:
-                found = _try_online(product, slug, deadline, queries, "exact", providers)
-            except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError) as exc:
-                log.warning("CAD search failed for %s: %s", product.class_id, exc)
-        if not found:
-            names = " + ".join(SOURCE_NAMES[p] for p in providers)
-            return not_found(product.class_id, product.canonical_name,
-                             f"no exact-match model on {names} passed the quality gate - browse similar options, "
-                             "upload a GLB or generate one from verified specs")
-        cand, source_name = found
-        return _finish(product, cand, source_name, "online")
+                if step == "dummies":
+                    attr = _try_dummies(product, deadline, provs)
+                    if attr:
+                        return _result(product, attr, "online", attr["source_key"], False, attr.get("query", ""))
+                elif step == "game_art" and queries:
+                    found = _try_online(product, slug, deadline, queries, "exact", provs)
+                    if found:
+                        return _finish(product, found[0], found[1], "online")
+                elif step == "packaging":
+                    attr = _try_packaging(product)
+                    if attr:
+                        return _result(product, attr, "online", "packaging", False)
+            except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError,
+                    cad_dummies.DummyError, packaging.PackagingError) as exc:
+                log.warning("CAD %s step %s failed for %s: %s", step, "+".join(provs), product.class_id, exc)
+        names = " + ".join(SOURCE_NAMES[p] for _, provs in steps for p in provs) or "the selected source"
+        return not_found(product.class_id, product.canonical_name,
+                         f"no exact-match model on {names} passed the quality gate - browse similar options, "
+                         "upload a GLB, scan the label or generate one from verified specs")
 
 
 def candidates(product, limit: int = 4, source: str = "auto", budget_s: float | None = None) -> list[dict]:
@@ -967,6 +1135,26 @@ def candidates(product, limit: int = 4, source: str = "auto", budget_s: float | 
     if not providers:
         return []
     deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
+    dummies: list[dict] = []
+    dummy_provs = tuple(p for p in DUMMY_SOURCES if p in providers)
+    if product.category == "smartphone" and dummy_provs:
+        try:
+            dummies = cad_dummies.search(product, dummy_provs)[:max(1, int(limit) // 2)]
+        except (urllib.error.URLError, OSError, ValueError, cad_dummies.DummyError) as exc:
+            log.warning("dummy search failed for %s: %s", product.class_id, exc)
+    with _cand_guard:
+        _dummy_cache[_slug(product.class_id)] = {d["uid"]: d for d in dummies}
+    out = [{
+        "uid": d["uid"], "provider": d["provider"], "source": SOURCE_NAMES[d["provider"]], "title": d["title"],
+        "thumbnail_url": d.get("thumbnail_url", ""), "author": d.get("author", ""), "author_url": d.get("author_url", ""),
+        "license": d.get("license", ""), "license_url": cad_dummies.license_link(d.get("license", "")),
+        "source_url": d["source_url"], "faces": 0, "likes": d.get("likes"), "views": None, "downloads": d.get("downloads"),
+        "level": "exact", "query": d.get("query", ""), "score": round(d["score"], 1),
+    } for d in dummies]
+    providers = tuple(p for p in providers if p in GAME_ART)
+    limit = max(0, int(limit) - len(out))
+    if not providers or not limit:
+        return out
     plan = search_plan(product)
     picked: list[Candidate] = []
     seen: set[tuple[str, str]] = set()
@@ -978,10 +1166,10 @@ def candidates(product, limit: int = 4, source: str = "auto", budget_s: float | 
             if (cand.provider, cand.uid) not in seen:
                 seen.add((cand.provider, cand.uid))
                 picked.append(cand)
-    picked = picked[:max(1, int(limit))]
+    picked = picked[:limit]
     with _cand_guard:
         _cand_cache[_slug(product.class_id)] = {c.uid: c for c in picked}
-    return [{
+    return out + [{
         "uid": c.uid, "provider": c.provider, "source": SOURCE_NAMES.get(c.provider, c.provider), "title": c.title,
         "thumbnail_url": c.thumbnail_url, "author": c.author, "author_url": c.author_url, "license": c.license,
         "license_url": c.license_url, "source_url": c.source_url, "faces": c.faces, "likes": c.extra.get("likes"),
@@ -996,6 +1184,15 @@ def select(product, uid: str) -> dict:
     slug = _slug(product.class_id)
     with _cand_guard:
         cand = (_cand_cache.get(slug) or {}).get(uid)
+        dummy = (_dummy_cache.get(slug) or {}).get(uid)
+    if dummy is not None:
+        with _lock_for(slug):
+            attr = _try_dummies(product, time.monotonic() + BUDGET_S, (dummy["provider"],), [dummy])
+        if not attr:
+            raise ValueError(f"{dummy['title']!r}: no file matched the exact variant and the verified dimensions")
+        attr["selected_by_user"] = True
+        _write_json(sidecar_path(product.class_id), attr)
+        return _result(product, attr, "online", attr["source_key"], False, attr.get("query", ""))
     if cand is None:
         raise KeyError(f"candidate {uid!r} is not in the last search for {product.class_id}; browse options again")
     with _lock_for(slug):
@@ -1046,41 +1243,41 @@ def use_library(class_id: str, entry_id: str) -> dict:
     return _result(product, attr, "cached", "library", True)
 
 
-def generate_from_specs(product, profile: str | None = None) -> dict:
-    """Build a dimension-calibrated GLB from verified published specs (explicit user action only)."""
+def generate_from_specs(product, profile: str | None = None, layout: dict | None = None) -> dict:
+    """Build a dimension-calibrated GLB from verified published specs (explicit user action only).
+
+    `layout` (phones only): cited rear-camera island / lens coordinates in mm from the top-left of the back (see
+    procedural_glb.validate_layout); it replaces the generic per-maker island approximation. Raises ValueError when the
+    layout does not fit the verified body or cites no source."""
     product = _coerce(product)
     spec = spec_search.product_specs(product, profile)
     if not spec.get("verified"):
         return {**not_found(product.class_id, product.canonical_name, spec.get("reason", "specs not verified")),
                 "spec": spec}
-    data = procedural_glb.build_from_spec(spec, product.raw_query, {"class_id": product.class_id})
-    slug = _slug(product.class_id)
-    dest = glb_path(product.class_id)
-    with _lock_for(slug):
-        delete_cached(product.class_id)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(".part")
-        tmp.write_bytes(data)
-        ok, why, info = validate_glb(tmp)
-        if not ok:
-            tmp.unlink(missing_ok=True)
-            raise ValueError(f"generated GLB failed the quality gate: {why}")
-        os.replace(tmp, dest)
-        src = spec["sources"][0]
-        dims = (f"{spec['height_mm']} x {spec['width_mm']} x {spec['depth_mm']} mm, {spec['rear_cameras']} rear cameras"
-                if spec["category"] == "smartphone" else
-                f"{spec['diameter_mm']} x {spec['height_mm']} mm ({spec['volume_ml']} ml {spec['profile']})")
-        attr = {
-            "title": f"{product.canonical_name} (dimensionally calibrated)", "author": "Kamikaze spec generator",
-            "author_url": PROJECT_URL, "license": "MIT (project licence)", "license_url": f"{PROJECT_URL}/blob/main/LICENSE",
-            "source": "Spec search", "source_key": "spec_generated", "source_url": src["url"], "thumbnail_url": "",
-            "attribution_text": f"Generated by Kamikaze from published dimensions ({dims}) - {src['publisher']} ({src['url']})",
-            "modified": False, "class_id": product.class_id, "canonical_name": product.canonical_name, "match": "spec",
-            "badge": SPEC_BADGE, "spec": spec, "quality": info,
-            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
-        }
-        _write_json(sidecar_path(product.class_id), attr)
-        write_credits_md()
+    if layout is not None:
+        if spec["category"] != "smartphone":
+            raise ValueError("a camera layout only applies to smartphones")
+        procedural_glb.validate_layout(layout, spec["width_mm"], spec["height_mm"])
+    data = procedural_glb.build_from_spec(spec, product.raw_query, {"class_id": product.class_id}, layout=layout)
+    src = spec["sources"][0]
+    dims = (f"{spec['height_mm']} x {spec['width_mm']} x {spec['depth_mm']} mm, {spec['rear_cameras']} rear cameras"
+            if spec["category"] == "smartphone" else
+            f"{spec['diameter_mm']} x {spec['height_mm']} mm ({spec['volume_ml']} ml {spec['profile']})")
+    attr = {
+        "title": f"{product.canonical_name} (dimensionally calibrated)", "author": "Kamikaze spec generator",
+        "author_url": PROJECT_URL, "license": "MIT (project licence)", "license_url": f"{PROJECT_URL}/blob/main/LICENSE",
+        "source": "Spec search", "source_key": "spec_generated", "source_url": src["url"], "thumbnail_url": "",
+        "attribution_text": f"Generated by Kamikaze from published dimensions ({dims}) - {src['publisher']} ({src['url']})",
+        "modified": False, "match": "spec", "badge": SPEC_BADGE, "spec": spec,
+    }
+    if layout is not None:
+        attr["layout"] = layout
+        attr["attribution_text"] += f"; camera layout: {layout['source']}"
+    with _lock_for(_slug(product.class_id)):
+        try:
+            attr = _install(product, data, attr)
+        except ValueError as exc:
+            raise ValueError(f"generated {exc}") from exc
     log.info("Spec-generated CAD for %s: %s", product.class_id, attr["attribution_text"])
     return {**_result(product, attr, "generated", "spec_generated", False), "spec": spec}
 

@@ -639,5 +639,121 @@ def get_pose_telemetry() -> dict:
     return _receiver_call("GET", "/api/pose", timeout=5.0)
 
 
+def _providers_arg(text: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
+    picked = tuple(p.strip().lower() for p in (text or "").split(",") if p.strip())
+    bad = [p for p in picked if p not in allowed]
+    if bad:
+        raise ValueError(f"unknown provider(s) {bad}; choose from {list(allowed)}")
+    return picked or allowed
+
+
+@mcp.tool()
+def search_cad_dummies(query: str, install: bool = False, providers: str = "printables,thingiverse", limit: int = 8,
+                       class_label: str = "") -> dict:
+    """1:1 smartphone CAD "dummies" / case templates (Printables, Thingiverse with THINGIVERSE_TOKEN) for a phone model.
+
+    Candidates are ranked by title relevance (exact model + tier, generation and other-tier conflicts rejected),
+    popularity and licence. With install=True the best file that passes the variant check AND the dimension gate
+    against GSMArena's published height/width/depth is converted (STL/OBJ/3MF -> oriented, metre-scaled GLB) and cached
+    for the class (`class_label`, default the resolved class id); a failed attempt keeps the existing model.
+    Returns {"product", "spec", "candidates": [...], "installed"?: {...}}.
+    """
+    import cad_dummies
+    import cad_harvester
+    import entity_resolver
+    import spec_search
+
+    try:
+        provs = _providers_arg(providers, cad_harvester.DUMMY_SOURCES)
+        product = entity_resolver.resolve(query, category="smartphone")
+        spec = spec_search.product_specs(product)
+        cands = cad_dummies.search(product, provs)[:max(1, min(25, int(limit)))]
+    except Exception as exc:  # network / parse / taxonomy errors are reported to the caller, never raised over stdio
+        return {"ok": False, "error": str(exc)}
+    out = {"ok": True, "product": product.to_dict(), "spec": spec, "candidates": [{
+        **{k: c.get(k) for k in ("uid", "provider", "title", "author", "author_url", "license", "source_url",
+                                 "thumbnail_url", "likes", "downloads", "query")},
+        "license_url": cad_dummies.license_link(c.get("license", "")), "rank_score": round(c.get("score", 0.0), 2),
+    } for c in cands]}
+    if install:
+        try:
+            out["installed"] = cad_harvester.install_dummy(product, provs, class_id=class_label or None)
+        except Exception as exc:
+            out["installed"] = {"status": "error", "reason": str(exc)}
+    return out
+
+
+@mcp.tool()
+def get_product_packaging(query: str, install: bool = False, limit: int = 5, class_label: str = "") -> dict:
+    """Open Food Facts packaging photos for a beverage can (brand / flavour / sub-tier / can-volume gated, no API key).
+
+    Returns the matching OFF products with their front-photo URLs. With install=True the first photo whose can passes
+    segmentation + the aspect check against the verified Crown can dimensions is unwrapped onto a dimension-calibrated
+    can (the unseen back ~60 % is filled from the label edge colour and flagged as an approximation) and cached for the
+    class. Attribution: Open Food Facts contributors (CC BY-SA 3.0).
+    """
+    import cad_harvester
+    import entity_resolver
+    import packaging
+
+    try:
+        product = entity_resolver.resolve(query, category="beverage_can")
+        hits = packaging.find_products(product)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    out = {"ok": True, "product": product.to_dict(), "query": packaging.lucene_query(product), "products": [{
+        "code": h.get("code"), "name": h.get("product_name"), "brands": h.get("brands"), "quantity": h.get("quantity"),
+        "volume_ml": h.get("volume_ml"), "scans": h.get("unique_scans_n"), "image_front_url": h.get("image_front_url"),
+        "image_full_url": packaging.full_image_url(h.get("image_front_url", "")),
+        "page": packaging.OFF_PAGE.format(code=h.get("code")),
+    } for h in hits[:max(1, min(25, int(limit)))]], "license": packaging.OFF_LICENSE}
+    if install:
+        try:
+            out["installed"] = cad_harvester.install_packaging(product, class_id=class_label or None)
+        except Exception as exc:
+            out["installed"] = {"status": "error", "reason": str(exc)}
+    return out
+
+
+@mcp.tool()
+def stitch_camera_texture(action: str = "status", label: str = "") -> dict:
+    """Live 360-degree label scan of the can held in front of the camera (receiver must be running).
+
+    action="start" with the enrolled class `label`, then slowly turn the can one full revolution inside the reticle:
+    the Modulino bar shows coverage in amber and turns solid green when the label is complete. action="status" reports
+    coverage / frames, "finish" wraps the stitched label on the verified can dimensions and installs it as the class
+    model, "cancel" discards it. Frames and the partial label stay in RAM; only the finished texture is saved (inside
+    the GLB). The partial label is viewable at /api/label_scan/texture.jpg.
+    """
+    action = (action or "status").lower()
+    body = {"action": action, **({"label": label} if label else {})}
+    return _receiver_call("POST", "/api/label_scan", body, timeout=90.0 if action == "finish" else 10.0)
+
+
+@mcp.tool()
+def assemble_phone_mesh(query: str, layout_json: str = "", class_label: str = "") -> dict:
+    """Dimension-calibrated phone GLB from verified GSMArena height/width/depth + rear camera count.
+
+    `layout_json` (optional): cited rear-camera geometry in mm measured on the BACK from its top-left corner, e.g.
+    {"source": "Apple Accessory Design Guidelines r22, fig 41", "island": {"x": 19, "y": 19, "w": 33, "h": 33,
+    "r": 8, "bump": 1.5}, "lenses": [{"x": 11, "y": 11, "r": 6, "h": 1.2}, ...]}. A layout without a source or with
+    parts outside the verified body is rejected. Without it the generic per-maker island is used and listed under
+    "approximations". Returns the installed asset with its spec + sources, or not_found when specs cannot be verified.
+    """
+    import cad_harvester
+    import entity_resolver
+
+    try:
+        layout = json.loads(layout_json) if layout_json.strip() else None
+        if layout is not None and not isinstance(layout, dict):
+            raise ValueError("layout_json must be a JSON object")
+        product = entity_resolver.resolve(query, category="smartphone")
+        if class_label:
+            product = cad_harvester._with_class_id(product, class_label)
+        return cad_harvester.generate_from_specs(product, layout=layout)
+    except Exception as exc:
+        return {"ok": False, "status": "error", "error": str(exc)}
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

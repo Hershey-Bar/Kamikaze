@@ -775,14 +775,16 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
             return cand, "Sketchfab"
 
         try:
-            with mock.patch.object(cad_harvester, "_try_online", return_value=None):
+            with mock.patch.object(cad_harvester, "_try_online", return_value=None), \
+                    mock.patch.object(cad_harvester, "_try_dummies", return_value=None):
                 status, out = self.call("POST", "/api/cad/fetch", {"label": cid})
             self.assertEqual(status, 200, out)
             self.assertEqual((out["status"], out["glb_url"]), ("not_found", ""), out)
             self.assertTrue(out["reason"])
             row = next(p for p in self.call("GET", "/api/classes")[1]["prototypes"] if p["class_id"] == cid)
             self.assertEqual(row["cad_status"], "missing")
-            with mock.patch.object(cad_harvester, "_try_online", side_effect=found):
+            with mock.patch.object(cad_harvester, "_try_online", side_effect=found), \
+                    mock.patch.object(cad_harvester, "_try_dummies", return_value=None):
                 status, out = self.call("POST", "/api/cad/fetch", {"label": cid})
             self.assertEqual((status, out["status"]), (200, "online"), out)
             self.assertTrue(out["glb_url"].endswith(f"{cid}.glb"))

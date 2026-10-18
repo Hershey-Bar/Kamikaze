@@ -641,7 +641,7 @@ class CadModeEndpointTests(unittest.TestCase):
         self.assertEqual((status, out["mode"], out["source"]), (200, "online", "polypizza"))
         self.assertFalse(self.assets.offline)
         self.assertEqual(self.call("POST", "/api/settings/mode", {"mode": "sideways"})[0], 400)
-        self.assertEqual(self.call("POST", "/api/settings/mode", {"source": "thingiverse"})[0], 400)
+        self.assertEqual(self.call("POST", "/api/settings/mode", {"source": "turbosquid"})[0], 400)
         status, out = self.call("POST", "/api/settings/mode", {"mode": "offline"})
         self.assertEqual((out["mode"], out["source"]), ("offline", "local"))
         self.assertEqual(self.call("POST", "/api/settings/mode", {"mode": "online"})[1]["source"], "polypizza")

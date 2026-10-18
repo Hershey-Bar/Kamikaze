@@ -14,8 +14,9 @@ Logitech Brio (USB 3.0 on the board, /dev/video0, V4L2 MJPG 1920x1080 @ 30 fps) 
                 DINOv2 ViT-S/14 pose worker (Hexagon NPU, own thread, 10 Hz) -> per-view centroids -> continuous yaw
                 pose.py (OpenCV/NumPy + view matching)   -> pitch/yaw/roll for the 3D viewer
                 ocr_fusion.py (RapidOCR worker, CPU, ~3 Hz) -> brand/flavour words -> 0.65 vision + 0.35 text
-                cad_harvester.py (Sketchfab + Poly Pizza exact matches, quality gate; else NOT_FOUND ->
-                                  browse / upload / generate from verified specs)
+                cad_harvester.py (local library -> phones: 1:1 CAD dummies (Printables / Thingiverse, dimension-gated)
+                                  -> Sketchfab + Poly Pizza exact matches -> cans: Open Food Facts packaging photo;
+                                  else NOT_FOUND -> browse / upload / 360° label scan / generate from verified specs)
                                                          -> static/models/<class>.glb + attribution
                 /var/run/arduino-router.sock (MessagePack-RPC set_pixels) -> STM32 -> Wire1 (I2C4) -> Modulino Pixels
 ```
@@ -27,7 +28,7 @@ cd ~/hackathon_iot
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 # Hexagon NPU runtime (QNN TFLite delegate + cDSP skeletons)
 sudo add-apt-repository ppa:ubuntu-qcom-iot/qcom-ppa && sudo apt install qairt-libs qairt-dsp-binaries
-cp .env.example .env   # add SKETCHFAB_TOKEN and POLY_PIZZA_API_KEY
+cp .env.example .env   # add SKETCHFAB_TOKEN, POLY_PIZZA_API_KEY and (optional) THINGIVERSE_TOKEN
 ./export_yolo.sh       # YOLO-World (domain vocabulary) + YOLO26n + YOLO11n -> models/npu/*_float32.tflite
 TORCH_HOME=models/dinov2 ~/yolo_export/venv/bin/python export_dinov2.py  # DINOv2 ViT-S/14 -> models/npu/dinov2_vits14_pose_float32.tflite (pose worker)
 ```
@@ -303,6 +304,48 @@ Every download passes a **quality gate** (`validate_glb`): valid GLB 2.0 contain
 boxes and placeholder primitives), ≤ 350k vertices, ≤ 35 MB, at least one material. Rejected files are deleted and the
 next candidate is tried. A GLB without its attribution sidecar is never shown.
 
+**Manufacturing and packaging sources.** Game-art sites rarely carry an exact iPhone 15 Pro chassis or a niche can
+flavour, so the automatic harvest tries the sources where those assets actually live, in this order:
+
+| Step | Phones | Cans |
+|---|---|---|
+| 1 | local model library (owner scans) | local model library |
+| 2 | **1:1 CAD dummies** (`cad_dummies.py`): Printables GraphQL (no key) and Thingiverse (`THINGIVERSE_TOKEN`) | Sketchfab / Poly Pizza exact match |
+| 3 | Sketchfab / Poly Pizza exact match | **Open Food Facts packaging photo** (`packaging.py`, no key) |
+
+*Dummies* are the 1:1 replicas case makers print. Candidates are ranked by title (dummy / 1:1 words, exact tier) and
+popularity. Licences must allow redistribution (Standard Digital File and NC are refused; `KAMIKAZE_CAD_ALLOW_NC=1`
+admits NC for private demos), and ND files are never simplified. Every file must name this exact variant: a
+`iphone_15_pro.stl` inside a *15 Pro / Pro Max* print is rejected, as is an unnamed file in a multi-variant print.
+STL / OBJ / 3MF files are loaded (3MF XML is parsed with entities refused). They are oriented by their own axes or by
+surface PCA, whichever bounds tighter, and must pass a **dimension gate**: height and width within the tolerance of the
+GSMArena numbers, thickness between the body and body + camera bump, with mm / cm / m / inch auto-detected. The camera
+bump goes to the back, top. The result is decimated (vertex clustering, ≤ 120k triangles) and written as a GLB in
+metres. Live check: Printables *iPhone 15 Pro Max model* by jack@meow (public domain) passes at 159.5 × 77.7 mm.
+
+*Packaging photos*: Open Food Facts is searched by brand + flavour. A hit must match brand, flavour, tier (zero /
+diet), drink type and can volume, and it must have a front photo. The photo is segmented (GrabCut), checked to be an
+upright side view whose aspect matches the Crown can, and unwrapped per row onto the visible arc of the cylinder.
+The unseen back is filled with the label's edge colour and listed as an approximation; images are CC BY-SA 3.0,
+credited to *Open Food Facts contributors* with the product link. Cans keep game art first because one photo
+covers only about 140° of the label.
+
+**360° label scan** (`label_stitch.py`, dashboard **Scan label 360°**, `POST /api/label_scan`). This captures
+the real label of the can in your hand, including special editions and local variants. Before the scan starts, the
+class must resolve to verified Crown dimensions, so its name needs a volume (`kirkland lime 355ml`). While the scan
+runs, each frame's detected can is unwrapped and its low-glare central band is registered by phase correlation. The
+band is then blended into a cylindrical texture. The Modulino shows amber, with the number of LEDs equal to the
+coverage in eighths; it turns solid green at 98.5 %. **Finish & apply** wraps the stitched texture on the
+manufacturer can dimensions and installs it, credited to the operator's scan. Frames and strips stay in RAM only, and
+an abandoned scan expires after 180 s.
+
+**Cited phone layouts.** `generate_spec` (and the MCP tool `assemble_phone_mesh`) accept
+`{"layout": {"source": ..., "island": {...}, "lenses": [{"x", "y", "r", "h"}]}}`. The coordinates are in mm, measured
+on the back from its top-left corner. Use them, for example, for lens centres from Apple's *Accessory Design
+Guidelines* drawings. A layout without a `source`, or one that lies outside the published body, is refused, and the
+source is added to the credit line. Without a layout, the generic per-maker arrangement is used and flagged as an
+approximation.
+
 **Generate from specs** (`spec_search.py` + `procedural_glb.py`) builds a dimension-calibrated GLB only from published
 numbers: smartphones from the GSMArena spec page (height × width × depth in mm; Apple and Samsung), cans from Crown's
 standard can table (the class must state its volume, e.g. `330ml`, snapped to a Crown size within 3%; 330 ml standard
@@ -366,7 +409,9 @@ per-class copies made from it). Scans keep their scanned scale; model-viewer fra
 | GET | `/api/classes/<id>/cad_candidates?source=&limit=4` | ranked online candidates, nothing downloaded (409 offline, 404 not enrolled) |
 | POST | `/api/classes/<id>/cad_select` `{"uid": ...}` | download + validate + attach a browsed candidate |
 | POST | `/api/classes/<id>/upload_cad?filename=x.glb` | raw GLB body (≤ `KAMIKAZE_CAD_UPLOAD_MB`, 35); 422 when it fails the quality gate |
-| POST | `/api/classes/<id>/generate_spec` | dimension-calibrated GLB from verified specs (404 + reason when no spec is found) |
+| POST | `/api/classes/<id>/generate_spec` | dimension-calibrated GLB from verified specs, optional cited `{"layout": ...}` for phones (404 + reason when no spec is found) |
+| GET, POST | `/api/label_scan` `{"action": "start"\|"status"\|"cancel"\|"finish", "label": ...}` | 360° can label scan (400 not a can / no verified volume, 404 not enrolled, 409 incomplete / offline / no scan) |
+| GET | `/api/label_scan/texture.jpg` | stitched label preview (404 when no scan is running) |
 | GET | `/api/credits`, `/api/db/export`; POST `/api/db/save` | attribution, database export/save |
 | GET | `/api/models` | local model library + per-class cached models |
 | POST | `/api/models/library?name=&category=&filename=&replace=1` | raw GLB body → quality gate → library (201; 409 exists; 422 rejected) |
@@ -375,12 +420,16 @@ per-class copies made from it). Scans keep their scanned scale; model-viewer fra
 | GET | `/ATTRIBUTION.md` | third-party credits |
 
 `mcp_server.py` exposes the same capabilities as FastMCP tools over stdio (`search_3d_asset`, `actuate_modulino`,
-`trigger_guidance`, `enroll_multiview`, `fetch_cad_asset`, `resolve_product`, `get_telemetry`, `get_pose_telemetry`, ...).
+`trigger_guidance`, `enroll_multiview`, `fetch_cad_asset`, `resolve_product`, `get_telemetry`, `get_pose_telemetry`, ...),
+plus the manufacturing / packaging tools `search_cad_dummies` (rank, and with `install=true` harvest, a 1:1 phone dummy),
+`get_product_packaging` (Open Food Facts hits, `install=true` builds the textured can), `stitch_camera_texture`
+(drives the live 360° label scan on the running receiver) and `assemble_phone_mesh` (verified-spec phone, optional
+cited `layout_json`).
 
 ## Tests
 
 ```bash
-.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite
+.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite test_cad_sources
 ```
 
 Hardware tests (LED RPC, Hexagon NPU, online CAD) skip themselves when the router socket, the NPU or credentials are absent.

@@ -29,6 +29,15 @@ Enrollment stores only normalised embedding vectors and OCR keyword lexicons (`e
 - **Online CAD** (Sketchfab, Poly Pizza): each downloaded model keeps its own title, author, licence and source link
   in a sidecar `.json`. The dashboard credit line and `GET /api/credits` show them for whichever model is on stage.
   No model is shown without its attribution. No geometry is invented for products whose dimensions are not verified.
+- **1:1 phone dummies** (Printables <https://www.printables.com>, Thingiverse <https://www.thingiverse.com>): each
+  converted dummy keeps the print title, author, licence (with deed link) and print URL, and is marked as modified
+  (converted to GLB, re-oriented, scaled, possibly simplified; never simplified under ND licences). Only licences
+  allowing redistribution are used; NC only with `KAMIKAZE_CAD_ALLOW_NC=1`.
+- **Packaging photos**: Open Food Facts contributors, <https://world.openfoodfacts.org>, images under
+  CC BY-SA 3.0 (<https://creativecommons.org/licenses/by-sa/3.0/>), product page linked per model; the photo is
+  segmented and unwrapped onto the can (modified).
+- **Dimensions**: smartphones from GSMArena spec pages (linked per model), cans from Crown's standard can size table.
+- **Live label scans** are made by the operator's own camera and stay on the device.
 
 ## Hardware
 
