@@ -8,16 +8,17 @@ One process, one port (0.0.0.0:5000):
   GET  /api/asset                    active 3D asset for the identified object
   GET  /api/frame.jpg                latest camera frame (dashboard live view)
   GET  /api/classes                  enrolled classes: metadata, view count, created_at, CAD status/credit
-  DELETE /api/classes/<id>[?delete_cad=1]   remove one class (and optionally its cached GLB); updates enrolled_classes.pt
-  POST /api/classes/reset            {"delete_cad": false} drop every enrolled class
+  DELETE /api/classes/<id>[?delete_cad=0]   remove one class + its cached GLB/attribution (keep the GLB with delete_cad=0)
+  POST /api/classes/reset            {"delete_cad": true} drop every enrolled class (and their cached GLBs)
   POST /api/resolve                  {"text": "coke zero can 330ml"} -> canonical product (class_id, brand, tier, CAD terms)
   GET  /api/telemetry                SoC identity, thermals, per-core freq/load, RAM, uptime, router IPC, bridge latency,
-                                     Wire1/Modulino status, ExecuTorch median/p95, cosine/margin, FPS (SSE: /api/telemetry/stream)
+                                     Wire1/Modulino status, NPU (cDSP/NSP), detector + embedder median/p95, cosine/margin, FPS
+                                     (SSE: /api/telemetry/stream)
   GET  /api/credits                  author/licence attribution of every cached 3D model
   POST /api/enroll                   legacy single-shot {"label": "coke_can", "frames": 12, "append": false, "wait": false}
   POST /api/unenroll                 {"label": "coke_can"}
   POST /api/enroll/start             multi-view guided enrollment: {"raw_name", "category", "brand", "variant",
-                                     "package_type", "container_volume", "frames_per_view": 8}
+                                     "package_type", "container_volume", "frames_per_view": 10}
   POST /api/enroll/capture           {"view": "front|back|side|top", "wait": false} capture the current/named view
   POST /api/enroll/finish | /cancel  finish early with the captured views / abort the session
   GET  /api/enroll/status            wizard state (current view, per-view progress + stability)
@@ -27,13 +28,15 @@ One process, one port (0.0.0.0:5000):
   POST /api/cad/fetch                {"raw_name": "...", "force": true} resolve + (re)harvest the CAD model, with attribution
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
-Pipeline per frame: center-60% crop -> 224x224 ImageNet normalisation -> MobileNetV3-Large embedding
-(ExecuTorch/XNNPACK fp16 on the Arm CPU, torch eager as fallback) -> L2-normalised vector -> cosine
-similarity against the multi-view prototypes (front/back/side/top centroids + global centroid) -> 5-frame
-temporal state machine -> Modulino Pixels via the Arduino Router socket (STM32 firmware untouched), 3D CAD
-retrieval and physical pose estimation (pose.py).
+Pipeline per frame: EfficientDet-Lite2 int8 object detection on the Hexagon NPU (npu.py; phones, bottles/cans) ->
+square crop around the target inside the central 60% box (temporally smoothed; the fixed center-60% crop when nothing
+is detected) -> 224x224 -> 1280-d MobileNetV3-Large embedding on the NPU (QNN TFLite delegate; ExecuTorch/XNNPACK or
+torch on the Arm CPU as fallbacks) -> L2-normalised vector -> cosine similarity against the multi-view prototypes
+(front/back/side/top centroids + global centroid) -> 5-frame temporal state machine -> Modulino Pixels via the Arduino
+Router socket (STM32 firmware untouched), background 3D CAD retrieval and physical pose estimation (pose.py).
 
-Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|executorch|torch),
+Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
+KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (lite2|lite0), KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
 KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_T_IDENT/T_SEARCH/MARGIN,
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s).
 
@@ -74,6 +77,7 @@ except ImportError:  # the state machine / HTTP layer stay importable without to
 
 import cad_harvester
 import entity_resolver
+import npu as npu_mod
 import pose as pose_mod
 import taxonomy
 import telemetry
@@ -92,7 +96,8 @@ HOST = os.environ.get("KAMIKAZE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("KAMIKAZE_PORT", "5000"))
 BANK_PATH = Path(os.environ.get("KAMIKAZE_BANK", BASE_DIR / "enrolled_classes.pt"))
 PTE_DIR = Path(os.environ.get("KAMIKAZE_PTE_DIR", BASE_DIR / "models"))
-EMBED_BACKEND = os.environ.get("KAMIKAZE_EMBED_BACKEND", "auto")
+EMBED_BACKEND = os.environ.get("KAMIKAZE_EMBED_BACKEND", "auto")  # auto | npu | executorch | torch
+DETECT_CROP = os.environ.get("KAMIKAZE_DETECT_CROP", "1") != "0"
 EMBED_PRECISION = os.environ.get("KAMIKAZE_EMBED_PRECISION", "fp16")
 TORCH_THREADS = int(os.environ.get("KAMIKAZE_TORCH_THREADS", "1"))
 LOG_FRAMES = os.environ.get("KAMIKAZE_LOG_FRAMES", "1") != "0"
@@ -103,7 +108,7 @@ PREVIEW_FRAME = os.environ.get("KAMIKAZE_PREVIEW", "1" if MODE == "training" els
 INPUT_SIZE = 224
 CROP_FRACTION = 0.60
 EMBED_DIM = 1280
-EMBEDDER_ID = "mobilenet_v3_large-fc1280"
+EMBEDDER_ID = "mobilenet_v3_large-fc1280"  # torchvision weights (ExecuTorch / eager); the NPU embedder has its own id
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -132,7 +137,7 @@ MSG_GUIDE_BOTTLE = "Rotate bottle slowly to show the front label to the camera."
 MSG_PHONE_FLIP = taxonomy.MSG_PHONE_FLIP
 MSG_PHONE_TILT = taxonomy.MSG_PHONE_TILT
 PHONE_AMBIG_MARGIN = float(os.environ.get("KAMIKAZE_PHONE_MARGIN", "0.20"))
-FRAMES_PER_VIEW = 8
+FRAMES_PER_VIEW = 10
 MIN_VIEW_FRAMES = 4
 MV_IDLE_EXPIRE_S = 900.0
 SSE_PERIOD_S = 0.1
@@ -151,11 +156,11 @@ def center_crop_box(width: int, height: int) -> tuple[int, int, int]:
     return size, (width - size) // 2, (height - size) // 2
 
 
-def preprocess(image: Image.Image) -> np.ndarray:
-    """Center-60% crop -> 224x224 -> ImageNet normalisation. Returns contiguous float32 (1,3,224,224)."""
+def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> np.ndarray:
+    """Square crop (detector box, else the center 60%) -> 224x224 -> ImageNet normalisation. float32 (1,3,224,224)."""
     if image.mode != "RGB":
         image = image.convert("RGB")
-    size, left, top = center_crop_box(*image.size)
+    size, left, top = box or center_crop_box(*image.size)
     crop = image.crop((left, top, left + size, top + size)).resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
     arr = (np.asarray(crop, dtype=np.float32) * (1.0 / 255.0) - IMAGENET_MEAN) / IMAGENET_STD
     return np.ascontiguousarray(arr.transpose(2, 0, 1)[None])
@@ -188,7 +193,13 @@ def build_pte(path: Path, precision: str) -> None:
 
 
 class FeatureExtractor:
-    """Image -> L2-normalised 1280-d embedding."""
+    """Image -> L2-normalised 1280-d embedding.
+
+    Backends, in "auto" order: npu (MediaPipe MobileNetV3-Large embedder on the Hexagon HTP through the QNN TFLite
+    delegate; the same .tflite on XNNPACK if the HTP is unavailable), executorch (torchvision MobileNetV3-Large,
+    XNNPACK fp16 .pte), torch (eager fp32). npu and executorch/torch use different weights, so each has its own
+    embedder_id and enrolled classes do not carry across backends.
+    """
 
     def __init__(self, backend: str = EMBED_BACKEND, precision: str = EMBED_PRECISION, threads: int = TORCH_THREADS):
         if torch is None:
@@ -196,20 +207,37 @@ class FeatureExtractor:
         self._lock = threading.Lock()
         self._runtime = None
         self._model = None
+        self._npu = None
         self.dtype = torch.float32
         self.name = ""
-        if backend in ("auto", "executorch"):
+        self.embedder_id = EMBEDDER_ID
+        self.device = "cpu"
+        if backend in ("auto", "npu"):
+            try:
+                self._npu = npu_mod.NpuEmbedder()
+                self.embedder_id, self.device = self._npu.embedder_id, self._npu.device
+                self.name = "npu-qnn-htp-mediapipe-mnv3" if self._npu.device == "npu" else "tflite-xnnpack-cpu-mediapipe-mnv3"
+            except Exception as exc:
+                log.warning("NPU embedder unavailable (%s: %s)", type(exc).__name__, exc)
+                if backend == "npu":
+                    raise
+        if self._npu is None and backend in ("auto", "executorch"):
             try:
                 self._init_executorch(precision)
             except Exception as exc:  # export/runtime problems must degrade, not kill the demo
                 log.warning("ExecuTorch backend unavailable (%s: %s)", type(exc).__name__, exc)
                 if backend == "executorch":
                     raise
-        if self._runtime is None:
+        if self._npu is None and self._runtime is None:
             torch.set_num_threads(threads)
             self._model = build_eager_model()
             self.name = "torch-eager-fp32"
         self.embed_tensor(torch.zeros(1, 3, INPUT_SIZE, INPUT_SIZE) + 0.1)
+
+    def info(self) -> dict:
+        if self._npu is not None:
+            return self._npu.info()
+        return {"model": "torchvision MobileNetV3-Large (ImageNet)", "device": "cpu", "runtime": self.name, "dim": EMBED_DIM}
 
     def _init_executorch(self, precision: str) -> None:
         from executorch.extension.pybindings.portable_lib import _load_for_executorch
@@ -227,6 +255,9 @@ class FeatureExtractor:
 
     def embed_tensor(self, x) -> "torch.Tensor":
         """x: float (1,3,224,224), already normalised. Returns a unit-norm fp32 vector of shape (D,)."""
+        if self._npu is not None:
+            nhwc = x.float().numpy()[0].transpose(1, 2, 0) * IMAGENET_STD + IMAGENET_MEAN
+            return torch.from_numpy(self._npu.embed_rgb01(np.clip(nhwc, 0.0, 1.0)[None]))
         x = x.to(self.dtype).contiguous()
         with self._lock:
             if self._runtime is not None:
@@ -273,8 +304,9 @@ class EmbeddingBank:
     best cosine over its global and view centroids.
     """
 
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, embedder_id: str = EMBEDDER_ID):
         self.path = Path(path) if path else None
+        self.embedder_id = embedder_id
         self._lock = threading.RLock()
         self.exemplars: dict[str, list] = {}
         self.centroids: dict[str, "torch.Tensor"] = {}
@@ -424,6 +456,7 @@ class EmbeddingBank:
             "cad_asset": cad, "cad_model_url": (cad or {}).get("glb_url") or None,
             "cad_status": "ready" if cad and cad.get("glb_url") else "missing",
             "cad_source": (cad or {}).get("source"), "cad_credit": (cad or {}).get("credit"),
+            "cad_match": (cad or {}).get("match") or ((cad or {}).get("attribution") or {}).get("match"),
         }
 
     def save(self) -> None:
@@ -446,7 +479,7 @@ class EmbeddingBank:
                 }
             payload = {
                 "version": 2,
-                "embedder": EMBEDDER_ID,
+                "embedder": self.embedder_id,
                 "exemplars": {k: torch.stack(v) for k, v in self.exemplars.items()},
                 "centroids": dict(self.centroids),
                 "prototypes": prototypes,
@@ -461,8 +494,12 @@ class EmbeddingBank:
             return 0
         try:
             data = torch.load(self.path, map_location="cpu", weights_only=True)
-            if data.get("embedder") != EMBEDDER_ID:
-                log.warning("Ignoring %s: embedder %r != %r", self.path, data.get("embedder"), EMBEDDER_ID)
+            if data.get("embedder") != self.embedder_id:
+                backup = self.path.with_name(f"{self.path.stem}.{slugify(str(data.get('embedder')))}.bak{self.path.suffix}")
+                if not backup.exists():
+                    shutil.copyfile(self.path, backup)
+                log.warning("Ignoring %s: it was enrolled with embedder %r but the active embedder is %r - re-enroll your "
+                            "classes (old database kept as %s)", self.path, data.get("embedder"), self.embedder_id, backup.name)
                 return 0
             with self._lock:
                 self.exemplars = {k: list(v.unbind(0)) for k, v in data["exemplars"].items()}
@@ -929,8 +966,17 @@ class AssetManager:
         self._info: dict[str, dict] = {}
         self._inflight: set[str] = set()
         self._failed_at: dict[str, float] = {}
+        self._gen: dict[str, int] = {}
         self.meta_lookup: Callable[[str], dict | None] | None = None
         self.on_resolved: Callable[[str, dict | None], None] | None = None
+
+    def forget(self, label: str, delete_files: bool = True) -> bool:
+        """Drop all state for a deleted class; an in-flight background harvest is discarded when it lands."""
+        with self._lock:
+            self._gen[label] = self._gen.get(label, 0) + 1
+            self._info.pop(label, None)
+            self._failed_at.pop(label, None)
+        return cad_harvester.delete_cached(label) if delete_files else False
 
     def peek(self, label: str) -> dict:
         slug = slugify(label)
@@ -957,16 +1003,21 @@ class AssetManager:
         return {**entry, "status": "resolving"}
 
     def _resolve(self, label: str) -> None:
+        with self._lock:
+            gen = self._gen.get(label, 0)
         try:
             meta = self.meta_lookup(label) if self.meta_lookup else None
             result = cad_harvester.retrieve(label, meta)
             with self._lock:
-                if result.get("glb_url"):
+                if self._gen.get(label, 0) != gen:
+                    log.info("Discarding CAD result for %s: the class was deleted while harvesting", label)
+                    cad_harvester.delete_cached(label)
+                elif result.get("glb_url"):
                     self._info[label] = {"title": result.get("title", label), "source": result.get("source") or result.get("status")}
                     self._failed_at.pop(label, None)
                     if self.on_resolved:
                         self.on_resolved(label, {k: result.get(k) for k in
-                                                 ("title", "glb_url", "source", "status", "query", "attribution", "credit")})
+                                                 ("title", "glb_url", "source", "status", "query", "attribution", "credit", "match")})
                 else:
                     self._failed_at[label] = time.monotonic()
         except Exception:
@@ -1049,8 +1100,12 @@ class SystemStats:
 
 
 class Pipeline:
-    def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager) -> None:
+    def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager, detector=None) -> None:
         self.extractor, self.bank, self.leds, self.assets = extractor, bank, leds, assets
+        self.detector = detector
+        self.crop_tracker = npu_mod.CropTracker()
+        self._detect_lat: collections.deque = collections.deque(maxlen=240)
+        self._detection: dict = {"target": None, "objects": [], "crop": None, "crop_source": "center", "ms": 0.0}
         self.enroller = Enroller(bank)
         self.mv = MultiViewEnroller(bank, on_complete=self._mv_complete)
         self.pose_est = pose_mod.PoseEstimator()
@@ -1077,7 +1132,7 @@ class Pipeline:
         self._viewer_label: str | None = None
         self._last = {
             "label": None, "similarity": 0.0, "confidence": 0.0, "margin": 0.0, "top2": None,
-            "embed_ms": 0.0, "total_ms": 0.0, "state": SEARCHING, "guidance": MSG_SEARCHING,
+            "embed_ms": 0.0, "detect_ms": 0.0, "total_ms": 0.0, "state": SEARCHING, "guidance": MSG_SEARCHING,
         }
 
     @property
@@ -1115,7 +1170,8 @@ class Pipeline:
                 self._latest_jpeg = data
         del data
         with self._infer_lock:
-            arr = preprocess(image)
+            box, detect_ms = self._locate(image)
+            arr = preprocess(image, box)
             t1 = time.perf_counter()
             vec = self.extractor.embed_array(arr)
             t2 = time.perf_counter()
@@ -1148,8 +1204,7 @@ class Pipeline:
             pose = self._pose
             if frame.label and state != SEARCHING:
                 try:
-                    size, left, top = center_crop_box(*image.size)
-                    pose = self.pose_est.update(image, (size, left, top), views, frame.label, category)
+                    pose = self.pose_est.update(image, box or center_crop_box(*image.size), views, frame.label, category)
                 except Exception:
                     log.exception("pose estimation failed")
             self._pose, self._best_view, self._category = pose, best_view, category
@@ -1166,14 +1221,15 @@ class Pipeline:
                 self._last = {
                     "label": frame.label, "similarity": frame.s1, "confidence": score, "margin": snap["margin"],
                     "top2": {"label": top2[0], "score": top2[1]} if top2[0] else None,
-                    "embed_ms": (t2 - t1) * 1000.0, "total_ms": total_ms, "state": state, "guidance": message,
+                    "embed_ms": (t2 - t1) * 1000.0, "detect_ms": detect_ms, "total_ms": total_ms, "state": state,
+                    "guidance": message,
                 }
             frames_seen = self._frames
         if LOG_FRAMES:
             log.info(
-                "[Frame %05d] %s | %s s1=%.3f margin=%.3f | preprocess %.1fms embed %.1fms total %.1fms",
+                "[Frame %05d] %s | %s s1=%.3f margin=%.3f | detect %.1fms embed %.1fms total %.1fms",
                 frames_seen, state, frame.label or "-", frame.s1, frame.margin,
-                (t1 - t0) * 1000, (t2 - t1) * 1000, total_ms,
+                detect_ms, (t2 - t1) * 1000, total_ms,
             )
         if (state, label) != prev:
             self._announce(state, label, score, snap["margin"], message)
@@ -1181,8 +1237,34 @@ class Pipeline:
         return {
             "ok": True, "state": state, "label": frame.label, "confidence": round(score, 3),
             "similarity": round(frame.s1, 3), "margin": round(snap["margin"], 3),
-            "embed_ms": round((t2 - t1) * 1000, 1), "latency_ms": round(total_ms, 1),
+            "embed_ms": round((t2 - t1) * 1000, 1), "detect_ms": round(detect_ms, 1), "latency_ms": round(total_ms, 1),
+            "detection": self._detection["target"],
         }
+
+    def _locate(self, image: Image.Image) -> tuple[tuple[int, int, int] | None, float]:
+        """NPU object detection -> smoothed square crop around the target inside the reticle (None = center crop)."""
+        if self.detector is None or not DETECT_CROP:
+            return None, 0.0
+        width, height = image.size
+        t0 = time.perf_counter()
+        try:
+            dets = self.detector.detect(image)
+        except Exception:
+            log.exception("object detection failed")
+            dets = []
+        ms = (time.perf_counter() - t0) * 1000.0
+        self._detect_lat.append(ms)
+        target = npu_mod.pick_target(dets, width, height, CROP_FRACTION)
+        box = self.crop_tracker.update(npu_mod.square_crop(target, width, height) if target else None, width, height)
+        crop = box or center_crop_box(width, height)
+        self._detection = {
+            "target": target.to_dict() if target else None,
+            "objects": [d.to_dict() for d in dets[:5]],
+            "crop": [round(crop[1] / width, 4), round(crop[2] / height, 4), round(crop[0] / width, 4), round(crop[0] / height, 4)],
+            "crop_source": "detector" if box else "center",
+            "ms": round(ms, 2),
+        }
+        return box, ms
 
     def _announce(self, state: str, label: str | None, score: float, margin: float, message: str) -> None:
         if state == IDENTIFIED:
@@ -1252,7 +1334,9 @@ class Pipeline:
             "asset_attribution": viewer.get("attribution"),
             "mode": MODE,
             "privacy": self.privacy(),
-            "latency_ms": {"embed": round(last["embed_ms"], 1), "total": round(last["total_ms"], 1)},
+            "latency_ms": {"embed": round(last["embed_ms"], 1), "detect": round(last["detect_ms"], 1), "total": round(last["total_ms"], 1)},
+            "detection": self._detection,
+            "accelerator": self.accelerator(),
             "fps": round(self._fps, 1),
             "frames": self._frames,
             "frame_age_s": age,
@@ -1277,6 +1361,14 @@ class Pipeline:
         return {"raw_frames_persisted": False, "images_written_to_disk": False, "stored_in_class_db": "1280-d vectors only",
                 "preview_frame_in_ram": bool(PREVIEW_FRAME and held), "preview_enabled": PREVIEW_FRAME, "mode": MODE}
 
+    def accelerator(self) -> str:
+        on_npu = [name for name, part in (("embedder", self.extractor), ("detector", self.detector))
+                  if part is not None and getattr(part, "device", "cpu") == "npu"]
+        if on_npu:
+            arch = npu_mod.htp_arch()
+            return f"Hexagon NPU ({f'HTP {arch}' if arch else 'HTP'}, QNN TFLite delegate): {' + '.join(on_npu)}"
+        return "Arm CPU (XNNPACK); Hexagon NPU unavailable"
+
     def telemetry_snapshot(self) -> dict:
         """Hardware (/proc, /sys), bridge IPC, and inference telemetry for GET /api/telemetry."""
         hw = telemetry.hardware()
@@ -1285,6 +1377,7 @@ class Pipeline:
             last = dict(self._last)
         embed = list(self._embed_lat)
         total = list(self._total_lat)
+        detect = list(self._detect_lat)
         router = hw["router"]
         led_ok = led["ok"]
         return {
@@ -1300,14 +1393,21 @@ class Pipeline:
                 "leds_total": 8, "bus_latency_ms": led["latency_ms"],
             },
             "inference": {
-                "backend": self.extractor.name, "embedder": EMBEDDER_ID, "embed_dim": EMBED_DIM,
+                "backend": self.extractor.name, "embedder": getattr(self.extractor, "embedder_id", EMBEDDER_ID),
+                "embed_dim": EMBED_DIM,
                 "embed_ms_last": round(embed[-1], 2) if embed else None,
                 "embed_ms_median": telemetry.percentile(embed, 50), "embed_ms_p95": telemetry.percentile(embed, 95),
+                "detect_ms_median": telemetry.percentile(detect, 50), "detect_ms_p95": telemetry.percentile(detect, 95),
                 "total_ms_median": telemetry.percentile(total, 50), "total_ms_p95": telemetry.percentile(total, 95),
                 "samples": len(embed), "fps": round(self._fps, 1), "frames": self._frames,
                 "cosine_similarity": round(last["similarity"], 4), "margin": round(last["margin"], 4),
                 "confidence": round(last["confidence"], 4), "label": last["label"],
-                "accelerator": "Arm CPU (XNNPACK); the Hexagon NPU is not used",
+                "accelerator": self.accelerator(),
+                "models": {
+                    "embedder": self.extractor.info() if hasattr(self.extractor, "info") else {"runtime": self.extractor.name},
+                    "detector": self.detector.info() if self.detector is not None else None,
+                },
+                "detection": self._detection,
             },
             "privacy": self.privacy(),
             "uptime_service_s": round(time.time() - self._started, 1),
@@ -1433,13 +1533,16 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) != 3 or parts[:2] != ["api", "classes"]:
             return self._json(404, {"ok": False, "error": "not found"})
         query = urllib.parse.parse_qs(url.query)
-        delete_cad = query.get("delete_cad", ["0"])[0].lower() in ("1", "true", "yes")
+        delete_cad = query.get("delete_cad", ["1"])[0].lower() not in ("0", "false", "no")
         try:
             label = normalize_label(parts[2])
         except ValueError as exc:
             return self._json(400, {"ok": False, "error": str(exc)})
         removed = self.pipeline.unenroll(label)
-        cad_removed = cad_harvester.delete_cached(label) if (removed and delete_cad) else False
+        cad_removed = False
+        if removed and delete_cad:
+            forget = getattr(self.pipeline.assets, "forget", None) or cad_harvester.delete_cached
+            cad_removed = forget(label)
         self._json(200 if removed else 404, {"ok": removed, "class_id": label, "cad_deleted": cad_removed,
                                              "classes": self.pipeline.bank.counts()})
 
@@ -1510,7 +1613,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/classes/reset":
                 labels = p.bank.labels()
                 p.reset_bank()
-                cad_removed = [x for x in labels if req.get("delete_cad") and cad_harvester.delete_cached(x)]
+                drop = getattr(p.assets, "forget", None) or cad_harvester.delete_cached
+                cad_removed = [x for x in labels if req.get("delete_cad", True) and drop(x)]
                 self._json(200, {"ok": True, "removed": labels, "cad_deleted": cad_removed})
             elif path == "/api/resolve":
                 product = entity_resolver.resolve(str(req.get("text") or req.get("raw_name") or ""), str(req.get("category", "")),
@@ -1527,7 +1631,7 @@ class Handler(BaseHTTPRequestHandler):
                                                       str(req.get("brand", "")), str(req.get("variant", "")))
                     label = normalize_label(product.class_id)
                     result = cad_harvester.harvest(product, force=bool(req.get("force")))
-                keys = ("title", "glb_url", "source", "status", "query", "attribution", "credit")
+                keys = ("title", "glb_url", "source", "status", "query", "attribution", "credit", "match")
                 p.bank.set_cad(label, {k: result.get(k) for k in keys})
                 if label == p._viewer_label:
                     p._bump()
@@ -1608,6 +1712,20 @@ def make_server(pipeline: Pipeline, host: str = HOST, port: int = PORT) -> Threa
     return server
 
 
+def build_detector():
+    """EfficientDet-Lite object detector on the Hexagon NPU; None (fixed center crop) if the NPU is unavailable,
+    unless KAMIKAZE_DETECTOR_CPU=1 accepts the slower CPU detector."""
+    ok, why = npu_mod.npu_available()
+    if not ok and os.environ.get("KAMIKAZE_DETECTOR_CPU", "0") != "1":
+        log.warning("Object detector off (NPU unavailable: %s); using the fixed center crop", why)
+        return None
+    try:
+        return npu_mod.NpuDetector()
+    except Exception as exc:
+        log.warning("Object detector unavailable, using the fixed center crop (%s: %s)", type(exc).__name__, exc)
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--host", default=HOST)
@@ -1624,17 +1742,20 @@ def main() -> None:
 
     t0 = time.perf_counter()
     extractor = FeatureExtractor()
-    bank = EmbeddingBank(BANK_PATH)
+    detector = build_detector() if DETECT_CROP else None
+    bank = EmbeddingBank(BANK_PATH, extractor.embedder_id)
     loaded = bank.load()
     leds = LedDriver()
     assets = AssetManager()
-    pipeline = Pipeline(extractor, bank, leds, assets)
+    pipeline = Pipeline(extractor, bank, leds, assets, detector)
     assets.prepare_static()
     leds.set(led_params(SEARCHING, 0.0))
     server = make_server(pipeline, args.host, args.port)
     log.info(
-        "Kamikaze receiver on %s:%d | embedder %s (%.1fs) | %d enrolled classes %s | dashboard http://localhost:%d/",
-        args.host, args.port, extractor.name, time.perf_counter() - t0, loaded, bank.labels(), args.port,
+        "Kamikaze receiver on %s:%d | embedder %s | detector %s | %s | ready in %.1fs | %d enrolled classes %s | "
+        "dashboard http://localhost:%d/",
+        args.host, args.port, extractor.name, detector.info()["runtime"] if detector else "off", pipeline.accelerator(),
+        time.perf_counter() - t0, loaded, bank.labels(), args.port,
     )
     try:
         server.serve_forever()

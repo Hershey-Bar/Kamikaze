@@ -417,7 +417,7 @@ def download_glb(url: str, slug: str) -> Path | None:
             if not is_valid_glb(tmp):
                 raise ValueError("response is not a binary glTF (GLB)")
             os.replace(tmp, dest)
-            log.info("Cached %s (%d KB) from %s", dest.name, dest.stat().st_size // 1024, url)
+            log.info("Cached %s (%d KB) from %s", dest.name, dest.stat().st_size // 1024, url.split("?", 1)[0])
             return dest
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             log.warning("GLB download failed for %s: %s", url, exc)
@@ -640,7 +640,7 @@ def resolve_product(raw_name: str, category: str = "", brand: str = "", variant:
 
 @mcp.tool()
 def get_telemetry() -> dict:
-    """Hardware + inference telemetry from the receiver: SoC, thermals, CPU/RAM, router/LED bridge latency, ExecuTorch timings."""
+    """Hardware + inference telemetry from the receiver: SoC, thermals, CPU/RAM, Hexagon NPU, router/LED bridge latency, detect/embed timings."""
     return _receiver_call("GET", "/api/telemetry", timeout=5.0)
 
 

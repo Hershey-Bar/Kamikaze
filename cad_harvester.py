@@ -2,18 +2,22 @@
 
     harvest(resolve("samsung galaxy s24 ultra"))  ->  static/models/galaxy_s24_ultra.glb + galaxy_s24_ultra.json
 
-Source order (first acceptable GLB wins):
+Search queries come from build_search_queries()/search_plan(): colloquial text is resolved to a canonical product and
+expanded into exact -> similar -> category queries ("s25 ultra" -> "Samsung Galaxy S25 Ultra" ... "Galaxy S24 Ultra" ...
+"Smartphone"). Each level is tried against every online source before falling back to the next level.
+
+Source order per level (first acceptable GLB wins):
   1. Sketchfab Data API  (SKETCHFAB_TOKEN)   - results are relevance-filtered (exact model + tier), licence-filtered
                                                (CC0 / CC-BY / CC-BY-SA / CC-BY-ND / Sketchfab Standard; NonCommercial rejected),
                                                single-object, face-count and download-size capped.
-  2. Poly Pizza API      (POLY_PIZZA_API_KEY) - CC0 / CC-BY models only.
-  3. Open repos          - KhronosGroup/glTF-Sample-Assets (strict name match; credits read from each model README).
+  2. Poly Pizza API      (POLY_PIZZA_API_KEY, header X-Auth-Token) - CC0 / CC-BY models only.
+  3. Open repos          - KhronosGroup/glTF-Sample-Assets (exact level only; credits read from each model README).
   4. Local parametric model (original work, brand/tier aware) built by procedural_glb.py; generic templates live in
      static/models/base/{soda_can,bottle,smartphone}.glb.
 
 Every cached model gets a sidecar static/models/<class_id>.json holding the attribution (title, author, author URL,
-licence, licence URL, source URL). credits() / write_credits_md() aggregate them (served at GET /api/credits and
-written to static/models/CREDITS.md).
+licence, licence URL, source URL, match level, query). credits() / write_credits_md() aggregate them (served at
+GET /api/credits and written to static/models/CREDITS.md).
 """
 
 from __future__ import annotations
@@ -50,17 +54,30 @@ MAX_FACES = int(os.environ.get("KAMIKAZE_CAD_MAX_FACES", "150000"))
 MAX_GLB_MB = float(os.environ.get("KAMIKAZE_CAD_MAX_MB", "24"))
 ALLOW_NONCOMMERCIAL = os.environ.get("KAMIKAZE_CAD_ALLOW_NC", "0") == "1"
 CANDIDATES_PER_QUERY = 3
-QUERIES_PER_SOURCE = 4
+ALLOW_GENERIC = os.environ.get("KAMIKAZE_CAD_GENERIC", "1") != "0"
+POLY_PIZZA_SEARCH = "https://api.poly.pizza/v1.1/search/{query}"
+LEVEL_SCORE = {"exact": 0.0, "similar": 30.0, "category": 10.0}
 
 PHONE_TIERS = {"pro", "max", "plus", "ultra", "mini", "fe", "edge", "air", "lite"}
 CAN_TIER_SYNONYMS = {"zero": "zero", "max": "zero", "diet": "diet", "light": "diet", "lite": "diet"}
 REJECT_COMMON = {"pack", "crate", "fridge", "vending", "machine", "dispenser", "scene", "pile", "collection", "set",
                  "cooler", "display", "shelf", "store", "room", "stack", "carton", "rack", "bundle", "truck", "series",
-                 "cans", "bottles", "phones", "smartphones", "sixpack", "case", "cases"}
+                 "cans", "bottles", "phones", "smartphones", "sixpack", "case", "cases", "logo", "sign", "poster",
+                 "billboard", "crushed", "broken", "destroyed"}
 REJECT_PHONE = {"cover", "holder", "stand", "charger", "box", "packaging", "tablet", "ipad", "fold", "flip", "watch",
-                "buds", "protector", "wallpaper", "desk", "hand", "holding", "dock", "tripod", "gimbal", "accessory"}
+                "buds", "protector", "wallpaper", "desk", "hand", "holding", "dock", "tripod", "gimbal", "accessory",
+                "pen", "spen", "stylus", "pencil", "airpods", "earbuds", "headphones", "airtag", "strap", "lens"}
 REJECT_CAN = {"bottle", "glass", "cup", "keg", "tin", "fanart", "sonic", "character", "sprite3d"}
+REJECT_BOTTLE = {"can", "glass", "cup", "keg", "tin", "fanart", "sonic", "character", "sprite3d", "wine", "beer"}
 CAN_WORDS = {"can", "soda", "drink", "beverage", "lemon", "lime", "cola", "aluminum", "aluminium", "energy"}
+BOTTLE_WORDS = {"bottle", "soda", "drink", "beverage", "pet", "plastic"}
+PHONE_WORDS = {"phone", "smartphone", "mobile", "cellphone", "handset"}
+PHONE_BRANDS = {"iphone", "apple", "samsung", "galaxy", "pixel", "google", "xiaomi", "redmi", "huawei", "oneplus",
+                "nokia", "motorola", "moto", "sony", "xperia", "oppo", "vivo", "realme", "honor", "nothing", "asus"}
+PHONE_FAMILY = {"Apple": {"iphone", "apple"}, "Samsung": {"galaxy", "samsung"}}
+BEVERAGE_BRANDS = {"coke", "coca", "cocacola", "pepsi", "sprite", "fanta", "redbull", "monster", "dew", "schweppes",
+                   "rockstar", "drpepper", "mirinda", "lipton", "nestea", "heineken", "budweiser", "beer", "corona",
+                   "carlsberg", "guinness", "arizona", "celsius"}
 LICENSE_RANK = (("cc0", 8.0), ("public domain", 8.0), ("by-sa", 4.0), ("sharealike", 4.0), ("by-nd", 3.0),
                 ("noderiv", 3.0), ("attribution", 6.0), ("cc-by", 6.0), ("standard", 1.0))
 LICENSE_URLS = (
@@ -206,6 +223,36 @@ def delete_cached(class_id: str) -> bool:
 # --------------------------------------------------------------------------------------
 
 
+def search_plan(product) -> list[tuple[str, str]]:
+    """[(query, level)] for a product, most specific first (levels: exact -> similar -> category)."""
+    product = _coerce(product)
+    return entity_resolver.query_plan(product.category, product.brand, product.model_or_variant, product.sub_tier,
+                                      product.container_volume)
+
+
+def plan_queries(product, level: str) -> list[str]:
+    return [query for query, lv in search_plan(product) if lv == level]
+
+
+def build_search_queries(raw_text: str) -> list[str]:
+    """Normalise colloquial text into ordered CAD search queries (most specific -> category fallback).
+
+        "coke zero can 330ml" -> ["Coca Cola Zero Can", "Coke Zero 330ml Can", "Coke Zero Can", "Coca Cola Can", "Soda Can"]
+        "s25 ultra"           -> ["Samsung Galaxy S25 Ultra", "Samsung S25 Ultra", "Galaxy S25 Ultra", "Galaxy S24 Ultra",
+                                  "Smartphone"]
+        "iphone 15 pro max"   -> ["iPhone 15 Pro Max", "Apple iPhone 15 Pro Max", "iPhone 15 Pro", "iPhone 14 Pro Max",
+                                  "Smartphone"]
+
+    Text the resolver cannot place (unknown brand) degrades to the title-cased text itself.
+    """
+    try:
+        product = entity_resolver.resolve(raw_text)
+    except taxonomy.MetadataError:
+        text = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+        return [text.title()] if text else []
+    return [query for query, _ in search_plan(product)]
+
+
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[a-z]+|\d+", (text or "").lower().replace("+", " plus "))
 
@@ -225,13 +272,22 @@ def _brand_present(brand: str, tokens: list[str]) -> bool:
     return bool(wanted) and all(w in tokens for w in wanted)
 
 
+def _reject_set(product) -> set[str]:
+    if product.category == "smartphone":
+        return REJECT_COMMON | REJECT_PHONE
+    return REJECT_COMMON | (REJECT_BOTTLE if product.category == "beverage_bottle" else REJECT_CAN)
+
+
+def _container_words(product) -> set[str]:
+    return BOTTLE_WORDS if product.category == "beverage_bottle" else CAN_WORDS
+
+
 def name_score(product: entity_resolver.CanonicalProduct, name: str) -> float | None:
     """How well a model title matches the exact product (None = reject). Variant tiers must match exactly."""
     tokens = _tokens(name)
     if not tokens:
         return None
-    reject = REJECT_COMMON | (REJECT_PHONE if product.category == "smartphone" else REJECT_CAN)
-    if reject & set(tokens):
+    if _reject_set(product) & set(tokens):
         return None
     if product.category == "smartphone":
         model = _tokens(product.model_or_variant)
@@ -246,14 +302,54 @@ def name_score(product: entity_resolver.CanonicalProduct, name: str) -> float | 
         if not _brand_present(product.brand, tokens):
             return None
         brand_key = product.brand.lower()
-        if not ("coca" in brand_key or "pepsi" in brand_key) and not CAN_WORDS & set(tokens):
+        if not ("coca" in brand_key or "pepsi" in brand_key) and not _container_words(product) & set(tokens):
             return None  # ambiguous brand words (e.g. "sprite") need a can/soda cue in the title
         want_tier = {"zero"} if product.sub_tier == "zero" else {"diet"} if product.sub_tier == "diet" else set()
         have_tier = {CAN_TIER_SYNONYMS[t] for t in tokens if t in CAN_TIER_SYNONYMS}
         if have_tier != want_tier:
             return None
-        score = 50.0 + (10.0 if "can" in tokens else 0.0)
+        pkg = "bottle" if product.category == "beverage_bottle" else "can"
+        score = 50.0 + (10.0 if pkg in tokens else 0.0)
     return score - min(10.0, 0.5 * max(0, len(tokens) - 8))
+
+
+def _foreign_beverage(product, tokens: list[str]) -> bool:
+    own = set(_tokens(product.brand)) | ({"coke", "coca", "cocacola"} if "coca" in product.brand.lower() else set())
+    if "red bull" in product.brand.lower():
+        own.add("redbull")
+    elif "red" in tokens and "bull" in tokens:
+        return True
+    return bool((BEVERAGE_BRANDS - own) & set(tokens))
+
+
+def match_score(product: entity_resolver.CanonicalProduct, name: str, level: str = "exact") -> float | None:
+    """Relevance of a model title at a search level (None = reject).
+
+    exact    - the exact product and tier (name_score).
+    similar  - same brand family / product line (another generation, tier or flavour), e.g. Galaxy S24 Ultra for S25 Ultra.
+    category - a generic object of the same category with no competing brand, e.g. "Soda Can", "Smartphone".
+    """
+    exact = name_score(product, name)
+    if exact is not None or level == "exact":
+        return exact
+    tokens = _tokens(name)
+    if not tokens or _reject_set(product) & set(tokens):
+        return None
+    penalty = min(10.0, 0.5 * max(0, len(tokens) - 8))
+    if product.category == "smartphone":
+        family = PHONE_FAMILY.get(product.brand, set(_tokens(product.brand)))
+        if family & set(tokens) and not (PHONE_BRANDS - family) & set(tokens):
+            return LEVEL_SCORE["similar"] - penalty
+        if level == "category" and PHONE_WORDS & set(tokens) and not PHONE_BRANDS & set(tokens):
+            return LEVEL_SCORE["category"] - penalty
+        return None
+    words = _container_words(product)
+    if _brand_present(product.brand, tokens) and words & set(tokens) and not _foreign_beverage(product, tokens):
+        return LEVEL_SCORE["similar"] - penalty
+    pkg = "bottle" if product.category == "beverage_bottle" else "can"
+    if level == "category" and (pkg in tokens or "soda" in tokens) and not _foreign_beverage(product, tokens):
+        return LEVEL_SCORE["category"] - penalty
+    return None
 
 
 def license_allowed(label: str) -> bool:
@@ -281,8 +377,8 @@ def license_url(label: str) -> str:
     return ""
 
 
-def rank_sketchfab(product: entity_resolver.CanonicalProduct, results: list[dict]) -> list[Candidate]:
-    """Filter and rank Sketchfab search results for the exact product, best first."""
+def rank_sketchfab(product: entity_resolver.CanonicalProduct, results: list[dict], level: str = "exact") -> list[Candidate]:
+    """Filter and rank Sketchfab search results for the product at a search level, best first."""
     ranked: list[Candidate] = []
     for model in results or []:
         uid, name = model.get("uid"), str(model.get("name") or "")
@@ -292,7 +388,7 @@ def rank_sketchfab(product: entity_resolver.CanonicalProduct, results: list[dict
             continue
         if model.get("isDownloadable") is False:
             continue
-        base = name_score(product, name)
+        base = match_score(product, name, level)
         if base is None:
             continue
         likes = int(model.get("likeCount") or 0)
@@ -316,29 +412,39 @@ def _poly_field(item: dict, *names: str):
     return ""
 
 
-def rank_polypizza(product: entity_resolver.CanonicalProduct, results: list[dict]) -> list[Candidate]:
+def _attribution_license_url(text: str) -> str:
+    found = re.search(r"https?://creativecommons\.org/[^\s\"')]+", text or "")
+    return found.group(0).rstrip(".,;") if found else ""
+
+
+def rank_polypizza(product: entity_resolver.CanonicalProduct, results: list[dict], level: str = "exact") -> list[Candidate]:
     """Filter and rank Poly Pizza search results (tolerates both capitalised and lower-case field names)."""
     ranked: list[Candidate] = []
     for item in results or []:
         title = str(_poly_field(item, "Title", "title"))
-        lic = str(_poly_field(item, "Licence", "License", "licence", "license")) or "CC0"
+        lic = str(_poly_field(item, "Licence", "License", "licence", "license"))
         url = str(_poly_field(item, "Download", "download"))
-        base = name_score(product, title)
-        if not url or base is None or not license_allowed(lic):
+        tris = int(_poly_field(item, "Tri Count", "triCount", "TriCount") or 0)
+        base = match_score(product, title, level)
+        if not url or base is None or not license_allowed(lic) or tris > MAX_FACES:
             continue
         creator = _poly_field(item, "Creator", "creator")
         creator = creator if isinstance(creator, dict) else {}
         pid = str(_poly_field(item, "ID", "id"))
-        profile = str(_poly_field(creator, "profileLink", "ProfileLink", "DPURL"))
+        username = str(_poly_field(creator, "Username", "username", "name"))
+        profile = str(_poly_field(creator, "profileLink", "ProfileLink"))
         if profile.startswith("/"):
             profile = "https://poly.pizza" + profile
+        if not profile and username:
+            profile = f"https://poly.pizza/u/{urllib.parse.quote(username)}"
+        attribution = str(_poly_field(item, "Attribution", "attribution"))
         ranked.append(Candidate(
             provider="polypizza", title=title, score=base + license_rank(lic),
-            author=str(_poly_field(creator, "Username", "username", "name")), author_url=profile,
-            license=lic, license_url=license_url(lic),
+            author=username, author_url=profile,
+            license=lic, license_url=_attribution_license_url(attribution) or license_url(lic),
             source_url=f"https://poly.pizza/m/{pid}" if pid else "https://poly.pizza", download_url=url,
-            thumbnail_url=str(_poly_field(item, "Thumbnail", "thumbnail", "previewUrl")), uid=pid,
-            attribution_text=str(_poly_field(item, "Attribution", "attribution")),
+            thumbnail_url=str(_poly_field(item, "Thumbnail", "thumbnail", "previewUrl")), uid=pid, faces=tris,
+            attribution_text=attribution,
         ))
     ranked.sort(key=lambda c: -c.score)
     return ranked
@@ -375,6 +481,8 @@ def _record(product, cand: Candidate, source_name: str) -> dict:
         "license_url": cand.license_url, "source": source_name, "source_key": cand.provider, "source_url": cand.source_url,
         "thumbnail_url": cand.thumbnail_url, "attribution_text": cand.attribution_text, "modified": False,
         "faces": cand.faces, "class_id": product.class_id, "canonical_name": product.canonical_name,
+        "match": cand.extra.get("match", "exact" if cand.provider in ("sketchfab", "polypizza", "github") else "parametric"),
+        "query": cand.extra.get("query", ""),
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -395,12 +503,13 @@ def _sketchfab_download_url(uid: str, token: str) -> str | None:
     return str(glb["url"])
 
 
-def _try_sketchfab(product, slug: str, deadline: float) -> tuple[Candidate, str] | None:
+def _try_sketchfab(product, slug: str, deadline: float, queries: list[str] | None = None,
+                   level: str = "exact") -> tuple[Candidate, str] | None:
     token = os.environ.get("SKETCHFAB_TOKEN")
     if not token or _blocked("sketchfab"):
         return None
     seen: set[str] = set()
-    for query in product.cad_search_terms[:QUERIES_PER_SOURCE]:
+    for query in queries if queries is not None else plan_queries(product, "exact"):
         if time.monotonic() > deadline or _blocked("sketchfab"):
             break
         params = urllib.parse.urlencode({"type": "models", "q": query, "downloadable": "true", "count": 24})
@@ -410,33 +519,38 @@ def _try_sketchfab(product, slug: str, deadline: float) -> tuple[Candidate, str]
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             _http_failure("sketchfab", exc)
             continue
-        for cand in rank_sketchfab(product, data.get("results", []))[:CANDIDATES_PER_QUERY]:
+        for cand in rank_sketchfab(product, data.get("results", []), level)[:CANDIDATES_PER_QUERY]:
             if cand.uid in seen or time.monotonic() > deadline:
                 continue
             seen.add(cand.uid)
             url = _sketchfab_download_url(cand.uid, token)
             if url and mcp.download_glb(url, slug):
-                cand.extra["query"] = query
+                cand.extra.update(query=query, match=level)
                 return cand, "Sketchfab"
     return None
 
 
-def _try_polypizza(product, slug: str, deadline: float) -> tuple[Candidate, str] | None:
+def _try_polypizza(product, slug: str, deadline: float, queries: list[str] | None = None,
+                   level: str = "exact") -> tuple[Candidate, str] | None:
     key = os.environ.get("POLY_PIZZA_API_KEY")
     if not key or _blocked("polypizza"):
         return None
-    for query in product.cad_search_terms[:QUERIES_PER_SOURCE]:
+    seen: set[str] = set()
+    for query in queries if queries is not None else plan_queries(product, "exact"):
         if time.monotonic() > deadline or _blocked("polypizza"):
             break
         try:
-            data = mcp._http_json(f"https://api.poly.pizza/v1.1/search/{urllib.parse.quote(query)}", {"x-auth-token": key},
+            data = mcp._http_json(POLY_PIZZA_SEARCH.format(query=urllib.parse.quote(query)), {"X-Auth-Token": key},
                                   timeout=SEARCH_TIMEOUT_S)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             _http_failure("polypizza", exc)
             continue
-        for cand in rank_polypizza(product, (data or {}).get("results", []))[:CANDIDATES_PER_QUERY]:
+        for cand in rank_polypizza(product, (data or {}).get("results", []), level)[:CANDIDATES_PER_QUERY]:
+            if cand.uid in seen or time.monotonic() > deadline:
+                continue
+            seen.add(cand.uid)
             if mcp.download_glb(cand.download_url, slug):
-                cand.extra["query"] = query
+                cand.extra.update(query=query, match=level)
                 return cand, "Poly Pizza"
     return None
 
@@ -576,7 +690,7 @@ def _result(product, attr: dict, status: str, source: str, cached: bool, query: 
     return {
         "class_id": product.class_id, "title": attr.get("title") or product.canonical_name, "glb_url": glb_url(product.class_id),
         "status": status, "source": source, "query": query, "cached": cached, "attribution": attr,
-        "credit": attribution_line(attr), "thumbnail_url": attr.get("thumbnail_url", ""),
+        "credit": attribution_line(attr), "thumbnail_url": attr.get("thumbnail_url", ""), "match": attr.get("match", ""),
     }
 
 
@@ -600,16 +714,27 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
             except OSError:
                 pass
         deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
-        providers = () if offline else (("sketchfab", _try_sketchfab), ("polypizza", _try_polypizza), ("github", _try_khronos))
         found: tuple[Candidate, str] | None = None
-        for name, provider in providers:
-            try:
-                found = provider(product, slug, deadline)
-            except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError) as exc:
-                log.warning("CAD source %s failed for %s: %s", name, product.class_id, exc)
-                found = None
-            if found:
-                break
+        if not offline:
+            plan = search_plan(product)
+            levels = [lv for lv in entity_resolver.QUERY_LEVELS if lv != "category" or ALLOW_GENERIC]
+            for level in levels:
+                queries = [q for q, lv in plan if lv == level]
+                steps = [("sketchfab", _try_sketchfab, (queries, level)), ("polypizza", _try_polypizza, (queries, level))]
+                if level == "exact":
+                    steps.append(("github", _try_khronos, ()))
+                for name, provider, extra in steps:
+                    if not queries and extra:
+                        continue
+                    try:
+                        found = provider(product, slug, deadline, *extra)
+                    except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError) as exc:
+                        log.warning("CAD source %s failed for %s: %s", name, product.class_id, exc)
+                        found = None
+                    if found:
+                        break
+                if found or time.monotonic() > deadline:
+                    break
         status = "online"
         if not found:
             status = "cached"

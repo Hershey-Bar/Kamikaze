@@ -116,8 +116,8 @@
       </div>
       <div class="row">
         <button id="startBtn">Start wizard</button>
-        <button id="capBtn" disabled>Capture view</button>
-        <button id="finishBtn" class="ghost" disabled>Finish early</button>
+        <button id="capBtn" disabled>Capture view &amp; Next</button>
+        <button id="finishBtn" class="ghost" disabled>Done (save captured views)</button>
         <button id="cancelBtn" class="ghost" disabled>Cancel</button>
       </div>
       <div class="steps" id="steps"></div>
@@ -126,7 +126,7 @@
         <button id="saveBtn" class="ghost">Save database</button>
         <a href="/api/db/export" download="enrolled_classes.pt"><button class="ghost" type="button">Export .pt</button></a>
         <button id="resolveBtn" class="ghost" title="Parse the name into a canonical product and download its 3D model">Resolve &amp; Fetch CAD</button>
-        <button id="resetBtn" class="danger" type="button">Reset all</button>
+        <button id="resetBtn" class="danger" type="button">Reset all classes</button>
       </div>
       <div id="resolved"></div>
       <table class="classes">
@@ -155,8 +155,10 @@
         <div class="stat"><b>Modulino Pixels</b><span id="tLed">—</span></div>
         <div class="stat"><b>Bridge RPC</b><span id="tBus">—</span></div>
         <div class="stat"><b>Frame rate</b><span id="tFps">—</span></div>
-        <div class="stat"><b>ExecuTorch median</b><span id="tEmbed">—</span></div>
-        <div class="stat"><b>ExecuTorch p95</b><span id="tEmbed95">—</span></div>
+        <div class="stat"><b>Embed median</b><span id="tEmbed">—</span></div>
+        <div class="stat"><b>Embed p95</b><span id="tEmbed95">—</span></div>
+        <div class="stat"><b>Detect median</b><span id="tDetect">—</span></div>
+        <div class="stat"><b>NPU (cDSP)</b><span id="tNpu">—</span></div>
         <div class="stat"><b>Total / frame</b><span id="tTotal">—</span></div>
         <div class="stat"><b>Cosine sim</b><span id="tCos">—</span></div>
         <div class="stat"><b>Margin</b><span id="tMarg">—</span></div>
@@ -173,13 +175,14 @@
         <div class="kv" id="kvIpc">IPC: —</div>
         <div class="kv" id="kvThermal">Thermal: —</div>
         <div class="kv" id="kvInfer">Inference: —</div>
+        <div class="kv" id="kvNpu">NPU: —</div>
       </div>
       <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
       <div class="mute" id="tBackend" style="margin-top:8px"></div>
     </section>
   </div>
 </main>
-<footer>Embeddings run on-device (Arm CPU · ExecuTorch/XNNPACK; the Hexagon NPU is not used). Pose is a heuristic estimate. No camera image is ever saved: only 1280-d vectors are stored, and the live view holds a single in-memory frame. API: <code>/api/state</code>, <code>/api/telemetry</code>, <code>/api/classes</code>, <code>/api/credits</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
+<footer>Object detection (EfficientDet-Lite2 int8) and 1280-d embeddings (MobileNetV3-Large) run on the Hexagon NPU through the QNN TFLite delegate, with the Arm CPU as fallback. Pose is a heuristic estimate. No camera image is ever saved: only 1280-d vectors are stored, and the live view holds a single in-memory frame. API: <code>/api/state</code>, <code>/api/telemetry</code>, <code>/api/classes</code>, <code>/api/credits</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
 
 <script>
   (function () {
@@ -220,6 +223,22 @@
       ctx.fillStyle = color; ctx.fillRect(x + 6, y + 6, Math.min(side - 12, 230), 22);
       ctx.fillStyle = '#000'; ctx.font = '600 13px system-ui';
       ctx.fillText(`${state.label} ${(state.similarity * 100).toFixed(0)}%`, x + 12, y + 22);
+    }
+    const det = state && state.detection;
+    if (det && det.target) {
+      const [x0, y0, x1, y1] = det.target.box;
+      const bx = x0 * W, by = y0 * H, bw = (x1 - x0) * W, bh = (y1 - y0) * H;
+      ctx.strokeStyle = '#e879f9'; ctx.lineWidth = 2; ctx.strokeRect(bx, by, bw, bh);
+      const tag = `NPU · ${det.target.label} ${(det.target.score * 100).toFixed(0)}%`;
+      ctx.font = '600 12px system-ui';
+      const tw = ctx.measureText(tag).width + 10, ty = by > 20 ? by - 18 : by + bh;
+      ctx.fillStyle = '#e879f9'; ctx.fillRect(bx, ty, tw, 18);
+      ctx.fillStyle = '#000'; ctx.fillText(tag, bx + 5, ty + 13);
+    }
+    if (det && det.crop && det.crop_source === 'detector') {
+      const [cx0, cy0, cw, ch] = det.crop;
+      ctx.strokeStyle = 'rgba(232,121,249,.55)'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.strokeRect(cx0 * W, cy0 * H, cw * W, ch * H); ctx.setLineDash([]);
     }
     if (pose && pose.valid) {
       const cx = W / 2, cy = H / 2, L = side * 0.32, r = (a) => a * Math.PI / 180;
@@ -289,14 +308,13 @@
       cell((p.category || '—').replace('_', ' '));
       cell(`${p.view_count}/4 · ${p.vectors}f`);
       cell(fmtDate(p.created_at));
-      cell(p.cad_status === 'ready' ? (p.cad_source || 'ready') : 'missing', p.cad_status === 'ready' ? 'cad-ready' : 'cad-missing');
+      cell(p.cad_status === 'ready' ? (p.cad_source || 'ready') + (p.cad_match ? ' · ' + p.cad_match : '') : 'missing', p.cad_status === 'ready' ? 'cad-ready' : 'cad-missing');
       const td = document.createElement('td');
       const del = document.createElement('button');
-      del.className = 'danger'; del.textContent = 'Delete'; del.title = 'Delete ' + p.class_id;
+      del.className = 'danger'; del.textContent = 'Delete'; del.title = 'Delete ' + p.class_id + ' and its cached 3D model';
       del.onclick = async () => {
-        if (!confirm('Delete enrolled class "' + p.class_id + '"?')) return;
-        const alsoCad = p.cad_status === 'ready' && confirm('Also delete its cached 3D model and credit file?');
-        const r = await fetch('/api/classes/' + encodeURIComponent(p.class_id) + (alsoCad ? '?delete_cad=1' : ''), { method: 'DELETE' });
+        if (!confirm('Delete enrolled class "' + p.class_id + '" and its cached 3D model?')) return;
+        const r = await fetch('/api/classes/' + encodeURIComponent(p.class_id), { method: 'DELETE' });
         const j = await r.json().catch(() => ({}));
         $('enrollMsg').textContent = j.ok ? 'Deleted ' + p.class_id + (j.cad_deleted ? ' and its 3D model.' : '.') : (j.error || 'Delete failed.');
         pullState();
@@ -329,8 +347,15 @@
   function renderTelemetry(t) {
     const inf = t.inference || {}, ipc = t.ipc || {}, mod = t.modulino || {}, mem = t.memory || {}, soc = t.soc || {};
     $('modePill').textContent = 'mode: ' + (t.mode || '—');
-    $('tEmbed').textContent = fmt(inf.embed_ms_median, 1, ' ms');
-    $('tEmbed95').textContent = fmt(inf.embed_ms_p95, 1, ' ms');
+    $('tEmbed').textContent = fmt(inf.embed_ms_median, 2, ' ms');
+    $('tEmbed95').textContent = fmt(inf.embed_ms_p95, 2, ' ms');
+    $('tDetect').textContent = fmt(inf.detect_ms_median, 2, ' ms');
+    const npu = t.npu || {}, models = inf.models || {}, em = models.embedder || {}, dm = models.detector || {};
+    const onNpu = [em.device === 'npu' ? 'embedder' : null, dm.device === 'npu' ? 'detector' : null].filter(Boolean);
+    $('tNpu').textContent = onNpu.length ? `active · ${onNpu.join(' + ')}` : (npu.fastrpc_cdsp ? 'idle (CPU fallback)' : 'unavailable');
+    $('kvNpu').textContent = `NPU: Hexagon cDSP ${npu.cdsp ? npu.cdsp.remoteproc + ' ' + npu.cdsp.state : '—'} · /dev/fastrpc-cdsp ${npu.fastrpc_cdsp ? 'present' : 'absent'}` +
+      ` · NSP ${npu.nsp_temp_c != null ? npu.nsp_temp_c + ' °C' : '—'} · embedder: ${em.model || '—'} [${em.runtime || em.device || '—'}]` +
+      ` · detector: ${dm.model || 'off'}${dm.runtime ? ' [' + dm.runtime + ']' : ''}`;
     $('tCos').textContent = fmt(inf.cosine_similarity, 3);
     $('tMarg').textContent = fmt(inf.margin, 3);
     const rpc = ipc.bridge_rpc || {};
@@ -349,7 +374,7 @@
       fr.appendChild(d);
     });
     const up = t.uptime_s != null ? Math.floor(t.uptime_s / 3600) + 'h ' + Math.floor((t.uptime_s % 3600) / 60) + 'm' : '—';
-    $('kvSoc').textContent = `SoC: ${soc.board_model || '—'} · ${soc.arch || ''} · ${soc.cores || '?'} cores${soc.soc_machine ? ' · ' + soc.soc_machine : ''} · ${soc.os || ''} · kernel ${soc.kernel || ''} · up ${up}`;
+    $('kvSoc').textContent = `SoC: ${soc.processor || soc.soc_machine || '—'} · ${soc.board_model || '—'} · ${soc.arch || ''} · ${soc.cores || '?'} cores · ${soc.os || ''} · kernel ${soc.kernel || ''} · up ${up}`;
     const rs = ipc.router_socket || {};
     $('kvIpc').textContent = `IPC: router socket ${rs.exists ? (rs.connectable ? 'connectable (' + fmt(rs.connect_ms, 2) + ' ms)' : 'present, refusing') : 'missing'} · ttyACM0 ${ (ipc.serial_bridge || {}).present ? 'present' : 'absent'} · ${mod.bus || ''}`;
     $('kvThermal').textContent = 'Thermal: ' + ((t.thermal || []).map((z) => `${z.type || z.zone} ${z.temp_c}°C`).join(' · ') || '—');
@@ -378,11 +403,13 @@
       box.appendChild(d);
     });
     const ph = mv.phase;
+    const remaining = (mv.views || []).filter((v) => v.state !== 'done' && v.view !== mv.current_view).length;
+    $('capBtn').textContent = mv.current_title ? `Capture ${mv.current_title} & ${remaining ? 'Next' : 'Done'}` : 'Capture view & Next';
     $('startBtn').disabled = mv.active;
     $('capBtn').disabled = ph !== 'ready';
     $('finishBtn').disabled = ph !== 'ready' || !(mv.views || []).some((v) => v.state === 'done');
     $('cancelBtn').disabled = !mv.active;
-    if (ph === 'ready') $('enrollMsg').textContent = `Show the ${mv.current_title}: ${mv.current_instruction} Then press "Capture view".`;
+    if (ph === 'ready') $('enrollMsg').textContent = `Show the ${mv.current_title}: ${mv.current_instruction} Then press "${$('capBtn').textContent}" (samples the next ${mv.frames_per_view} frames).`;
     else if (ph === 'capturing') $('enrollMsg').textContent = `Capturing ${mv.current_title}… ${mv.collected}/${mv.frames_per_view}`;
     else if (ph === 'done') $('enrollMsg').textContent = `Enrolled "${mv.label}" (consistency ${mv.result ? mv.result.consistency : '—'}). Fetching CAD model…`;
     else if (ph === 'error' && mv.error) $('enrollMsg').textContent = 'Enrollment stopped: ' + mv.error;
@@ -498,9 +525,8 @@
     pullState();
   };
   $('resetBtn').onclick = async () => {
-    if (!confirm('Delete ALL enrolled classes? This empties enrolled_classes.pt.')) return;
-    const alsoCad = confirm('Also delete all cached 3D models for them?');
-    const j = await post('/api/classes/reset', { delete_cad: alsoCad });
+    if (!confirm('Delete ALL enrolled classes and their cached 3D models? This empties enrolled_classes.pt.')) return;
+    const j = await post('/api/classes/reset', { delete_cad: true });
     if (j.ok) $('enrollMsg').textContent = `Removed ${j.removed.length} class(es).`;
     pullState();
   };

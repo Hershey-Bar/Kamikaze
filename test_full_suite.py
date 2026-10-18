@@ -94,7 +94,10 @@ class PlaintextParsingTests(unittest.TestCase):
             with self.subTest(text=text):
                 p = entity_resolver.resolve(text)
                 self.assertEqual((p.class_id, p.brand, p.sub_tier, p.category), (class_id, brand, tier, "smartphone"))
-                self.assertTrue(any("3D model" in t or "glb" in t.lower() or "model" in t.lower() for t in p.cad_search_terms))
+                terms = p.cad_search_terms
+                self.assertTrue(terms[0].lower().replace(" ", "_").endswith(class_id), terms)
+                self.assertEqual(terms[-1], "Smartphone")
+                self.assertFalse(any("3d model" in t.lower() or "glb" in t.lower() for t in terms), terms)
 
     def test_colour_is_captured_but_not_part_of_the_class(self):
         p = entity_resolver.resolve("iPhone 15 Pro Max deep purple")
@@ -329,8 +332,8 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         self.assertEqual((status, listing["count"]), (200, 2))
         self.assertEqual({p["class_id"] for p in listing["prototypes"]}, set(saved["prototypes"]))
 
-        status, out = self.call("DELETE", "/api/classes/galaxy_s24_ultra")
-        self.assertEqual((status, out["ok"]), (200, True), out)
+        status, out = self.call("DELETE", "/api/classes/galaxy_s24_ultra?delete_cad=0")
+        self.assertEqual((status, out["ok"], out["cad_deleted"]), (200, True, False), out)
         on_disk = torch.load(self.db, map_location="cpu", weights_only=True)
         self.assertEqual(set(on_disk["prototypes"]), {"coca_cola_zero_330ml_can"})
         self.assertEqual(set(on_disk["centroids"]), {"coca_cola_zero_330ml_can"})
@@ -339,10 +342,10 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         reloaded = self.receiver.EmbeddingBank(self.db)
         self.assertEqual(reloaded.load(), 1)
         self.assertEqual(reloaded.labels(), ["coca_cola_zero_330ml_can"])
-        self.assertEqual(self.call("DELETE", "/api/classes/galaxy_s24_ultra")[0], 404)
-        self.assertEqual(self.call("DELETE", "/api/classes/..%2F..%2Fetc")[0] in (400, 404), True)
+        self.assertEqual(self.call("DELETE", "/api/classes/galaxy_s24_ultra?delete_cad=0")[0], 404)
+        self.assertEqual(self.call("DELETE", "/api/classes/..%2F..%2Fetc?delete_cad=0")[0] in (400, 404), True)
 
-    def test_delete_with_cad_removes_cached_model(self):
+    def test_delete_removes_cached_model_by_default(self):
         self.enroll("iphone 15 pro", 7)
         cid = "iphone_15_pro"
         keep = cad_harvester.glb_path(cid).exists()
@@ -351,19 +354,53 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         try:
             cad_harvester.harvest(entity_resolver.resolve("iphone 15 pro"), offline=True)
             self.assertTrue(cad_harvester.glb_path(cid).exists())
-            status, out = self.call("DELETE", f"/api/classes/{cid}?delete_cad=1")
+            self.assertTrue(cad_harvester.sidecar_path(cid).exists())
+            status, out = self.call("DELETE", f"/api/classes/{cid}")
             self.assertEqual((status, out["cad_deleted"]), (200, True), out)
             self.assertFalse(cad_harvester.glb_path(cid).exists())
+            self.assertFalse(cad_harvester.sidecar_path(cid).exists())
         finally:
             cad_harvester.delete_cached(cid)
             cad_harvester.write_credits_md()
+
+    def test_asset_manager_discards_harvest_that_lands_after_delete(self):
+        cid = "zz_test_inflight_can"
+        assets = self.receiver.AssetManager()
+        started, release = threading.Event(), threading.Event()
+
+        def slow_retrieve(label, meta=None, force=False, offline=False):
+            started.set()
+            release.wait(5)
+            path = cad_harvester.glb_path(label)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"glTF" + b"\0" * 64)
+            return {"glb_url": f"/static/models/{label}.glb", "title": label, "source": "test"}
+
+        resolved = []
+        assets.on_resolved = lambda label, info: resolved.append(label)
+        try:
+            with mock.patch.object(cad_harvester, "retrieve", side_effect=slow_retrieve):
+                assets.get(cid)
+                self.assertTrue(started.wait(5))
+                assets.forget(cid)
+                release.set()
+                for _ in range(100):
+                    with assets._lock:
+                        if cid not in assets._inflight:
+                            break
+                    threading.Event().wait(0.02)
+            self.assertEqual(resolved, [])
+            self.assertFalse(cad_harvester.glb_path(cid).exists())
+        finally:
+            cad_harvester.delete_cached(cid)
 
     def test_reset_empties_the_database_file(self):
         self.enroll("Pepsi can", 11)
         self.enroll("Sprite can", 13)
         self.bank.save()
-        status, out = self.call("POST", "/api/classes/reset", {})
-        self.assertEqual((status, out["ok"], sorted(out["removed"])), (200, True, ["pepsi_can", "sprite_can"]))
+        status, out = self.call("POST", "/api/classes/reset", {"delete_cad": False})
+        self.assertEqual((status, out["ok"], sorted(out["removed"]), out["cad_deleted"]),
+                         (200, True, ["pepsi_can", "sprite_can"], []))
         self.assertEqual(self.call("GET", "/api/classes")[1]["count"], 0)
         reloaded = self.receiver.EmbeddingBank(self.db)
         reloaded.load()
@@ -524,6 +561,232 @@ class HardwareLedTests(unittest.TestCase):
         self.assertIsNotNone(st["latency_avg_ms"])
         self.assertEqual(st["rpc_fail"], 0)
         drv.set((0, 100, 150, 15, 1))
+
+
+class SearchQueryNormalizerTests(unittest.TestCase):
+    def test_directive_examples(self):
+        coke = cad_harvester.build_search_queries("coke zero can 330ml")
+        self.assertEqual(coke[0], "Coca Cola Zero Can")
+        self.assertIn("Coke Zero 330ml Can", coke)
+        self.assertEqual(coke[-1], "Soda Can")
+        s25 = cad_harvester.build_search_queries("s25 ultra")
+        self.assertEqual((s25[0], s25[-1]), ("Samsung Galaxy S25 Ultra", "Smartphone"))
+        self.assertIn("Samsung S25 Ultra", s25)
+        self.assertIn("Galaxy S24 Ultra", s25)
+        ip = cad_harvester.build_search_queries("iphone 15 pro max")
+        self.assertEqual((ip[0], ip[-1]), ("iPhone 15 Pro Max", "Smartphone"))
+        self.assertIn("iPhone 15 Pro", ip)
+
+    def test_queries_are_unique_and_specific_first(self):
+        for text in ("coke zero can 330ml", "s25 ultra", "iphone 15 pro max", "pepsi can", "galaxy s23+"):
+            with self.subTest(text=text):
+                q = cad_harvester.build_search_queries(text)
+                self.assertEqual(len(q), len({x.lower() for x in q}), q)
+                levels = [lvl for _, lvl in cad_harvester.search_plan(entity_resolver.resolve(text))]
+                self.assertEqual(levels[0], "exact")
+                self.assertEqual(levels[-1], "category")
+
+    def test_match_score_levels(self):
+        s24u = entity_resolver.resolve("Samsung Galaxy S24 Ultra")
+        self.assertIsNotNone(cad_harvester.match_score(s24u, "Samsung Galaxy S24 Ultra", "exact"))
+        self.assertIsNone(cad_harvester.match_score(s24u, "Samsung Galaxy S23", "exact"))
+        self.assertIsNone(cad_harvester.match_score(s24u, "Galaxy S24 Ultra phone case", "exact"))
+        for accessory in ("Samsung S24 Ultra S-pen", "Galaxy S24 Ultra Stylus", "Samsung Galaxy S24 Ultra S Pen"):
+            for level in ("exact", "similar", "category"):
+                self.assertIsNone(cad_harvester.match_score(s24u, accessory, level), (accessory, level))
+        self.assertIsNotNone(cad_harvester.match_score(s24u, "Galaxy S23 Ultra", "similar"))
+        self.assertIsNotNone(cad_harvester.match_score(s24u, "Smartphone", "category"))
+        self.assertIsNone(cad_harvester.match_score(s24u, "Soda Can", "category"))
+        coke = entity_resolver.resolve("coke zero can 330ml")
+        self.assertIsNotNone(cad_harvester.match_score(coke, "Soda Can", "category"))
+        self.assertIsNone(cad_harvester.match_score(coke, "Pepsi Can", "exact"))
+
+    def test_polypizza_ranking_keeps_author_and_licence(self):
+        product = entity_resolver.resolve("coke zero can 330ml")
+        results = [
+            {"ID": "abc123", "Title": "Soda Can", "Licence": "CC-BY 3.0",
+             "Attribution": "Soda Can by Jane Doe [CC-BY] (https://creativecommons.org/licenses/by/3.0/) via Poly Pizza",
+             "Download": "https://static.poly.pizza/abc123.glb", "Thumbnail": "https://static.poly.pizza/abc123.webp",
+             "Tri Count": 500, "Creator": {"Username": "Jane Doe"}},
+            {"ID": "nc1", "Title": "Soda Can", "Licence": "CC-BY-NC", "Download": "https://x/nc.glb",
+             "Creator": {"Username": "nc"}},
+            {"ID": "nodl", "Title": "Soda Can", "Licence": "CC0", "Creator": {"Username": "z"}},
+        ]
+        ranked = cad_harvester.rank_polypizza(product, results, "category")
+        self.assertEqual([c.uid for c in ranked], ["abc123"])
+        c = ranked[0]
+        self.assertEqual((c.author, c.author_url), ("Jane Doe", "https://poly.pizza/u/Jane%20Doe"))
+        self.assertEqual(c.license_url, "https://creativecommons.org/licenses/by/3.0/")
+        self.assertEqual(c.source_url, "https://poly.pizza/m/abc123")
+        self.assertIn("Jane Doe", c.attribution_text)
+
+    def test_polypizza_endpoint_is_v11_path_search(self):
+        self.assertEqual(cad_harvester.POLY_PIZZA_SEARCH.format(query="Soda%20Can"),
+                         "https://api.poly.pizza/v1.1/search/Soda%20Can")
+
+
+class NpuMathTests(unittest.TestCase):
+    """Pure-NumPy parts of npu.py (anchors, decode, NMS, crop selection, tracking)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import npu
+        cls.npu = npu
+
+    def test_anchor_counts_match_efficientdet_lite(self):
+        self.assertEqual(self.npu.generate_anchors(320).shape, (19206, 4))
+        self.assertEqual(self.npu.generate_anchors(448).shape, (37629, 4))
+        a = self.npu.generate_anchors(320)
+        self.assertTrue(((a[:, :2] > 0) & (a[:, :2] < 1)).all())
+        self.assertTrue((a[:, 2:] > 0).all())
+
+    def test_decode_zero_encoding_returns_anchor_box(self):
+        import numpy as np
+        anchors = np.array([[0.5, 0.5, 0.2, 0.4]], dtype=np.float32)
+        box = self.npu.decode_boxes(np.zeros((1, 4), dtype=np.float32), anchors)[0]
+        np.testing.assert_allclose(box, [0.4, 0.3, 0.6, 0.7], atol=1e-6)
+
+    def test_nms_suppresses_overlaps(self):
+        import numpy as np
+        boxes = np.array([[0.1, 0.1, 0.5, 0.5], [0.11, 0.11, 0.51, 0.51], [0.6, 0.6, 0.9, 0.9]], dtype=np.float32)
+        scores = np.array([0.9, 0.8, 0.7], dtype=np.float32)
+        self.assertEqual(self.npu.nms(boxes, scores, 0.5), [0, 2])
+        self.assertEqual(self.npu.nms(boxes, scores, 0.5, limit=1), [0])
+
+    def test_target_classes_map_to_categories(self):
+        D = self.npu.Detection
+        self.assertEqual(D("cell phone", 0.9, (0, 0, 1, 1)).category, "smartphone")
+        self.assertEqual(D("bottle", 0.9, (0, 0, 1, 1)).category, "beverage")
+        self.assertIsNone(D("person", 0.9, (0, 0, 1, 1)).category)
+        self.assertEqual(len(self.npu.COCO_LABELS), 90)
+
+    def test_pick_target_prefers_centred_target_classes(self):
+        D = self.npu.Detection
+        dets = [D("person", 0.99, (0.3, 0.3, 0.7, 0.7)),
+                D("cell phone", 0.95, (0.0, 0.0, 0.1, 0.1)),
+                D("cell phone", 0.60, (0.4, 0.35, 0.6, 0.65)),
+                D("bottle", 0.30, (0.45, 0.4, 0.55, 0.6))]
+        best = self.npu.pick_target(dets, 640, 480)
+        self.assertIsNotNone(best)
+        self.assertEqual((best.label, best.score), ("cell phone", 0.60))
+        self.assertIsNone(self.npu.pick_target(dets[:2], 640, 480))
+
+    def test_square_crop_stays_inside_frame(self):
+        D = self.npu.Detection
+        for box in [(0.4, 0.3, 0.6, 0.7), (0.0, 0.0, 0.05, 0.05), (0.9, 0.8, 1.0, 1.0), (0.0, 0.0, 1.0, 1.0)]:
+            with self.subTest(box=box):
+                size, left, top = self.npu.square_crop(D("bottle", 0.9, box), 640, 480)
+                self.assertGreaterEqual(size, int(0.25 * 480))
+                self.assertLessEqual(size, 480)
+                self.assertTrue(0 <= left <= 640 - size and 0 <= top <= 480 - size, (size, left, top))
+
+    def test_crop_tracker_smooths_holds_and_releases(self):
+        t = self.npu.CropTracker(alpha=0.5, hold_frames=2, jump=0.5)
+        self.assertEqual(t.update((200, 100, 100), 640, 480), (200, 100, 100))
+        size, left, top = t.update((200, 120, 100), 640, 480)
+        self.assertEqual((size, left, top), (200, 110, 100))
+        self.assertEqual(t.update(None, 640, 480), (200, 110, 100))
+        self.assertEqual(t.update(None, 640, 480), (200, 110, 100))
+        self.assertIsNone(t.update(None, 640, 480))
+        t.update((200, 0, 0), 640, 480)
+        self.assertEqual(t.update((200, 400, 200), 640, 480), (200, 400, 200))
+
+    def test_npu_available_reports_reason(self):
+        ok, reason = self.npu.npu_available()
+        self.assertIsInstance(ok, bool)
+        self.assertTrue(reason)
+
+    def test_telemetry_npu_status_shape(self):
+        st = telemetry.npu_status([{"type": "nsp0-thermal", "temp_c": 41.0}, {"type": "cpu0", "temp_c": 60.0}])
+        self.assertEqual(set(st), {"fastrpc_cdsp", "cdsp", "nsp_temp_c", "nsp_zones"})
+        self.assertEqual((st["nsp_temp_c"], st["nsp_zones"]), (41.0, 1))
+        self.assertIn("npu", telemetry.hardware())
+
+
+@needs_torch
+class EmbedderMismatchTests(unittest.TestCase):
+    def test_bank_from_another_embedder_is_backed_up_not_mixed(self):
+        import receiver
+        tmp = Path(tempfile.mkdtemp(prefix="kz_emb_"))
+        try:
+            db = tmp / "enrolled_classes.pt"
+            old = receiver.EmbeddingBank(db, "mobilenet_v3_large-fc1280")
+            old.add("pepsi_can", [torch.nn.functional.normalize(torch.ones(8), dim=0)])
+            old.save()
+            fresh = receiver.EmbeddingBank(db, "mediapipe-mobilenet_v3_large-embedder-1280")
+            self.assertEqual(fresh.load(), 0)
+            self.assertEqual(fresh.labels(), [])
+            backups = list(tmp.glob("enrolled_classes.*.bak.pt"))
+            self.assertEqual(len(backups), 1, backups)
+            same = receiver.EmbeddingBank(db, "mobilenet_v3_large-fc1280")
+            self.assertEqual(same.load(), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _board_npu() -> tuple[bool, str]:
+    try:
+        import npu
+    except Exception as exc:
+        return False, str(exc)
+    ok, why = npu.npu_available()
+    if not ok:
+        return False, why
+    files = [npu.MODELS_DIR / npu.EMBEDDER_SPEC.file, npu.MODELS_DIR / npu.DETECTOR_SPECS[npu.DETECTOR_VARIANT].file]
+    missing = [f.name for f in files if not f.is_file()]
+    return (not missing), (f"models missing: {missing}" if missing else "ok")
+
+
+_NPU_OK, _NPU_WHY = _board_npu()
+
+
+@unittest.skipUnless(_NPU_OK, f"Hexagon NPU not available: {_NPU_WHY}")
+class HexagonNpuLiveTests(unittest.TestCase):
+    """Runs the real TFLite models through the QNN HTP delegate on the VENTUNO Q."""
+
+    @classmethod
+    def setUpClass(cls):
+        import numpy as np
+        import npu
+        cls.np, cls.npu = np, npu
+        cls.embedder = npu.NpuEmbedder()
+        cls.detector = npu.NpuDetector()
+
+    def test_embedder_runs_on_npu_and_is_unit_norm(self):
+        import time
+        np = self.np
+        self.assertEqual(self.embedder.device, "npu", self.embedder.info())
+        x = np.random.default_rng(0).random((1, 224, 224, 3), dtype=np.float32)
+        v = self.embedder.embed_rgb01(x)
+        self.assertEqual(v.shape, (1280,))
+        self.assertAlmostEqual(float(np.linalg.norm(v)), 1.0, places=4)
+        t0 = time.perf_counter()
+        for _ in range(20):
+            self.embedder.embed_rgb01(x)
+        ms = (time.perf_counter() - t0) * 50
+        print(f"\n  NPU embedder: {ms:.2f} ms/frame")
+        self.assertLess(ms, 15.0)
+
+    def test_embedder_is_deterministic_and_discriminative(self):
+        np = self.np
+        rng = np.random.default_rng(1)
+        a, b = rng.random((1, 224, 224, 3), dtype=np.float32), np.zeros((1, 224, 224, 3), dtype=np.float32)
+        va1, va2, vb = self.embedder.embed_rgb01(a), self.embedder.embed_rgb01(a), self.embedder.embed_rgb01(b)
+        self.assertGreater(float(va1 @ va2), 0.999)
+        self.assertLess(float(va1 @ vb), 0.99)
+
+    def test_detector_runs_on_npu(self):
+        import time
+        np = self.np
+        self.assertEqual(self.detector.device, "npu", self.detector.info())
+        frame = np.full((self.detector.size, self.detector.size, 3), 127, dtype=np.uint8)
+        t0 = time.perf_counter()
+        for _ in range(10):
+            dets = self.detector.detect_array(frame)
+        ms = (time.perf_counter() - t0) * 100
+        print(f"\n  NPU detector ({self.detector.variant}): {ms:.2f} ms/frame, {len(dets)} detections on grey")
+        self.assertIsInstance(dets, list)
+        self.assertLess(ms, 40.0)
 
 
 if __name__ == "__main__":

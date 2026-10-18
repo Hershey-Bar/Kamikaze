@@ -8,8 +8,10 @@ build/
 static/models/*.glb
 static/vendor/
 models/*.pte
+models/npu/
 model.pte
 enrolled_classes.pt
+enrolled_classes.*.bak.pt
 *.part
 .env
 static/models/*.json

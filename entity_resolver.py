@@ -61,6 +61,94 @@ class CanonicalProduct:
         return data
 
 
+QUERY_LEVELS = ("exact", "similar", "category")
+_SEARCH_BRAND = {"Coca-Cola": "Coca Cola"}
+_SEARCH_NICK = {"Coca-Cola": "Coke"}
+_ZERO_PHRASES = {"Pepsi": ("Pepsi Zero Sugar", "Pepsi Zero", "Pepsi Max"), "Red Bull": ("Red Bull Sugarfree", "Red Bull Zero")}
+_APPLE_SIBLING = {"pro_max": "Pro", "pro": "Pro Max", "standard": "Plus", "plus": "", "mini": ""}
+_SAMSUNG_SIBLING = {"plus": "", "standard": "Plus", "fe": ""}
+
+
+def _iphone_label_exists(gen: int, label: str) -> bool:
+    low = label.lower()
+    return (low != "plus" or gen >= 14) and (low != "mini" or gen in (12, 13)) and gen >= 11
+
+
+def _dedupe_plan(plan: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    seen, out = set(), []
+    for query, level in plan:
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query.lower() not in seen:
+            seen.add(query.lower())
+            out.append((query, level))
+    return out
+
+
+def _phone_plan(brand: str, model: str, tier: str) -> list[tuple[str, str]]:
+    m = re.match(r"(iPhone|Galaxy S)\s?(\d+)\s*(.*)$", model or "")
+    if not m:
+        return [(f"{brand} {model}".strip(), "exact"), ("Smartphone", "category")]
+    family, gen, label = m.group(1), int(m.group(2)), m.group(3).strip()
+    if family == "iPhone":
+        plan = [(model, "exact"), (f"Apple {model}", "exact")]
+        sibling = _APPLE_SIBLING.get(tier)
+        if tier == "standard" and gen in (12, 13):
+            sibling = "mini"
+        if sibling is not None and (sibling or label) and _iphone_label_exists(gen, sibling):
+            plan.append((f"iPhone {gen} {sibling}", "similar"))
+        if _iphone_label_exists(gen - 1, label):
+            plan.append((f"iPhone {gen - 1} {label}", "similar"))
+        elif gen > 11:
+            plan.append((f"iPhone {gen - 1}", "similar"))
+    else:
+        plan = [(f"Samsung {model}", "exact"), (f"Samsung S{gen} {label}", "exact"), (model, "exact")]
+        if gen > 20:
+            plan.append((f"Galaxy S{gen - 1} {label}", "similar"))
+        sibling = _SAMSUNG_SIBLING.get(tier)
+        if sibling is not None:
+            plan.append((f"Galaxy S{gen} {sibling}", "similar"))
+    plan.append(("Smartphone", "category"))
+    return plan
+
+
+def _beverage_plan(category: str, brand: str, variant: str, volume: str) -> list[tuple[str, str]]:
+    pkg = "Bottle" if category == "beverage_bottle" else "Can"
+    name = _SEARCH_BRAND.get(brand, brand)
+    nick = _SEARCH_NICK.get(brand, name)
+    if variant == "zero":
+        phrases = list(_ZERO_PHRASES.get(brand, (f"{name} Zero", f"{nick} Zero")))
+    elif variant == "diet":
+        phrases = [f"Diet {nick}", f"{name} Diet"]
+    else:
+        phrases = [name, nick]
+    plan = [(f"{phrases[0]} {pkg}", "exact")]
+    if volume:
+        plan.append((f"{phrases[1]} {volume} {pkg}", "exact"))
+    plan += [(f"{p} {pkg}", "exact") for p in phrases[1:]]
+    if variant not in ("", "original"):
+        plan.append((f"{name} {pkg}", "similar"))
+    if category == "beverage_bottle":
+        plan += [("Soda Bottle", "category"), ("Plastic Bottle", "category")]
+    else:
+        plan.append(("Energy Drink Can" if brand == "Red Bull" else "Soda Can", "category"))
+    return plan
+
+
+def query_plan(category: str, brand: str, model_or_variant: str, sub_tier: str, container_volume: str = "") -> list[tuple[str, str]]:
+    """Ordered [(query, level)] for CAD search: exact product -> similar product -> generic category (most specific first).
+
+    "coke zero can 330ml" -> Coca Cola Zero Can, Coke Zero 330ml Can, Coke Zero Can | Coca Cola Can | Soda Can
+    "s25 ultra"           -> Samsung Galaxy S25 Ultra, Samsung S25 Ultra, Galaxy S25 Ultra | Galaxy S24 Ultra | Smartphone
+    "iphone 15 pro max"   -> iPhone 15 Pro Max, Apple iPhone 15 Pro Max | iPhone 15 Pro, iPhone 14 Pro Max | Smartphone
+    """
+    if category == "smartphone":
+        plan = _phone_plan(brand, model_or_variant, sub_tier)
+    else:
+        variant = {"regular": "original"}.get(sub_tier, sub_tier)
+        plan = _beverage_plan(category, brand, variant, container_volume)
+    return _dedupe_plan(plan)
+
+
 def _phone_variant_name(meta: dict) -> str:
     model, _ = taxonomy._phone_model(meta.get("brand", ""), f"{meta.get('raw_name', '')} {meta.get('variant', '')}")
     return model
@@ -86,18 +174,8 @@ def resolve(text: str, category: str = "", brand: str = "", variant: str = "", p
         model_or_variant = _CAN_VARIANT_NAMES.get(meta["variant"], meta["variant"].title())
         sub_tier = _CAN_SUB_TIER.get(meta["variant"], meta["variant"])
 
-    terms = list(taxonomy.search_queries(meta))
-    if meta["category"] == "beverage_can" and meta["brand"] == "Coca-Cola" and meta["variant"] in ("zero", "diet"):
-        terms.insert(0, "Coke Zero can" if meta["variant"] == "zero" else "Diet Coke can")
-    if meta["category"] != "smartphone" and meta["container_volume"]:
-        terms.insert(0, f"{name} 3D model")
-    seen, ordered = set(), []
-    for term in terms:
-        key = term.lower()
-        if key not in seen:
-            seen.add(key)
-            ordered.append(term)
-
+    plan = query_plan(meta["category"], meta["brand"], model_or_variant, sub_tier, meta["container_volume"])
+    ordered = [query for query, _ in plan]
     return CanonicalProduct(
         raw_query=raw, class_id=class_id, canonical_name=name, category=meta["category"], brand=meta["brand"],
         model_or_variant=model_or_variant, sub_tier=sub_tier, cad_search_terms=tuple(ordered),

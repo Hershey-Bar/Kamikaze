@@ -41,8 +41,13 @@ def soc_identity() -> dict:
         if "=" in line:
             k, v = line.split("=", 1)
             os_release[k] = v.strip('"')
+    board = _read("/proc/device-tree/model") or _read("/sys/devices/virtual/dmi/id/product_name") or platform.node()
+    machine = _read("/sys/devices/soc0/machine")
+    tag = f"{board} {machine}".lower()
+    processor = "Qualcomm Dragonwing QCS8275" if ("8275" in tag or "ventuno" in tag) else (machine or platform.processor())
     return {
-        "board_model": _read("/proc/device-tree/model") or _read("/sys/devices/virtual/dmi/id/product_name") or platform.node(),
+        "processor": processor,
+        "board_model": board,
         "soc_family": _read("/sys/devices/soc0/family"),
         "soc_machine": _read("/sys/devices/soc0/machine"),
         "soc_id": _read("/sys/devices/soc0/soc_id"),
@@ -161,12 +166,31 @@ def i2c_buses() -> list[str]:
     return sorted(os.path.basename(p) for p in glob.glob("/dev/i2c-*"))
 
 
-def hardware() -> dict:
-    """Everything that does not depend on the pipeline (SoC, thermals, CPU, RAM, IPC)."""
+def npu_status(zones: list[dict] | None = None) -> dict:
+    """Hexagon NPU (cDSP) state: FastRPC device node, remoteproc state and NSP junction temperatures."""
+    cdsp = None
+    for rp in sorted(glob.glob("/sys/class/remoteproc/remoteproc*")):
+        ident = " ".join((_read(f"{rp}/name"), _read(f"{rp}/firmware"), _read(f"{rp}/device/of_node/compatible")))
+        if "cdsp" in ident.lower():
+            cdsp = {"remoteproc": os.path.basename(rp), "name": _read(f"{rp}/name"),
+                    "firmware": _read(f"{rp}/firmware"), "state": _read(f"{rp}/state")}
+            break
+    nsp = [z for z in (zones if zones is not None else thermal()) if z["type"].lower().startswith("nsp")]
     return {
-        "soc": soc_identity(), "thermal": thermal(), "cpu_freq": cpu_freqs(), "cpu_load": cpu_load(),
+        "fastrpc_cdsp": os.path.exists("/dev/fastrpc-cdsp"),
+        "cdsp": cdsp,
+        "nsp_temp_c": max((z["temp_c"] for z in nsp), default=None),
+        "nsp_zones": len(nsp),
+    }
+
+
+def hardware() -> dict:
+    """Everything that does not depend on the pipeline (SoC, thermals, CPU, RAM, IPC, NPU)."""
+    zones = thermal()
+    return {
+        "soc": soc_identity(), "thermal": zones, "cpu_freq": cpu_freqs(), "cpu_load": cpu_load(),
         "memory": memory(), "uptime_s": uptime_s(), "router": router_socket(), "serial": serial_bridge(),
-        "linux_i2c_buses": i2c_buses(),
+        "linux_i2c_buses": i2c_buses(), "npu": npu_status(zones),
     }
 
 
