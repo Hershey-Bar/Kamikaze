@@ -117,6 +117,8 @@ def find_phone(brand: str, model: str, index: tuple[dict, list] | None = None) -
             continue
         if _norm(str(entry[2])) == want:
             return maker, int(entry[1]), str(entry[2])
+    if not want.endswith(" 5g"):  # GSMArena lists e.g. "Galaxy S21 5G" / "Galaxy Z Fold3 5G" for 5G-only launches
+        return find_phone(brand, f"{model} 5G", (makers, phones))
     return None
 
 
@@ -126,19 +128,31 @@ def phone_page_url(maker: str, phone_id: int, name: str) -> str:
 
 
 def parse_phone_page(page: str) -> dict:
-    """Dimensions (mm) and rear camera module count from a GSMArena spec page."""
-    m = re.search(r'data-spec="dimensions">\s*([\d.]+)\s*x\s*([\d.]+)\s*x\s*([\d.]+)\s*mm', page)
-    if not m:
-        raise SpecError("dimensions not found on the GSMArena page")
-    height, width, depth = (float(v) for v in m.groups())
+    """Dimensions (mm) and rear camera module count from a GSMArena spec page. Foldables ("Unfolded: H x W x D mm
+    <br>Folded: H x W x D1-D2 mm") report the folded (pocket) body, thickest point of a range, plus `unfolded_mm`."""
+    folded = re.search(r'data-spec="dimensions">\s*Unfolded:\s*([\d.]+)\s*x\s*([\d.]+)\s*x\s*([\d.]+)\s*mm\s*'
+                       r'(?:<br\s*/?>)?\s*Folded:\s*([\d.]+)\s*x\s*([\d.]+)\s*x\s*([\d.]+)(?:\s*-\s*([\d.]+))?\s*mm', page)
+    unfolded = None
+    if folded:
+        g = folded.groups()
+        unfolded = {"height_mm": float(g[0]), "width_mm": float(g[1]), "depth_mm": float(g[2])}
+        height, width, depth = float(g[3]), float(g[4]), float(g[6] or g[5])
+    else:
+        m = re.search(r'data-spec="dimensions">\s*([\d.]+)\s*x\s*([\d.]+)\s*x\s*([\d.]+)\s*mm', page)
+        if not m:
+            raise SpecError("dimensions not found on the GSMArena page")
+        height, width, depth = (float(v) for v in m.groups())
     lenses = 0
     cam = re.search(r'data-spec="cam1modules">(.*?)</td>', page, re.S)
     if cam:
         lines = [html.unescape(re.sub(r"<[^>]+>", "", ln)).strip() for ln in re.split(r"<br\s*/?>", cam.group(1))]
         lenses = sum(1 for ln in lines if re.search(r"\bMP\b", ln))
     weight = re.search(r'data-spec="weight">\s*([\d.]+)\s*g', page)
-    return {"height_mm": height, "width_mm": width, "depth_mm": depth, "rear_cameras": lenses,
-            "weight_g": float(weight.group(1)) if weight else None}
+    out = {"height_mm": height, "width_mm": width, "depth_mm": depth, "rear_cameras": lenses,
+           "weight_g": float(weight.group(1)) if weight else None}
+    if unfolded:
+        out["unfolded_mm"] = unfolded
+    return out
 
 
 def phone_specs(brand: str, model: str) -> dict:
@@ -219,6 +233,14 @@ def product_specs(product, profile: str | None = None) -> dict:
     """Verified dimensions for an entity_resolver.CanonicalProduct (or anything with the same attributes)."""
     category = getattr(product, "category", "")
     if category == "smartphone":
+        try:  # the offline devices_db (GSMArena-verified, scripts/build_devices_db.py) answers without the network
+            import device_cache
+
+            dev = device_cache.match_product(product)
+            if dev:
+                return device_cache.spec_for(dev)
+        except (OSError, ValueError, KeyError):
+            pass
         return phone_specs(getattr(product, "brand", ""), getattr(product, "model_or_variant", ""))
     if category == "beverage_can":
         return can_specs(getattr(product, "raw_query", ""), getattr(product, "container_volume", ""), profile)

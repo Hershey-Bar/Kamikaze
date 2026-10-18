@@ -277,8 +277,12 @@ def validate_layout(layout: dict, width_mm: float, height_mm: float) -> None:
 
 def build_phone_spec(width_mm: float, height_mm: float, depth_mm: float, rear_cameras: int, maker: str,
                      name: str = "", color: tuple | None = None, extras: dict | None = None,
-                     layout: dict | None = None) -> bytes:
+                     layout: dict | None = None, island_type: str | None = None) -> bytes:
     """Phone body at its published outer dimensions with the published number of rear camera modules.
+
+    `island_type` (models/devices_db.json design family) overrides the generation heuristic: Apple "triple_square",
+    "diagonal_dual", "vertical_pill"; Samsung "floating_rings" (no housing) or "rect_housing" / "contour_housing" /
+    "contour_island" / "vertical_housing" (lenses on a raised housing).
 
     With `layout` (validate_layout: cited, mm from the top-left of the back) the island and lenses are placed exactly
     there. Without it the approximations flagged by spec_search apply: corner radius 11 % of width, 2 % bezel, lens /
@@ -309,9 +313,9 @@ def build_phone_spec(width_mm: float, height_mm: float, depth_mm: float, rear_ca
         lr = 0.19 * side
         q = side * 0.24
         # (dx, dy) seen from the FRONT axes; from behind, -dx is the viewer's right
-        if n >= 3:
+        if n >= 3 or island_type == "triple_square":
             spots = [(q, q), (q, -q), (-q, 0.0)]
-        elif gen in (12, 16):
+        elif island_type == "vertical_pill" or (island_type is None and gen in (12, 16)):
             spots = [(q, q), (q, -q)]
         else:
             spots = [(q, q), (-q, -q)][:n]
@@ -323,7 +327,8 @@ def build_phone_spec(width_mm: float, height_mm: float, depth_mm: float, rear_ca
         pitch = 2.75 * lr
         x = w / 2 - 0.06 * w - lr
         y0 = h / 2 - 0.06 * w - lr
-        if gen and gen < 23:
+        housed = island_type != "floating_rings" if island_type else bool(gen and gen < 23)
+        if housed:
             hw, hh = 2 * lr + 0.012 * w, (n - 1) * pitch + 2 * lr + 0.024 * w
             rounded_prism(m, (x, y0 - (n - 1) * pitch / 2, rear - 0.0008), hw, hh, 0.0016, 0.3 * hw, body, 0.6, 0.3)
             base = rear - 0.0016
@@ -335,7 +340,7 @@ def build_phone_spec(width_mm: float, height_mm: float, depth_mm: float, rear_ca
             m.cylinder((x, y, base - 0.0023), lr * 0.62, 0.0002, GLASS, axis="z", metallic=0.2, rough=0.02)
     return m.to_glb({"kind": SPEC_TAG, "category": "smartphone",
                      "dimensions_mm": {"width": width_mm, "height": height_mm, "depth": depth_mm},
-                     "rear_cameras": n, **meta, **(extras or {})})
+                     "rear_cameras": n, **({"island_type": island_type} if island_type else {}), **meta, **(extras or {})})
 
 
 def build_can_spec(diameter_mm: float, height_mm: float, neck_diameter_mm: float, neck_height_mm: float = 10.0,
@@ -381,7 +386,7 @@ def build_from_spec(spec: dict, label_text: str = "", extras: dict | None = None
     meta = {"sources": spec.get("sources", []), "approximations": spec.get("approximations", []), **(extras or {})}
     if spec["category"] == "smartphone":
         return build_phone_spec(spec["width_mm"], spec["height_mm"], spec["depth_mm"], spec["rear_cameras"],
-                                spec.get("maker", ""), spec.get("name", ""), color, meta, layout)
+                                spec.get("maker", ""), spec.get("name", ""), color, meta, layout, spec.get("island_type"))
     if spec["category"] == "beverage_can":
         return build_can_spec(spec["diameter_mm"], spec["height_mm"], spec["neck_diameter_mm"],
                               spec.get("neck_height_mm", 10.0), None if label else color, meta, label)

@@ -169,6 +169,16 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   .smart.locked .meter i { background:var(--green); }
   .smart.inconclusive { border-color:var(--red); }
   .smart #smMsg { margin-top:8px; }
+  .orihud { position:absolute; left:10px; top:46px; display:flex; gap:8px; align-items:center; z-index:4; flex-wrap:wrap;
+            padding:6px 10px; border-radius:12px; max-width:calc(100% - 20px); background:rgba(2,6,16,.72); border:1px solid var(--line); font-size:12px; }
+  .orihud .sw { display:flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }
+  .orihud .sw input { display:none; }
+  .orihud .sw i { width:34px; height:18px; border-radius:999px; background:#334155; position:relative; transition:background .15s; }
+  .orihud .sw i::after { content:''; position:absolute; left:2px; top:2px; width:14px; height:14px; border-radius:50%; background:#e2e8f0; transition:left .15s; }
+  .orihud .sw input:checked + i { background:var(--green); }
+  .orihud .sw input:checked + i::after { left:18px; }
+  .orihud button { padding:4px 10px; font-size:11px; }
+  .orihud #oriTxt { color:var(--mute); font-variant-numeric:tabular-nums; }
   .kinfo { margin-top:12px; padding:12px 14px; border-radius:10px; background:var(--panel2); border:1px solid var(--line); }
   .kinfo #kName { font-size:22px; font-weight:700; overflow-wrap:anywhere; }
   .kinfo .krow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:6px; font-size:12px; color:var(--mute); }
@@ -388,6 +398,11 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
           <span id="previewBar"><span class="pill on" id="previewPill">preview</span><button class="ghost" id="previewExit" type="button">Back to live</button></span>
           <span id="estBadge" class="prov"></span>
           <div id="badge"></div>
+          <div class="orihud" id="oriHud" title="Auto-Orient: the model mirrors the live yaw / pitch / roll of the object in front of the Brio (DINOv2 + MobileNetV3 pose, EMA-smoothed). Off: drag to orbit, idle auto-rotate.">
+            <label class="sw"><input type="checkbox" id="oriSwitch"><i></i><b>Auto-Orient</b></label>
+            <button class="ghost" id="snapBtn" type="button" title="Jump the model to the current live pose once">Snap to Live Pose</button>
+            <span id="oriTxt">pose: —</span>
+          </div>
         </div>
         <div class="kinfo kz" id="kInfo">
           <div id="kName">Show an object to the camera</div>
@@ -875,28 +890,62 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     else { icon.textContent = '⟳'; icon.className = 'on rotate'; }
   }
 
-  // Physical pose -> <model-viewer>. Yaw / pitch drive the camera orbit (pitch > 0 = top tilted toward the camera, so
-  // the virtual camera rises: phi = 90 - pitch). Image roll (+ = clockwise as seen by the camera) is a rotation of the
-  // model about the virtual camera's viewing axis; model-viewer's `orientation` is "roll pitch yaw" =
-  // Euler(x=pitch, y=yaw, z=roll, 'YXZ') in model space, so convert the axis-angle rotation to that Euler triple.
-  function viewRollOrientation(thetaDeg, phiDeg, rollDeg) {
-    const D = Math.PI / 180, t = thetaDeg * D, p = phiDeg * D, a = -rollDeg * D;
-    const ax = Math.sin(p) * Math.sin(t), ay = Math.cos(p), az = Math.sin(p) * Math.cos(t);
-    const c = Math.cos(a), s = Math.sin(a), C = 1 - c;
-    const m11 = c + ax * ax * C, m13 = ax * az * C + ay * s, m21 = ay * ax * C + az * s, m22 = c + ay * ay * C;
-    const m23 = ay * az * C - ax * s, m31 = az * ax * C - ay * s, m33 = c + az * az * C;
-    const x = Math.asin(-Math.max(-1, Math.min(1, m23)));
-    let y, z;
-    if (Math.abs(m23) < 0.9999999) { y = Math.atan2(m13, m33); z = Math.atan2(m21, m22); }
-    else { y = Math.atan2(-m31, m11); z = 0; }
-    return `${(z / D).toFixed(1)}deg ${(x / D).toFixed(1)}deg ${(y / D).toFixed(1)}deg`;
+  // Physical pose -> <model-viewer> (kiosk Auto-Orient). The virtual camera stays in front of the model and the model
+  // itself turns to mirror the object held in front of the Brio: `orientation` is "roll pitch yaw" (model-viewer), so
+  // yaw turns by -yaw about +Y, pitch by +pitch about +X (top toward the camera) and roll by -roll about +Z (image roll
+  // + = clockwise). Single-frame network noise is removed with an EMA (alpha 0.25) that wraps yaw / roll at +-180.
+  const ORI_ALPHA = 0.25, ORI_ORBIT = '0deg 80deg auto', IDLE_ORBIT = '45deg 75deg auto';
+  const ori = { yaw: null, pitch: 0, roll: 0 };
+  let autoOrient = false;
+  const wrap180 = (a) => ((((a + 180) % 360) + 360) % 360) - 180;
+  function smoothPose(p, snap) {
+    if (snap || ori.yaw === null) { ori.yaw = wrap180(p.yaw); ori.pitch = p.pitch; ori.roll = wrap180(p.roll); return; }
+    ori.yaw = wrap180(ori.yaw + ORI_ALPHA * wrap180(p.yaw - ori.yaw));
+    ori.pitch += ORI_ALPHA * (p.pitch - ori.pitch);
+    ori.roll = wrap180(ori.roll + ORI_ALPHA * wrap180(p.roll - ori.roll));
   }
-
+  function orientModel() {
+    viewer.setAttribute('orientation', `${(-ori.roll).toFixed(1)}deg ${ori.pitch.toFixed(1)}deg ${(-ori.yaw).toFixed(1)}deg`);
+  }
+  function setAutoOrient(on, quiet) {
+    autoOrient = syncPose = !!on;
+    try { localStorage.setItem('kz.autoOrient', on ? '1' : '0'); } catch (e) {}
+    $('oriSwitch').checked = autoOrient;
+    $('syncBtn').classList.toggle('on', autoOrient);
+    if (autoOrient) {
+      autoRotate = false; $('rotBtn').classList.remove('on');
+      viewer.removeAttribute('auto-rotate'); viewer.removeAttribute('camera-controls');
+      viewer.setAttribute('camera-orbit', ORI_ORBIT);
+      ori.yaw = null;
+      applyPose();
+    } else {
+      viewer.setAttribute('camera-controls', '');
+      viewer.removeAttribute('orientation');
+      viewer.setAttribute('camera-orbit', IDLE_ORBIT);
+      if (!quiet) { autoRotate = true; $('rotBtn').classList.add('on'); }
+      if (autoRotate) viewer.setAttribute('auto-rotate', ''); else viewer.removeAttribute('auto-rotate');
+    }
+  }
+  function snapPose() {
+    if (!pose || !pose.valid) { $('oriTxt').textContent = 'no live pose - hold the object in the reticle'; return; }
+    autoRotate = false; $('rotBtn').classList.remove('on');
+    viewer.removeAttribute('auto-rotate');
+    viewer.setAttribute('camera-orbit', ORI_ORBIT);
+    smoothPose(pose, true);
+    orientModel();
+    if (typeof viewer.jumpCameraToGoal === 'function') viewer.jumpCameraToGoal();
+  }
   function applyPose() {
-    if (!syncPose || !pose || !pose.valid) return;
-    const phi = Math.max(15, Math.min(165, 90 - pose.pitch));
-    viewer.cameraOrbit = `${pose.yaw}deg ${phi}deg auto`;
-    viewer.setAttribute('orientation', viewRollOrientation(pose.yaw, phi, pose.roll));
+    if (!autoOrient || !pose || !pose.valid) return;
+    smoothPose(pose, false);
+    orientModel();
+  }
+  function renderPoseHud() {
+    const live = pose && pose.valid;
+    $('snapBtn').disabled = !live;
+    const raw = live ? `yaw ${Math.round(pose.yaw)}° · pitch ${Math.round(pose.pitch)}° · roll ${Math.round(pose.roll || 0)}°` : 'pose: no object';
+    $('oriTxt').textContent = autoOrient && live && ori.yaw !== null
+      ? `yaw ${Math.round(ori.yaw)}° · pitch ${Math.round(ori.pitch)}° · roll ${Math.round(ori.roll)}°` : raw;
   }
 
   function render(s) {
@@ -943,6 +992,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     $('syncPill').textContent = syncPose ? (poseTxt ? 'syncing · ' + poseTxt : 'pose: no object') : (poseTxt ? 'pose: off · ' + poseTxt : 'pose: off');
     $('syncPill').className = 'pill' + (syncPose && pose && pose.valid ? ' on' : '');
     applyPose();
+    renderPoseHud();
   }
 
   let offlinePrompted = '', uploadBusy = false, srcSig = '', orientBusy = false;
@@ -1520,15 +1570,14 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   $('rotBtn').onclick = () => {
     autoRotate = !autoRotate;
     $('rotBtn').classList.toggle('on', autoRotate);
-    if (autoRotate) { syncPose = false; $('syncBtn').classList.remove('on'); viewer.removeAttribute('orientation'); viewer.setAttribute('auto-rotate', ''); }
+    if (autoRotate && autoOrient) setAutoOrient(false);
+    else if (autoRotate) { viewer.removeAttribute('orientation'); viewer.setAttribute('auto-rotate', ''); }
     else viewer.removeAttribute('auto-rotate');
   };
-  $('syncBtn').onclick = () => {
-    syncPose = !syncPose;
-    $('syncBtn').classList.toggle('on', syncPose);
-    if (syncPose) { autoRotate = false; $('rotBtn').classList.remove('on'); viewer.removeAttribute('auto-rotate'); applyPose(); }
-    else { viewer.removeAttribute('orientation'); viewer.setAttribute('camera-orbit', '45deg 75deg auto'); }
-  };
+  $('syncBtn').onclick = () => setAutoOrient(!autoOrient);
+  $('oriSwitch').onchange = (e) => setAutoOrient(e.target.checked);
+  $('snapBtn').onclick = snapPose;
+  try { if (localStorage.getItem('kz.autoOrient') === '1') setAutoOrient(true); } catch (e) {}
   $('refetchActiveBtn').onclick = () => {
     const name = state && (state.confirmed_label || state.viewer_label);
     if (name) refetchCad(name);

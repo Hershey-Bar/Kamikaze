@@ -66,7 +66,8 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
   GET|POST /api/settings/view        {"view": "smart"|"debug"}: SMART kiosk (5 s autonomous scan, locked identity, auto
                                      label scan of unlabelled cans) or enrollment & debug (default KAMIKAZE_VIEW=smart)
   GET  /api/scan                     SMART scan state (status idle|scanning|locked|inconclusive, progress, votes, tokens)
-  GET  /api/scan_stream              alias of /api/events (SSE live state incl. smart_scan)
+  GET  /api/scan_stream              alias of /api/events (SSE live state incl. smart_scan, orientation {yaw, pitch,
+                                     roll, attribute} for the kiosk Auto-Orient and smart_scan.device_match)
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
 Pipeline per frame: Ultralytics YOLO-World v2 (open vocabulary: beverage can / soda can / smartphone / bottle; YOLO26n
@@ -144,7 +145,9 @@ except ImportError:  # numpy fallback for the empty-scene gate
     cv2 = None
 
 import cad_harvester
+import citrus_classifier
 import color_sig
+import device_cache
 import device_taxonomy
 import entity_resolver
 import label_stitch
@@ -153,6 +156,7 @@ import netguard
 import npu as npu_mod
 import onboard_camera
 import packaging
+import phone_classifier
 import pose as pose_mod
 import smart_scan
 import ocr_fusion
@@ -272,6 +276,7 @@ POSE_FRESH_S = 1.0  # DINOv2 view sims older than this fall back to the MobileNe
 # calibrated confidence through these knots (s0 -> 0, s1 -> 80 %, s2 -> 95 %, capped); weight 0 disables the route.
 DINO_KNOTS = tuple(float(x) for x in os.environ.get("KAMIKAZE_DINO_KNOTS", "0.45,0.78,0.92").split(","))
 DINO_WEIGHT = float(os.environ.get("KAMIKAZE_DINO_WEIGHT", "0.5"))
+PHONE_MATCH_HZ = float(os.environ.get("KAMIKAZE_PHONE_MATCH_HZ", "2"))  # fine-grained phone classifier rate cap
 PIPELINE = ("raw_frame_input -> yolo_world_v2_npu_detection(beverage can|soda can|smartphone|bottle) -> "
             "roi_crop(pad=15%) -> routing_switch(smartphone=dinov2_vits14_npu+mobilenetv3_npu view-prototype cosine, "
             "beverage=pp_ocrv4(det npu, rec cpu) rolling 5-pass keyword lexicon + dinov2 pose, colour) -> "
@@ -303,36 +308,48 @@ def color_signature(image: Image.Image, box: tuple[int, int, int]) -> np.ndarray
     return color_sig.signature(object_pixels(image, box))
 
 
-def citrus_tiebreak(ranked: list, fused: dict, flavor_of, hue: dict | None, lexicon_label: str | None,
-                    max_gap: float = 0.25) -> dict | None:
-    """Lime vs lemon: identical Kirkland cans whose embeddings sit within `max_gap` calibrated confidence of each other.
-    When the top two candidates are a lime and a lemon class, OCR did not already confirm one of them (lexicon route),
-    and the object's median print hue gives a verdict (color_sig.citrus_verdict: hue > 38 lime, else lemon), the hue
-    picks the winner: it takes the higher fused confidence and the loser drops MIN_MARGIN + 0.05 below it.
-    Mutates ranked / fused in place; returns diagnostics or None when the rule does not apply."""
-    if len(ranked) < 2:
-        return None
-    a, b = ranked[0][0], ranked[1][0]
-    fa, fb = flavor_of(a), flavor_of(b)
-    if not fa or not fb or fa == fb or lexicon_label in (a, b):
-        return None
-    ca, cb = fused.get(a, calibrate(ranked[0][1])), fused.get(b, calibrate(ranked[1][1]))
-    if abs(ca - cb) > max_gap:
-        return None
-    verdict = color_sig.citrus_verdict(hue)
-    info = {"pair": [a, b], "median_hue": (hue or {}).get("median_hue"), "verdict": verdict, "swapped": False}
-    if verdict is None:
-        return info
-    hi = max(ca, cb)
-    lo = max(0.0, hi - MIN_MARGIN - 0.05)
-    if verdict == fb:
-        ranked[0], ranked[1] = ranked[1], ranked[0]
-        fused[b], fused[a] = hi, min(ca, cb, lo)
-        info["swapped"] = True
+def citrus_crop(image: Image.Image, target: dict | None, crop_box: tuple[int, int, int]) -> np.ndarray:
+    """The can surface for citrus_classifier: the detector box of the target (normalised x0, y0, x1, y1) when there
+    is one, else the square crop; reduced to <= citrus_classifier.SIDE px in RAM (the ellipse mask is applied later)."""
+    w, h = image.size
+    if target and target.get("box"):
+        x0, y0, x1, y1 = citrus_classifier.to_pixel_box(target["box"], w, h)
     else:
-        fused[a], fused[b] = hi, min(ca, cb, lo)
-    info["winner"] = ranked[0][0]
-    return info
+        size, left, top = crop_box
+        x0, y0, x1, y1 = left, top, left + size, top + size
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        size, left, top = crop_box
+        x0, y0, x1, y1 = left, top, left + size, top + size
+    side = citrus_classifier.SIDE
+    s = min(1.0, side / max(x1 - x0, y1 - y0))
+    crop = image.crop((x0, y0, x1, y1)).resize((max(8, int(round((x1 - x0) * s))), max(8, int(round((y1 - y0) * s)))),
+                                               Image.BILINEAR)
+    return np.asarray(crop.convert("RGB"))
+
+
+def model_orientation(pose: dict | None) -> dict:
+    """Live physical pose -> <model-viewer> `orientation` for the kiosk Auto-Orient mode (camera fixed in front).
+    pose: yaw (object turned, + = its right side toward the camera), pitch (+ = top tilted toward the camera),
+    roll (+ = clockwise as seen by the camera). model-viewer's attribute is "roll pitch yaw" (Euler about z, x, y in
+    model space), so the model turns by -yaw about +Y, +pitch about +X and -roll about +Z to mirror the object."""
+    p = pose or {}
+    yaw, pitch, roll = (float(p.get(k) or 0.0) for k in ("yaw", "pitch", "roll"))
+    valid = bool(p.get("valid"))
+    return {"yaw": round(yaw, 1), "pitch": round(pitch, 1), "roll": round(roll, 1), "valid": valid,
+            "source": p.get("source"), "smoothing_alpha": 0.25,
+            "attribute": f"{-roll:.1f}deg {pitch:.1f}deg {-yaw:.1f}deg" if valid else None}
+
+
+def phone_crop(image: Image.Image, target: dict | None) -> np.ndarray | None:
+    """RGB crop (RAM) of the detected phone for the fine-grained classifier, or None without a usable detector box."""
+    if not target or not target.get("box"):
+        return None
+    w, h = image.size
+    x0, y0, x1, y1 = citrus_classifier.to_pixel_box(target["box"], w, h)
+    if x1 - x0 < 24 or y1 - y0 < 24:
+        return None
+    return np.asarray(image.crop((x0, y0, x1, y1)).convert("RGB"))
+
 
 def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> np.ndarray:
     """Square crop (detector box, else the center 75%) -> 224x224 -> ImageNet normalisation. float32 (1,3,224,224)."""
@@ -366,12 +383,17 @@ class PoseWorker:
         self._last_submit = 0.0
         self._thread: threading.Thread | None = None
         self._lat: collections.deque = collections.deque(maxlen=240)
+        self._embed_lock = threading.Lock()  # the NPU graph is shared with the fine-grained phone classifier
         self.runs = 0
         self.errors = 0
 
+    def embed(self, nhwc01: np.ndarray) -> np.ndarray:
+        with self._embed_lock:
+            return self.embedder.embed_rgb01(nhwc01)
+
     def describe(self, arr: np.ndarray) -> np.ndarray:
         t = time.perf_counter()
-        desc = self.embedder.embed_rgb01(rgb01_nhwc(arr))
+        desc = self.embed(rgb01_nhwc(arr))
         self._lat.append((time.perf_counter() - t) * 1000.0)
         return desc
 
@@ -2129,11 +2151,19 @@ class Pipeline:
         self.ocr = ocr if ocr is not None else ocr_fusion.OcrWorker(None)
         self._vocab_key: tuple | None = None
         self._route: dict | None = None  # bifurcated-routing diagnostics of the last frame (telemetry)
-        self._hue: dict | None = None  # median print hue of the object (lime vs lemon tiebreak), RAM only
+        self._hue: dict | None = None  # median print hue of the object (diagnostics), RAM only
+        self._citrus: dict | None = None  # citrus_classifier colour evidence of the can surface, RAM only
+        self._ocr_tokens: tuple[set, dict] = (set(), {})  # (latest OCR pass, rolling buffer) used by the last fusion
         self._ocr_cursor = 0  # last OCR pass handed to the enrollment lexicon
         self._lighting: dict = {"ok": True, "issue": None, "message": "", "mean_luma": None, "glare_fraction": None,
                                 "gate": LIGHT_GATE}
         self.pose_worker = PoseWorker(pose_embedder, bank) if pose_embedder is not None else None
+        self.devices: phone_classifier.DeviceMatcher | None = None  # fine-grained phone model match (SMART scan)
+        try:
+            self.devices = phone_classifier.DeviceMatcher(phone_classifier.PhoneClassifier.create(
+                embed=self.pose_worker.embed if self.pose_worker is not None else None), hz=PHONE_MATCH_HZ)
+        except Exception:
+            log.exception("fine-grained phone classifier unavailable")
         self.camera = None  # onboard_camera.LocalBrioCapture when the on-board camera is the video source
         self.crop_tracker = npu_mod.CropTracker()
         self._detect_lat: collections.deque = collections.deque(maxlen=240)
@@ -2391,17 +2421,19 @@ class Pipeline:
                 frame, views, best_view, category = FrameScore(None, 0.0, empty=empty), {}, None, None
                 arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None, "ocr": None,
                        "route": None}
-                arr, self._hue = None, None
+                arr, self._hue, self._citrus = None, None, None
             else:
                 box, detect_ms = self._locate(image)
                 crop_box = box or center_crop_box(*image.size)
                 if self.ocr.enabled:
                     size, left, top = crop_box
                     self.ocr.submit(np.asarray(image.crop((left, top, left + size, top + size))))
-                live_color, self._hue = None, None
+                live_color, self._hue, self._citrus = None, None, None
                 try:
                     pixels = object_pixels(image, crop_box)
                     self._hue = color_sig.hue_stats(pixels)
+                    self._citrus = citrus_classifier.color_evidence(
+                        citrus_crop(image, self._detection.get("target"), crop_box))
                     if self.mv.capturing or self.bank.has_color():
                         live_color = color_sig.signature(pixels)
                 except Exception:
@@ -2440,7 +2472,7 @@ class Pipeline:
                 self.leds.set(capture_led_params(mv["collected"], mv["frames_per_view"]) if capturing else led_params(SEARCHING, 0.0))
             else:
                 st = self._feed_label_scan(scan, image) if scan is not None and not dark else None
-                smart_led = self._smart_step(frame, category, best_view, saliency, arb, st, dark)
+                smart_led = self._smart_step(frame, category, best_view, saliency, arb, st, dark, image)
                 if st is not None and self._auto_scan and self.smart.status == smart_scan.LOCKED:
                     self.leds.set(scan_led_params(st["coverage"], st["complete"]))  # locked: keep turning for the label
                 elif smart_led is not None:
@@ -2523,7 +2555,9 @@ class Pipeline:
                 "ocr": None, "route": None}
         ranked, fused, info["ocr"] = self._fuse(ranked, live_color, domain)
         lex_label = (self._route.get("lexicon") or {}).get("label") if self._route else None
-        citrus = citrus_tiebreak(ranked, fused, self._citrus_of, self._hue, lex_label)
+        recent_tokens, roll_tokens = self._ocr_tokens
+        citrus = citrus_classifier.arbitrate(ranked, fused, self._flavor_of, self._citrus, recent_tokens, roll_tokens,
+                                             lex_label, calibrate, margin=MIN_MARGIN, demote_to=C_IDENT - 0.25)
         if citrus is not None and self._route is not None:
             self._route["citrus"] = citrus
         info["route"] = self._route
@@ -2579,6 +2613,11 @@ class Pipeline:
             recent = self.ocr.recent()
             roll = self.ocr.rolling()
         seen = set(recent["tokens"]) if recent else set()
+        # Multimodal citrus gate: OCR flavour words the can's colour contradicts (a fuzzy "lemon" read on a strictly
+        # green can) are dropped before any text scoring or lexicon routing.
+        seen = citrus_classifier.gate_tokens(seen, self._citrus)
+        roll = citrus_classifier.gate_tokens(roll, self._citrus)
+        self._ocr_tokens = (seen, roll)
         dino = self._dino_identity()
         lex = self._lexicon_route(ranked, roll, domain)
         self._route = {"branch": "smartphone" if domain == device_taxonomy.PHONE_DOMAIN else
@@ -2627,7 +2666,8 @@ class Pipeline:
         return {"ok": True, "view": self.view, "views": list(VIEWS)}
 
     def _smart_step(self, frame: "FrameScore", category: str | None, best_view: str | None, saliency: dict,
-                    arb: dict, st: dict | None, dark: bool) -> tuple[int, int, int, int, int] | None:
+                    arb: dict, st: dict | None, dark: bool,
+                    image: Image.Image | None = None) -> tuple[int, int, int, int, int] | None:
         """Feed the SMART scan one frame; returns the LED tuple it wants (None = regular state machine LEDs)."""
         manual_scan = self._label_scan is not None and not self._auto_scan
         if self.view != "smart" or manual_scan or self.enroller.active or not self.bank.labels():
@@ -2645,6 +2685,8 @@ class Pipeline:
                                   category=category, tokens=ocr.get("tokens") or (),
                                   sharpness=(saliency or {}).get("laplacian_var"),
                                   view=best_view if category == "smartphone" else None)
+        if event == "started" and self.devices is not None:
+            self.devices.reset()
         if event == "started":
             log.info("SMART scan #%d started (%.0f s window)", self.smart.scans, self.smart.window_s)
             self._bump()
@@ -2662,6 +2704,10 @@ class Pipeline:
             self._bump()
         if self.smart.status == smart_scan.SCANNING:
             self._maybe_auto_label_scan(self.smart.label)
+            if category == "smartphone" and self.devices is not None and image is not None and not blank:
+                crop = phone_crop(image, target)
+                if crop is not None:
+                    self.devices.submit(crop, best_view)
         if self._auto_scan and st is not None and st.get("complete") and not self._auto_finishing:
             self._auto_finishing = True
             threading.Thread(target=self._finish_auto_scan, name="auto-label-scan", daemon=True).start()
@@ -2735,6 +2781,10 @@ class Pipeline:
         snap["auto_label_scan"] = scan.status() if scan is not None and self._auto_scan else None
         if snap["label"]:
             snap["display_name"] = self._display_name(snap["label"])
+        snap["orientation"] = model_orientation(self._pose)
+        snap["device_match"] = None
+        if self.devices is not None and snap.get("category") == "smartphone":
+            snap["device_match"] = self.devices.summary(device_cache.device_id_for(snap["label"] or ""))
         return snap
 
     def _display_name(self, label: str) -> str:
@@ -2749,6 +2799,9 @@ class Pipeline:
 
     def _citrus_of(self, label: str) -> str | None:
         return ocr_fusion.citrus_flavor(self.bank.metadata(label), label)
+
+    def _flavor_of(self, label: str) -> str | None:
+        return citrus_classifier.flavor_of(self.bank.metadata(label), label)
 
     def _dino_identity(self) -> dict[str, float]:
         """Smartphone branch: {phone label: calibrated DINOv2 view-centric confidence} from the latest NPU descriptor."""
@@ -3122,6 +3175,7 @@ class Pipeline:
             "view": self.view,
             "smart_scan": self.smart_status(),
             "pose": self._pose,
+            "orientation": model_orientation(self._pose),
             "category": self._category,
             "best_view": self._best_view,
             "hint": last.get("hint"),
@@ -3206,6 +3260,7 @@ class Pipeline:
                     "embedder": self.extractor.info() if hasattr(self.extractor, "info") else {"runtime": self.extractor.name},
                     "detector": self.detector.info() if self.detector is not None else None,
                     "pose": self.pose_worker.info() if self.pose_worker is not None else None,
+                    "phone_match": self.devices.info() if self.devices is not None else None,
                     "ocr": self.ocr.recent(),
                 },
                 "ocr": last.get("ocr"), "lighting": last.get("lighting") or self._lighting,

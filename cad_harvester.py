@@ -58,6 +58,7 @@ from types import SimpleNamespace
 import entity_resolver
 import glb_orient
 import cad_dummies
+import device_cache
 import mcp_server as mcp
 import packaging
 import procedural_glb
@@ -1088,6 +1089,27 @@ def _library_match(product) -> dict | None:
         return None
 
 
+def _device_cache_match(product) -> dict | None:
+    """Install the pre-built offline GLB for a devices_db phone (scripts/populate_device_cache.py): a file copy plus
+    the cached attribution record, no network and no re-validation (< 50 ms)."""
+    try:
+        dev = device_cache.match_product(product)
+        if not dev:
+            return None
+        rec = device_cache.install(dev, glb_path(product.class_id))
+    except (OSError, ValueError, KeyError) as exc:
+        log.warning("device cache lookup failed for %s: %s", product.class_id, exc)
+        return None
+    if rec is None:
+        return None
+    attr = {**rec, "class_id": product.class_id, "canonical_name": product.canonical_name, "device_id": dev,
+            "device_cache": True,
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+    _write_json(sidecar_path(product.class_id), attr)
+    log.info("CAD for %s: offline device cache %s (%s)", product.class_id, dev, attr.get("source_key"))
+    return attr
+
+
 def harvest(product, force: bool = False, offline: bool = False, budget_s: float | None = None,
             source: str = "auto") -> dict:
     """Resolve + cache a GLB for `product` (CanonicalProduct | metadata dict | free text) and write its attribution.
@@ -1117,6 +1139,10 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
             if lib is not None:
                 attr = model_library.install(lib["id"], product.class_id)
                 return _result(product, attr, "cached", "library", True)
+            dev = _device_cache_match(product)
+            if dev is not None:
+                threading.Thread(target=write_credits_md, name="credits", daemon=True).start()
+                return _result(product, dev, "cached", dev.get("source_key", "device_cache"), True)
         if offline:
             return not_found(product.class_id, product.canonical_name,
                              "offline mode: no local 3D model is cached for this class", "offline_missing")

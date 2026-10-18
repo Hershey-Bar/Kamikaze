@@ -12,6 +12,7 @@ from unittest import mock
 import numpy as np
 
 import cad_harvester
+import citrus_classifier
 import color_sig
 import mcp_server
 import ocr_fusion
@@ -171,36 +172,47 @@ class CitrusTests(unittest.TestCase):
         self.assertIn("sparkling", lex)
         self.assertNotIn("lemon", lex)
 
-    def tiebreak(self, hue_rgb, lexicon=None, lemon_first=True, gap=0.05):
+    def tiebreak(self, rgb, lexicon=None, lemon_first=True, gap=0.05, recent=()):
         ranked = [("kirkland_lemon_can", 0.80, "front"), ("kirkland_lime_can", 0.78, "front")]
         if not lemon_first:
             ranked.reverse()
         fused = {ranked[0][0]: 0.80, ranked[1][0]: 0.80 - gap}
-        hue = color_sig.hue_stats(solid(hue_rgb)) if hue_rgb else None
-        info = receiver.citrus_tiebreak(ranked, fused, self.flavor, hue, lexicon)
+        ev = citrus_classifier.color_evidence(solid(rgb)) if rgb else None
+        info = citrus_classifier.arbitrate(ranked, fused, lambda lab: citrus_classifier.flavor_of({}, lab), ev,
+                                           set(recent), {}, lexicon, receiver.calibrate, margin=receiver.MIN_MARGIN)
         return ranked, fused, info
 
     def test_tiebreak_swaps_lemon_to_lime_on_green_print(self):
         ranked, fused, info = self.tiebreak(self.LIME)
-        self.assertTrue(info["swapped"])
+        self.assertEqual(info["action"], "promoted")
         self.assertEqual(ranked[0][0], "kirkland_lime_can")
         self.assertEqual(info["winner"], "kirkland_lime_can")
         self.assertGreaterEqual(fused["kirkland_lime_can"] - fused["kirkland_lemon_can"], receiver.MIN_MARGIN)
 
     def test_tiebreak_keeps_lemon_on_yellow_print(self):
         ranked, fused, info = self.tiebreak(self.LEMON)
-        self.assertFalse(info["swapped"])
+        self.assertIsNone(info["action"])
         self.assertEqual(ranked[0][0], "kirkland_lemon_can")
-        self.assertGreaterEqual(fused["kirkland_lemon_can"] - fused["kirkland_lime_can"], receiver.MIN_MARGIN)
 
     def test_tiebreak_does_not_apply(self):
-        self.assertIsNone(self.tiebreak(self.LIME, lexicon="kirkland_lemon_can")[2])  # OCR already decided
-        self.assertIsNone(self.tiebreak(self.LIME, gap=0.4)[2])  # vision is confident enough
-        ranked, _, info = self.tiebreak(self.GRAPEFRUIT)  # no colour evidence: leave the ranking alone
+        self.assertIsNone(self.tiebreak(self.LIME, lexicon="kirkland_lemon_can")[2]["action"])  # OCR already decided
+        ranked, _, info = self.tiebreak((200, 200, 205))  # silver: no colour evidence, leave the ranking alone
         self.assertIsNone(info["verdict"])
         self.assertEqual(ranked[0][0], "kirkland_lemon_can")
-        ranked = [("kirkland_grapefruit_can", 0.8, "front"), ("kirkland_lime_can", 0.79, "front")]
-        self.assertIsNone(receiver.citrus_tiebreak(ranked, {}, self.flavor, None, None))
+        ranked = [("cola_can", 0.8, "front"), ("kirkland_lime_can", 0.79, "front")]
+        self.assertIsNone(citrus_classifier.arbitrate(ranked, {}, lambda lab: citrus_classifier.flavor_of({}, lab),
+                                                      None))
+
+    def test_far_gap_demotes_instead_of_swapping(self):
+        ranked, fused, info = self.tiebreak(self.LIME, gap=0.4)  # vision far apart: lemon demoted, not swapped
+        self.assertEqual(info["action"], "demoted")
+        self.assertLessEqual(fused["kirkland_lemon_can"], 0.45)
+
+    def test_grapefruit_print_demotes_lemon_without_grapefruit_class(self):
+        ranked, fused, info = self.tiebreak(self.GRAPEFRUIT)
+        self.assertEqual(info["flavor"], "grapefruit")
+        self.assertEqual(info["action"], "demoted")
+        self.assertLess(fused["kirkland_lemon_can"], receiver.C_IDENT)
 
 
 class ViewEndpointTests(unittest.TestCase):

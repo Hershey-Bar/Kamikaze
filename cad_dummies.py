@@ -88,7 +88,10 @@ def identity(product) -> dict:
     if getattr(product, "category", "") != "smartphone" or not gen:
         raise DummyError(f"{getattr(product, 'canonical_name', product)!r} is not a phone with a model number")
     brand = getattr(product, "brand", "")
-    return {"brand": brand, "gen": gen, "tiers": tiers,
+    line = "fold" if "fold" in toks else "flip" if "flip" in toks else "iphone" if brand == "Apple" else "s"
+    if line in ("fold", "flip"):
+        gen = next((t for i, t in enumerate(toks) if t.isdigit() and i and toks[i - 1] == line), gen)
+    return {"brand": brand, "gen": gen, "tiers": tiers, "line": line,
             "family": {"iphone"} if brand == "Apple" else {"galaxy", "samsung", "s"}}
 
 
@@ -97,6 +100,10 @@ def _names_generation(toks: list[str], ident: dict) -> bool:
         if t != ident["gen"]:
             continue
         prev = toks[i - 1] if i else ""
+        if ident.get("line") in ("fold", "flip"):
+            if prev == ident["line"]:
+                return True
+            continue
         if ident["brand"] == "Apple" and prev == "iphone":
             return True
         if ident["brand"] == "Samsung" and prev == "s":
@@ -129,6 +136,8 @@ def file_matches(filename: str, title: str, ident: dict) -> tuple[bool, str]:
     if set(toks) & FILE_REJECT:
         return False, "accessory / partial file"
     other = {t for t in toks if t.isdigit() and 10 <= int(t) <= 30 and t != ident["gen"]}
+    if ident.get("line") in ("fold", "flip"):
+        other = {t for i, t in enumerate(toks) if t.isdigit() and i and toks[i - 1] == ident["line"] and t != ident["gen"]}
     if other and ident["gen"] not in toks:
         return False, f"different generation ({', '.join(sorted(other))})"
     ftiers = {t for t in toks if t in TIERS}

@@ -1,0 +1,947 @@
+{
+ "schema": 1,
+ "generated": "2026-10-18T18:40:05Z",
+ "units": "mm; height x width x depth of the body (GSMArena, camera bump excluded); foldables: folded body, thickest point, unfolded_mm separately",
+ "notes": [
+  "front_type / island_type are curated design-family facts (not measurements)",
+  "corner_radius_mm and lenses are null: not published by GSMArena, never estimated here"
+ ],
+ "devices": {
+  "iphone_13_mini": {
+   "brand": "Apple",
+   "name": "iPhone 13 mini",
+   "gsmarena_name": "Apple iPhone 13 mini",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 131.5,
+   "width_mm": 64.2,
+   "depth_mm": 7.7,
+   "weight_g": 141.0,
+   "rear_cameras": 2,
+   "aspect": 2.048,
+   "front_type": "notch",
+   "island_type": "diagonal_dual",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_13_mini-11104.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_13": {
+   "brand": "Apple",
+   "name": "iPhone 13",
+   "gsmarena_name": "Apple iPhone 13",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.7,
+   "width_mm": 71.5,
+   "depth_mm": 7.7,
+   "weight_g": 174.0,
+   "rear_cameras": 2,
+   "aspect": 2.052,
+   "front_type": "notch",
+   "island_type": "diagonal_dual",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_13-11103.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_13_pro": {
+   "brand": "Apple",
+   "name": "iPhone 13 Pro",
+   "gsmarena_name": "Apple iPhone 13 Pro",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.7,
+   "width_mm": 71.5,
+   "depth_mm": 7.7,
+   "weight_g": 204.0,
+   "rear_cameras": 3,
+   "aspect": 2.052,
+   "front_type": "notch",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_13_pro-11102.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_13_pro_max": {
+   "brand": "Apple",
+   "name": "iPhone 13 Pro Max",
+   "gsmarena_name": "Apple iPhone 13 Pro Max",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 160.8,
+   "width_mm": 78.1,
+   "depth_mm": 7.7,
+   "weight_g": 240.0,
+   "rear_cameras": 3,
+   "aspect": 2.059,
+   "front_type": "notch",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_13_pro_max-11089.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_14": {
+   "brand": "Apple",
+   "name": "iPhone 14",
+   "gsmarena_name": "Apple iPhone 14",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.7,
+   "width_mm": 71.5,
+   "depth_mm": 7.8,
+   "weight_g": 172.0,
+   "rear_cameras": 2,
+   "aspect": 2.052,
+   "front_type": "notch",
+   "island_type": "diagonal_dual",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_14-11861.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_14_plus": {
+   "brand": "Apple",
+   "name": "iPhone 14 Plus",
+   "gsmarena_name": "Apple iPhone 14 Plus",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 160.8,
+   "width_mm": 78.1,
+   "depth_mm": 7.8,
+   "weight_g": 203.0,
+   "rear_cameras": 2,
+   "aspect": 2.059,
+   "front_type": "notch",
+   "island_type": "diagonal_dual",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_14_plus-11862.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_14_pro": {
+   "brand": "Apple",
+   "name": "iPhone 14 Pro",
+   "gsmarena_name": "Apple iPhone 14 Pro",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 147.5,
+   "width_mm": 71.5,
+   "depth_mm": 7.9,
+   "weight_g": 206.0,
+   "rear_cameras": 3,
+   "aspect": 2.063,
+   "front_type": "dynamic_island",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_14_pro-11860.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_14_pro_max": {
+   "brand": "Apple",
+   "name": "iPhone 14 Pro Max",
+   "gsmarena_name": "Apple iPhone 14 Pro Max",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 160.7,
+   "width_mm": 77.6,
+   "depth_mm": 7.9,
+   "weight_g": 240.0,
+   "rear_cameras": 3,
+   "aspect": 2.071,
+   "front_type": "dynamic_island",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_14_pro_max-11773.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_15": {
+   "brand": "Apple",
+   "name": "iPhone 15",
+   "gsmarena_name": "Apple iPhone 15",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 147.6,
+   "width_mm": 71.6,
+   "depth_mm": 7.8,
+   "weight_g": 171.0,
+   "rear_cameras": 2,
+   "aspect": 2.061,
+   "front_type": "dynamic_island",
+   "island_type": "diagonal_dual",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_15-12559.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_15_plus": {
+   "brand": "Apple",
+   "name": "iPhone 15 Plus",
+   "gsmarena_name": "Apple iPhone 15 Plus",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 160.9,
+   "width_mm": 77.8,
+   "depth_mm": 7.8,
+   "weight_g": 201.0,
+   "rear_cameras": 2,
+   "aspect": 2.068,
+   "front_type": "dynamic_island",
+   "island_type": "diagonal_dual",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_15_plus-12558.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_15_pro": {
+   "brand": "Apple",
+   "name": "iPhone 15 Pro",
+   "gsmarena_name": "Apple iPhone 15 Pro",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.6,
+   "width_mm": 70.6,
+   "depth_mm": 8.3,
+   "weight_g": 187.0,
+   "rear_cameras": 3,
+   "aspect": 2.076,
+   "front_type": "dynamic_island",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_15_pro-12557.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_15_pro_max": {
+   "brand": "Apple",
+   "name": "iPhone 15 Pro Max",
+   "gsmarena_name": "Apple iPhone 15 Pro Max",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 159.9,
+   "width_mm": 76.7,
+   "depth_mm": 8.3,
+   "weight_g": 221.0,
+   "rear_cameras": 3,
+   "aspect": 2.085,
+   "front_type": "dynamic_island",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_15_pro_max-12548.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_16": {
+   "brand": "Apple",
+   "name": "iPhone 16",
+   "gsmarena_name": "Apple iPhone 16",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 147.6,
+   "width_mm": 71.6,
+   "depth_mm": 7.8,
+   "weight_g": 170.0,
+   "rear_cameras": 2,
+   "aspect": 2.061,
+   "front_type": "dynamic_island",
+   "island_type": "vertical_pill",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_16-13317.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_16_plus": {
+   "brand": "Apple",
+   "name": "iPhone 16 Plus",
+   "gsmarena_name": "Apple iPhone 16 Plus",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 160.9,
+   "width_mm": 77.8,
+   "depth_mm": 7.8,
+   "weight_g": 199.0,
+   "rear_cameras": 2,
+   "aspect": 2.068,
+   "front_type": "dynamic_island",
+   "island_type": "vertical_pill",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_16_plus-13316.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_16_pro": {
+   "brand": "Apple",
+   "name": "iPhone 16 Pro",
+   "gsmarena_name": "Apple iPhone 16 Pro",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 149.6,
+   "width_mm": 71.5,
+   "depth_mm": 8.3,
+   "weight_g": 199.0,
+   "rear_cameras": 3,
+   "aspect": 2.092,
+   "front_type": "dynamic_island",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_16_pro-13315.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "iphone_16_pro_max": {
+   "brand": "Apple",
+   "name": "iPhone 16 Pro Max",
+   "gsmarena_name": "Apple iPhone 16 Pro Max",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 163.0,
+   "width_mm": 77.6,
+   "depth_mm": 8.3,
+   "weight_g": 227.0,
+   "rear_cameras": 3,
+   "aspect": 2.101,
+   "front_type": "dynamic_island",
+   "island_type": "triple_square",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/apple_iphone_16_pro_max-13123.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s20": {
+   "brand": "Samsung",
+   "name": "Galaxy S20",
+   "gsmarena_name": "Samsung Galaxy S20",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 151.7,
+   "width_mm": 69.1,
+   "depth_mm": 7.9,
+   "weight_g": 163.0,
+   "rear_cameras": 3,
+   "aspect": 2.195,
+   "front_type": "punch_hole",
+   "island_type": "rect_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s20-10081.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s20_plus": {
+   "brand": "Samsung",
+   "name": "Galaxy S20+",
+   "gsmarena_name": "Samsung Galaxy S20+",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 161.9,
+   "width_mm": 73.7,
+   "depth_mm": 7.8,
+   "weight_g": 186.0,
+   "rear_cameras": 4,
+   "aspect": 2.197,
+   "front_type": "punch_hole",
+   "island_type": "rect_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s20+-10080.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s20_ultra": {
+   "brand": "Samsung",
+   "name": "Galaxy S20 Ultra",
+   "gsmarena_name": "Samsung Galaxy S20 Ultra",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 166.9,
+   "width_mm": 76.0,
+   "depth_mm": 8.8,
+   "weight_g": 220.0,
+   "rear_cameras": 4,
+   "aspect": 2.196,
+   "front_type": "punch_hole",
+   "island_type": "rect_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s20_ultra-10084.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s21": {
+   "brand": "Samsung",
+   "name": "Galaxy S21",
+   "gsmarena_name": "Samsung Galaxy S21",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 151.7,
+   "width_mm": 71.2,
+   "depth_mm": 7.9,
+   "weight_g": 169.0,
+   "rear_cameras": 3,
+   "aspect": 2.131,
+   "front_type": "punch_hole",
+   "island_type": "contour_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s21-10693.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s21_plus": {
+   "brand": "Samsung",
+   "name": "Galaxy S21+",
+   "gsmarena_name": "Samsung Galaxy S21+ 5G",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 161.5,
+   "width_mm": 75.6,
+   "depth_mm": 7.8,
+   "weight_g": 200.0,
+   "rear_cameras": 3,
+   "aspect": 2.136,
+   "front_type": "punch_hole",
+   "island_type": "contour_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s21+_5g-10625.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s21_ultra": {
+   "brand": "Samsung",
+   "name": "Galaxy S21 Ultra",
+   "gsmarena_name": "Samsung Galaxy S21 Ultra 5G",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 165.1,
+   "width_mm": 75.6,
+   "depth_mm": 8.9,
+   "weight_g": 227.0,
+   "rear_cameras": 4,
+   "aspect": 2.184,
+   "front_type": "punch_hole",
+   "island_type": "contour_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s21_ultra_5g-10596.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s22": {
+   "brand": "Samsung",
+   "name": "Galaxy S22",
+   "gsmarena_name": "Samsung Galaxy S22 5G",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.0,
+   "width_mm": 70.6,
+   "depth_mm": 7.6,
+   "weight_g": 167.0,
+   "rear_cameras": 3,
+   "aspect": 2.068,
+   "front_type": "punch_hole",
+   "island_type": "contour_island",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s22_5g-11253.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s22_plus": {
+   "brand": "Samsung",
+   "name": "Galaxy S22+",
+   "gsmarena_name": "Samsung Galaxy S22+ 5G",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 157.4,
+   "width_mm": 75.8,
+   "depth_mm": 7.6,
+   "weight_g": 195.0,
+   "rear_cameras": 3,
+   "aspect": 2.077,
+   "front_type": "punch_hole",
+   "island_type": "contour_island",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s22+_5g-11252.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s22_ultra": {
+   "brand": "Samsung",
+   "name": "Galaxy S22 Ultra",
+   "gsmarena_name": "Samsung Galaxy S22 Ultra 5G",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 163.3,
+   "width_mm": 77.9,
+   "depth_mm": 8.9,
+   "weight_g": 228.0,
+   "rear_cameras": 4,
+   "aspect": 2.096,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s22_ultra_5g-11251.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s23": {
+   "brand": "Samsung",
+   "name": "Galaxy S23",
+   "gsmarena_name": "Samsung Galaxy S23",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.3,
+   "width_mm": 70.9,
+   "depth_mm": 7.6,
+   "weight_g": 168.0,
+   "rear_cameras": 3,
+   "aspect": 2.063,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s23-12082.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s23_plus": {
+   "brand": "Samsung",
+   "name": "Galaxy S23+",
+   "gsmarena_name": "Samsung Galaxy S23+",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 157.8,
+   "width_mm": 76.2,
+   "depth_mm": 7.6,
+   "weight_g": 196.0,
+   "rear_cameras": 3,
+   "aspect": 2.071,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s23+-12083.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s23_ultra": {
+   "brand": "Samsung",
+   "name": "Galaxy S23 Ultra",
+   "gsmarena_name": "Samsung Galaxy S23 Ultra",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 163.4,
+   "width_mm": 78.1,
+   "depth_mm": 8.9,
+   "weight_g": 234.0,
+   "rear_cameras": 4,
+   "aspect": 2.092,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s23_ultra-12024.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s24": {
+   "brand": "Samsung",
+   "name": "Galaxy S24",
+   "gsmarena_name": "Samsung Galaxy S24",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 147.0,
+   "width_mm": 70.6,
+   "depth_mm": 7.6,
+   "weight_g": 167.0,
+   "rear_cameras": 3,
+   "aspect": 2.082,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s24-12773.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s24_plus": {
+   "brand": "Samsung",
+   "name": "Galaxy S24+",
+   "gsmarena_name": "Samsung Galaxy S24+",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 158.5,
+   "width_mm": 75.9,
+   "depth_mm": 7.7,
+   "weight_g": 196.0,
+   "rear_cameras": 3,
+   "aspect": 2.088,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s24+-12772.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s24_ultra": {
+   "brand": "Samsung",
+   "name": "Galaxy S24 Ultra",
+   "gsmarena_name": "Samsung Galaxy S24 Ultra",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 162.3,
+   "width_mm": 79.0,
+   "depth_mm": 8.6,
+   "weight_g": 232.0,
+   "rear_cameras": 4,
+   "aspect": 2.054,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s24_ultra-12771.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s25": {
+   "brand": "Samsung",
+   "name": "Galaxy S25",
+   "gsmarena_name": "Samsung Galaxy S25",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 146.9,
+   "width_mm": 70.5,
+   "depth_mm": 7.2,
+   "weight_g": 162.0,
+   "rear_cameras": 3,
+   "aspect": 2.084,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s25-13610.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s25_plus": {
+   "brand": "Samsung",
+   "name": "Galaxy S25+",
+   "gsmarena_name": "Samsung Galaxy S25+",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 158.4,
+   "width_mm": 75.8,
+   "depth_mm": 7.3,
+   "weight_g": 190.0,
+   "rear_cameras": 3,
+   "aspect": 2.09,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s25+-13609.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_s25_ultra": {
+   "brand": "Samsung",
+   "name": "Galaxy S25 Ultra",
+   "gsmarena_name": "Samsung Galaxy S25 Ultra",
+   "category": "smartphone",
+   "form": "slab",
+   "height_mm": 162.8,
+   "width_mm": 77.6,
+   "depth_mm": 8.2,
+   "weight_g": 218.0,
+   "rear_cameras": 4,
+   "aspect": 2.098,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_s25_ultra-13322.php",
+     "publisher": "GSMArena"
+    }
+   ]
+  },
+  "galaxy_z_fold_3": {
+   "brand": "Samsung",
+   "name": "Galaxy Z Fold 3",
+   "gsmarena_name": "Samsung Galaxy Z Fold3 5G",
+   "category": "smartphone",
+   "form": "foldable",
+   "height_mm": 158.2,
+   "width_mm": 67.1,
+   "depth_mm": 16.0,
+   "weight_g": 271.0,
+   "rear_cameras": 3,
+   "aspect": 2.358,
+   "front_type": "punch_hole",
+   "island_type": "vertical_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_z_fold3_5g-10906.php",
+     "publisher": "GSMArena"
+    }
+   ],
+   "unfolded_mm": {
+    "height_mm": 158.2,
+    "width_mm": 128.1,
+    "depth_mm": 6.4
+   },
+   "unfolded_aspect": 1.235
+  },
+  "galaxy_z_fold_4": {
+   "brand": "Samsung",
+   "name": "Galaxy Z Fold 4",
+   "gsmarena_name": "Samsung Galaxy Z Fold4",
+   "category": "smartphone",
+   "form": "foldable",
+   "height_mm": 155.1,
+   "width_mm": 67.1,
+   "depth_mm": 15.8,
+   "weight_g": 263.0,
+   "rear_cameras": 3,
+   "aspect": 2.311,
+   "front_type": "punch_hole",
+   "island_type": "vertical_housing",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_z_fold4-11737.php",
+     "publisher": "GSMArena"
+    }
+   ],
+   "unfolded_mm": {
+    "height_mm": 155.1,
+    "width_mm": 130.1,
+    "depth_mm": 6.3
+   },
+   "unfolded_aspect": 1.192
+  },
+  "galaxy_z_fold_5": {
+   "brand": "Samsung",
+   "name": "Galaxy Z Fold 5",
+   "gsmarena_name": "Samsung Galaxy Z Fold5",
+   "category": "smartphone",
+   "form": "foldable",
+   "height_mm": 154.9,
+   "width_mm": 67.1,
+   "depth_mm": 13.4,
+   "weight_g": 253.0,
+   "rear_cameras": 3,
+   "aspect": 2.308,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_z_fold5-12418.php",
+     "publisher": "GSMArena"
+    }
+   ],
+   "unfolded_mm": {
+    "height_mm": 154.9,
+    "width_mm": 129.9,
+    "depth_mm": 6.1
+   },
+   "unfolded_aspect": 1.192
+  },
+  "galaxy_z_fold_6": {
+   "brand": "Samsung",
+   "name": "Galaxy Z Fold 6",
+   "gsmarena_name": "Samsung Galaxy Z Fold6",
+   "category": "smartphone",
+   "form": "foldable",
+   "height_mm": 153.5,
+   "width_mm": 68.1,
+   "depth_mm": 12.1,
+   "weight_g": 239.0,
+   "rear_cameras": 3,
+   "aspect": 2.254,
+   "front_type": "punch_hole",
+   "island_type": "floating_rings",
+   "corner_radius_mm": null,
+   "lenses": null,
+   "sources": [
+    {
+     "what": "dimensions, rear camera modules",
+     "url": "https://www.gsmarena.com/samsung_galaxy_z_fold6-13147.php",
+     "publisher": "GSMArena"
+    }
+   ],
+   "unfolded_mm": {
+    "height_mm": 153.5,
+    "width_mm": 132.6,
+    "depth_mm": 5.6
+   },
+   "unfolded_aspect": 1.158
+  }
+ }
+}

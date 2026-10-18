@@ -907,5 +907,26 @@ def cad_harvester_sources():
     return receiver.cad_harvester.SOURCES
 
 
+
+_CAD_CACHE_ENV = None
+
+
+def setUpModule():
+    """Isolate from the populated offline device cache: these tests expect "no CAD exists" unless they create it."""
+    global _CAD_CACHE_ENV
+    import os as _os
+    import tempfile as _tempfile
+    _CAD_CACHE_ENV = _os.environ.get("KAMIKAZE_CAD_CACHE")
+    _os.environ["KAMIKAZE_CAD_CACHE"] = _tempfile.mkdtemp(prefix="kz_empty_cad_cache_")
+
+
+def tearDownModule():
+    import os as _os
+    import shutil as _shutil
+    _shutil.rmtree(_os.environ.pop("KAMIKAZE_CAD_CACHE"), ignore_errors=True)
+    if _CAD_CACHE_ENV is not None:
+        _os.environ["KAMIKAZE_CAD_CACHE"] = _CAD_CACHE_ENV
+
+
 if __name__ == "__main__":
     unittest.main()

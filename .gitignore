@@ -19,3 +19,6 @@ static/models/base/
 static/models/CREDITS.md
 # owner-provided hand scans: local model library only, never committed
 static/models/library/
+# offline device CAD cache + phone embeddings: rebuilt on the board by scripts/populate_device_cache.py
+models/cad_cache/
+models/phone_embeddings.npz

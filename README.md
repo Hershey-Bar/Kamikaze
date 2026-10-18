@@ -254,11 +254,22 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
      guards stop a lime can from reading as lemon: (1) OCR fuzzy correction can never *produce* a citrus word
      (`limon`, a common misread and the Spanish word for lemon, stays `limon` instead of becoming `lemon`); exact reads
      still count; (2) a class's learned lexicon never contains the other citrus word, and reading the other word without
-     the own one zeroes that class's text score and vetoes its lexicon route; (3) when the top two candidates are a
-     lime / lemon pair within 0.25 calibrated confidence and OCR has not decided, the median hue of the strongly
-     coloured print (`color_sig.hue_stats`, OpenCV hue: lemon yellow ~22-34, lime green ~40-75) breaks the tie at
-     `KAMIKAZE_CITRUS_SPLIT` = 38 and the loser drops below the IDENTIFIED margin. Grapefruit pink and silver give no
-     verdict and leave the ranking alone. The decision is in the telemetry `route.citrus` field.
+     the own one zeroes that class's text score and vetoes its lexicon route; (3) the multimodal citrus classifier
+     below decides the flavour from the can's colour and OCR together.
+   - **Citrus classifier** (`citrus_classifier.py`, ~1 ms). The detector box of the can (or the reticle) is cropped,
+     only the inner 60 % ellipse is kept (no background, table reflections or edge shadow), and specular glare
+     (V > 240 and S < 30), dark ink (V < 40) and the unsaturated silver body are dropped. The remaining print pixels are
+     clustered with deterministic k-means (k = 3) on CIELAB a*, b*; each cluster is scored per flavour from its
+     circular-mean HSV hue band (OpenCV units, 0-180: lime 36-82, lemon 22-35 with S > ~100, grapefruit 160-180 and
+     0-11, orange 12-21 with high S) confirmed by CIELAB (lime a* <= -12, lemon b* > 30, grapefruit a* 10-60, orange
+     a* > 10 and b* > 40); the hue band is necessary, LAB only confirms. The flavour decision is
+     `P = 0.55 S_color + 0.45 S_OCR` (OCR: 1.0 for the latest pass, 0.6 for the rolling buffer). When the colour is
+     strong (>= 0.6) and a flavour read by OCR scores <= 0.15 in colour, that word is a **conflict** and is suppressed
+     both in the fusion and in the OCR tokens fed to the lexicon route (OCR *lemon* on a green can -> *lime*, OCR
+     *lime* on a pink can -> *grapefruit*). In `_arbitrate`, when the top-1 class is citrus and the decision names a
+     different flavour, a class of the decided flavour within 0.25 is promoted; with no such class enrolled, a strong
+     contradicting colour demotes the top class to GUIDING (so a lemon can never identifies as the only enrolled lime
+     class). The decision is in the telemetry `route.citrus` field. Grapefruit pink and silver are handled the same way.
 
 ## SMART kiosk mode
 
@@ -288,6 +299,24 @@ installs itself when complete. Moving the can away cancels it.
 VERIFIED (green, hand scan or upload), CAD 1:1 (blue, Printables / Thingiverse dummy with its author), PACKAGING
 (violet, Open Food Facts photo on Crown dimensions), LIVE SCAN (teal, 360° label), ONLINE (grey, Sketchfab / Poly
 Pizza) and ESTIMATED (amber, only for spec-generated geometry). It is in `asset_provenance` of `/api/state`.
+
+**Auto-Orient / Snap to Live Pose.** The 3D stage HUD has an **Auto-Orient** switch and a **Snap** button. With
+Auto-Orient on, the model mirrors the object in front of the Brio: the live pose (`orientation` in `/api/scan` and the
+`/api/scan_stream` SSE state: yaw, pitch, roll, source and the ready-made `attribute`) is smoothed in the browser with an
+EMA (alpha 0.25, yaw and roll wrapped at +-180 deg) and written to model-viewer's `orientation` attribute
+(`"roll pitch yaw"`, model = -roll, +pitch, -yaw so it mirrors the object), while the camera is fixed in front and
+drag / `auto-rotate` are off. Snap jumps to the latest pose without smoothing. Switching it off restores
+`camera-controls`, the idle orbit and `auto-rotate`. The choice is kept in the browser (`kz.autoOrient`).
+
+**Fine-grained phone match** (`phone_classifier.py`, advisory). While a scan of a smartphone runs, an upright crop of
+the phone is classified at most 2 times per second (`KAMIKAZE_PHONE_MATCH_HZ`) in a worker thread, against every
+device of the offline cache: structural cues (Hough lens count and layout on the camera island: diagonal pair for
+iPhone 13-15, vertical pill for iPhone 16, triangle for Pro, Samsung column; housing vs floating rings for S21/S22 vs
+S23-S25; notch vs Dynamic Island on the front; outline aspect, Z Fold closed ~2.27 vs slabs ~2.0-2.1) plus DINOv2
+cosine similarity of the camera island against `models/phone_embeddings.npz` when present. Votes accumulate over the
+scan; `smart_scan.device_match` reports the leading device, its runner-ups, the majority cues and any **conflicts**
+with the identified class. It never overrides identification: reference embeddings come from grey renders of the
+cached CAD, so the domain gap to real photos is large, and the match is a cross-check only.
 
 ## Dashboard
 
@@ -409,6 +438,25 @@ phone's screen or back faces +Z cannot be inferred from bounds; press **Rotate Y
 rotated CC-BY model is a modification, so the sidecar records `modified` + `orientation_fix` and the credit line says
 *(re-oriented)*.
 
+**Offline device CAD cache** (`device_cache.py`, `models/devices_db.json`,
+`scripts/populate_device_cache.py`). 38 popular phones load offline from `models/cad_cache/{device_id}.glb`
+(`KAMIKAZE_CAD_CACHE` overrides the folder; git-ignored): iPhone 13/13 mini/13 Pro/13 Pro Max, iPhone 14-16 (base,
+Plus, Pro, Pro Max), Galaxy S20-S25 (base, +, Ultra) and Galaxy Z Fold 3-6. `devices_db.json` holds GSMArena body
+dimensions (H x W x D mm, unfolded size for the Folds), outline aspect, front cut-out and camera island family, each
+with its source URL (`scripts/build_devices_db.py` rebuilds it). Lens coordinates are not published and are left null
+(never invented). The populate script searches 1:1 dummies on Printables and Thingiverse (`THINGIVERSE_TOKEN` from
+`.env`), skips accessory prints (cases, stands, holders), downloads up to 12 files per device, converts STL / OBJ / 3MF,
+and accepts only models within +-2 mm of the GSMArena height and width (depth may include the camera bump); the best by
+popularity rank minus dimension error wins, NC licences only with `KAMIKAZE_CAD_ALLOW_NC=1`. Otherwise the
+spec-generated body (exact dimensions, design-family island, flagged ESTIMATED) is cached. Every GLB is in metres,
+Y-up, centre of mass at the origin, with an attribution sidecar; then the camera-island renders are embedded with
+DINOv2. The harvester and spec search check the cache first, so a phone class installs in a few milliseconds with no
+network. `--offline`, `--only`, `--force`, `--retry-estimated` and `--no-embeddings` control the run.
+
+```bash
+cd /home/arduino/hackathon_iot && set -a && . ./.env && set +a && .venv/bin/python scripts/populate_device_cache.py
+```
+
 Every model has a JSON sidecar with title, author, author URL, licence and source; credits are shown in the
 dashboard and written to `static/models/CREDITS.md`. Third-party models, runtimes and libraries are credited in [ATTRIBUTION.md](ATTRIBUTION.md)
 (also served at `/ATTRIBUTION.md` and linked from the dashboard footer).
@@ -451,8 +499,8 @@ per-class copies made from it). Scans keep their scanned scale; model-viewer fra
 | GET, POST | `/api/label_scan` `{"action": "start"\|"status"\|"cancel"\|"finish", "label": ...}` | 360° can label scan (400 not a can / no verified volume, 404 not enrolled, 409 incomplete / offline / no scan) |
 | GET | `/api/label_scan/texture.jpg` | stitched label preview (404 when no scan is running) |
 | GET, POST | `/api/settings/view` `{"view": "smart"\|"debug"}` | dashboard view (400 for another value) |
-| GET | `/api/scan` | SMART scan state: status, progress, leader, votes, tokens, automatic label scan |
-| GET | `/api/scan_stream` | alias of `/api/events` (SSE live state including `smart_scan`) |
+| GET | `/api/scan` | SMART scan state: status, progress, leader, votes, tokens, automatic label scan, `orientation`, `device_match` |
+| GET | `/api/scan_stream` | alias of `/api/events` (SSE live state including `smart_scan` and `orientation`) |
 | GET | `/api/credits`, `/api/db/export`; POST `/api/db/save` | attribution, database export/save |
 | GET | `/api/models` | local model library + per-class cached models |
 | POST | `/api/models/library?name=&category=&filename=&replace=1` | raw GLB body → quality gate → library (201; 409 exists; 422 rejected) |
@@ -470,7 +518,9 @@ cited `layout_json`).
 ## Tests
 
 ```bash
-.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite test_cad_sources test_smart_citrus
+.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite test_cad_sources test_smart_citrus test_citrus_color test_smart_kiosk
 ```
+
+`test_smart_kiosk` checks the populated device cache (every device within +-2 mm), so run the populate script first.
 
 Hardware tests (LED RPC, Hexagon NPU, online CAD) skip themselves when the router socket, the NPU or credentials are absent.
