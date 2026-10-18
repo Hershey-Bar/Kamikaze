@@ -26,7 +26,12 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
   POST /api/classes/<id>/cad_select  {"uid": "..."} download + quality-check the picked candidate as the class model
   POST /api/classes/<id>/upload_cad  raw GLB body (model/gltf-binary, <= KAMIKAZE_CAD_UPLOAD_MB): operator-supplied model
   POST /api/classes/<id>/generate_spec   dimension-calibrated GLB from verified published specs (GSMArena / Crown)
-  GET|POST /api/settings/mode        {"mode": "online"|"offline", "source": "auto"|"sketchfab"|"polypizza"|"local"}
+  POST /api/classes/<id>/cad_orient  {"auto": true} | {"axis": "x|y|z", "deg": 90} | {"reset": true} | {}: orientation fix
+                                     of the cached GLB (glb_orient wrapper node; recorded in the attribution as a change)
+  GET|POST /api/settings/mode        {"mode": "online"|"offline", "source": "auto"|"sketchfab"|"polypizza"|"local"|"upload"}
+                                     offline = strict: only local|upload are valid sources and netguard blocks every
+                                     external request; a class with no cached GLB reports asset_status "offline_missing"
+  GET|POST /api/camera/focus         {"auto": true} | {"auto": false, "value": 0-255}: on-board camera focus (V4L2)
   POST /api/resolve                  {"text": "coke zero can 330ml"} -> canonical product (class_id, brand, tier, CAD terms)
   GET  /api/telemetry                SoC identity, thermals, per-core freq/load, RAM, uptime, router IPC, bridge latency,
                                      Wire1/Modulino status, NPU (cDSP/NSP), detector + embedder median/p95, cosine/margin, FPS
@@ -51,8 +56,9 @@ COCO fallback) object detection on the Hexagon NPU (npu.py) ->
 square crop around the target inside the central 75% box (temporally smoothed; the fixed center-75% crop when nothing
 is detected) -> 224x224 -> 1280-d MobileNetV3-Large embedding on the NPU (QNN TFLite delegate; ExecuTorch/XNNPACK or
 torch on the Arm CPU as fallbacks) -> L2-normalised vector -> cosine similarity against the multi-view prototypes
-(front/right/back/left/top centroids + global centroid), fused 0.65/0.35 with on-device OCR text evidence (ocr_fusion.py,
-RapidOCR on the CPU in its own ~3 Hz worker) -> 5-frame temporal state machine -> Modulino Pixels via the Arduino Router
+(front/right/back/left/top views, scored max-over-views and calibrated to a confidence) fused with on-device OCR text
+evidence (ocr_fusion.py, RapidOCR on the CPU in its own ~3 Hz worker, glyph-corrected against the enrolled vocabulary) and
+a hue/value colour signature (color_sig.py) -> 5-frame temporal state machine -> Modulino Pixels via the Arduino Router
 socket (STM32 firmware untouched), background 3D CAD retrieval (exact-match + GLB quality gate; NOT_FOUND instead of
 any substitute model) and 360-degree physical pose estimation (pose.py; yaw from DINOv2 ViT-S/14 viewpoint descriptors
 on the NPU in a separate pose worker thread when the class was enrolled with them). A lighting gate (mean luma / specular
@@ -61,7 +67,8 @@ glare of the reticle crop) pauses recognition and enrollment capture under unusa
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
 KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolov8s-worldv2-kz|yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE,
 KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
-KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_SLOPE / CAL_CENTER / C_IDENT / C_SEARCH / MARGIN /
+KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_KNOTS (0.42,0.70,0.95) / CAL_MID / CAL_CAP /
+C_IDENT / C_SEARCH / MARGIN /
 EMA_ALPHA (calibrated confidence), KAMIKAZE_CROP_FRACTION (0.75), KAMIKAZE_POSE_DINO (1|0, DINOv2 pose worker),
 KAMIKAZE_POSE_HZ (10, pose worker rate cap),
 KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
@@ -117,8 +124,10 @@ except ImportError:  # numpy fallback for the empty-scene gate
     cv2 = None
 
 import cad_harvester
+import color_sig
 import device_taxonomy
 import entity_resolver
+import netguard
 import npu as npu_mod
 import onboard_camera
 import pose as pose_mod
@@ -156,13 +165,14 @@ EMBEDDER_ID = "mobilenet_v3_large-fc1280"  # torchvision weights (ExecuTorch / e
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Calibrated confidence: a logistic curve normalised to C(1) = 1,
-#   C(S) = sigmoid(k (S - c)) / sigmoid(k (1 - c)),  k = 7.38, c = 0.833,
-# fitted to the operating points C(0.856) = 0.70 (IDENTIFIED) and C(0.64) = 0.25 (SEARCHING) so the gates are unchanged.
-# Smooth (no hard 0% cliff); high-dimensional embeddings sit at a 0.35-0.52 cosine baseline for arbitrary scenes, which
-# maps to 5-12% here, never to "identified".
-CAL_SLOPE = float(os.environ.get("KAMIKAZE_CAL_SLOPE", "7.38"))
-CAL_CENTER = float(os.environ.get("KAMIKAZE_CAL_CENTER", "0.8334"))
+# Calibrated confidence: piecewise-linear in the raw cosine of the best-fit enrolled view,
+#   S <= s0 -> 0,  s0..s1 -> 0..c1 (ambiguous / guiding),  s1..s2 -> c1..c2 (confident),  capped at c2.
+# Knots fitted to on-board data (MobileNetV3 1280-d, view centroids): unrelated room clutter / empty desk 0.13-0.48,
+# the enrolled object at a trained angle 0.78-0.92 (leave-one-out within a view 0.97-0.99). With C_IDENT = 0.70 the
+# IDENTIFIED floor is raw 0.804 and SEARCHING (C < 0.25) is raw < 0.56; 0.85 -> 79 %, 0.89 -> 86 %.
+CAL_KNOTS = tuple(float(x) for x in os.environ.get("KAMIKAZE_CAL_KNOTS", "0.42,0.70,0.95").split(","))
+CAL_MID = float(os.environ.get("KAMIKAZE_CAL_MID", "0.50"))  # calibrated value at the middle knot
+CAL_CAP = float(os.environ.get("KAMIKAZE_CAL_CAP", "0.98"))  # calibrated value at (and above) the top knot
 C_IDENT = float(os.environ.get("KAMIKAZE_C_IDENT", "0.70"))
 C_SEARCH = float(os.environ.get("KAMIKAZE_C_SEARCH", "0.25"))
 MIN_MARGIN = float(os.environ.get("KAMIKAZE_MARGIN", "0.15"))  # calibrated top-1 minus top-2
@@ -183,6 +193,8 @@ ENROLL_STALE_S = 15.0
 
 CAD_OFFLINE_DEFAULT = os.environ.get("KAMIKAZE_CAD_MODE", "online").strip().lower() == "offline"
 CAD_SOURCE_DEFAULT = os.environ.get("KAMIKAZE_CAD_SOURCE", "auto").strip().lower()
+CAD_SOURCE_NAMES = {"auto": "Auto (Ranked)", "sketchfab": "Sketchfab", "polypizza": "Poly Pizza", "local": "Local Cache",
+                    "upload": "Custom Scan Upload"}
 CAD_BROWSE_BUDGET_S = float(os.environ.get("KAMIKAZE_CAD_BROWSE_BUDGET", "25"))
 MAX_UPLOAD_BYTES = int(float(os.environ.get("KAMIKAZE_CAD_UPLOAD_MB", "35")) * 1024 * 1024)
 LIGHT_GATE = os.environ.get("KAMIKAZE_LIGHT_GATE", "1") != "0"
@@ -238,6 +250,13 @@ def center_crop_box(width: int, height: int) -> tuple[int, int, int]:
     size = max(1, int(CROP_FRACTION * min(width, height)))
     return size, (width - size) // 2, (height - size) // 2
 
+
+def color_signature(image: Image.Image, box: tuple[int, int, int]) -> np.ndarray:
+    """Colour-modality signature of the object: the inner 60% x 80% of the square crop (where the can / phone body
+    is, leaving most of the background at the sides), reduced to 64x64 before the HSV histogram."""
+    size, left, top = box
+    inner = (left + int(0.2 * size), top + int(0.1 * size), left + int(0.8 * size), top + int(0.9 * size))
+    return color_sig.signature(np.asarray(image.crop(inner).resize((color_sig.SIDE, color_sig.SIDE), Image.BILINEAR)))
 
 def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> np.ndarray:
     """Square crop (detector box, else the center 75%) -> 224x224 -> ImageNet normalisation. float32 (1,3,224,224)."""
@@ -325,23 +344,27 @@ class PoseWorker:
                 "median_ms": round(lat[len(lat) // 2], 2) if lat else None}
 
 
-def _sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
-
-
 def calibrate(sim: float) -> float:
-    """Raw cosine -> calibrated confidence in [0, 1]: normalised logistic, C(1) = 1, monotone, no hard floor."""
-    s = min(1.0, float(sim))
-    return min(1.0, _sigmoid(CAL_SLOPE * (s - CAL_CENTER)) / _sigmoid(CAL_SLOPE * (1.0 - CAL_CENTER)))
+    """Raw cosine -> calibrated confidence in [0, CAL_CAP]: piecewise linear through CAL_KNOTS, monotone."""
+    s0, s1, s2 = CAL_KNOTS
+    s = float(sim)
+    if s <= s0:
+        return 0.0
+    if s < s1:
+        return (s - s0) / (s1 - s0) * CAL_MID
+    return min(CAL_CAP, CAL_MID + (s - s1) / (s2 - s1) * (CAL_CAP - CAL_MID))
 
 
 def raw_threshold(c: float) -> float:
-    """Inverse of calibrate(): the raw cosine at which the calibrated confidence equals c."""
-    p = min(1.0 - 1e-9, max(1e-9, c * _sigmoid(CAL_SLOPE * (1.0 - CAL_CENTER))))
-    return CAL_CENTER + math.log(p / (1.0 - p)) / CAL_SLOPE
+    """Inverse of calibrate(): the lowest raw cosine at which the calibrated confidence reaches c."""
+    s0, s1, s2 = CAL_KNOTS
+    c = max(0.0, min(CAL_CAP, float(c)))
+    if c <= CAL_MID:
+        return s0 + c / CAL_MID * (s1 - s0)
+    return s1 + (c - CAL_MID) / (CAL_CAP - CAL_MID) * (s2 - s1)
 
 
-T_IDENT = raw_threshold(C_IDENT)  # raw cosine equivalents (~0.856 / ~0.640)
+T_IDENT = raw_threshold(C_IDENT)  # raw cosine equivalents (~0.804 / ~0.560)
 T_SEARCH = raw_threshold(C_SEARCH)
 
 
@@ -518,6 +541,15 @@ def normalize_label(raw: object) -> str:
     return label
 
 
+def _plain(obj: object) -> object:
+    """json.dumps default: numpy scalars/arrays and paths -> plain Python values."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
+
+
 class EmbeddingBank:
     """label -> exemplar embeddings and prototypes.
 
@@ -535,6 +567,7 @@ class EmbeddingBank:
         self.views: dict[str, dict[str, "torch.Tensor"]] = {}
         self.view_counts: dict[str, dict[str, int]] = {}
         self.pose_views: dict[str, dict[str, "torch.Tensor"]] = {}  # DINOv2 viewpoint centroids (pose only)
+        self.color_views: dict[str, dict[str, "torch.Tensor"]] = {}  # 21-d colour signatures per view (color_sig)
         self.meta: dict[str, dict] = {}
         self.cad: dict[str, dict | None] = {}
         self.created: dict[str, str] = {}
@@ -582,6 +615,7 @@ class EmbeddingBank:
             self.views.pop(label, None)
             self.view_counts.pop(label, None)
             self.pose_views.pop(label, None)
+            self.color_views.pop(label, None)
             self.meta.setdefault(label, {})
             self.created.setdefault(label, _now_iso())
             self._rebuild()
@@ -589,9 +623,10 @@ class EmbeddingBank:
             return {"label": label, "vectors": int(stack.shape[0]), "consistency": round(float((stack @ centroid).mean()), 4)}
 
     def add_multiview(self, label: str, view_vectors: dict[str, list], metadata: dict,
-                      pose_vectors: dict[str, list] | None = None) -> dict:
+                      pose_vectors: dict[str, list] | None = None, color_vectors: dict[str, list] | None = None) -> dict:
         """Store angle-tagged centroids; the global centroid is the normalised mean of the view centroids.
-        `pose_vectors` (optional) are DINOv2 descriptors per view, kept only for pose estimation."""
+        `pose_vectors` (optional) are DINOv2 descriptors per view, kept only for pose estimation; `color_vectors`
+        (optional) are per-frame colour signatures (color_sig), averaged per view for the colour modality."""
         with self._lock:
             views, counts, all_vecs = {}, {}, []
             for view, vecs in view_vectors.items():
@@ -614,6 +649,12 @@ class EmbeddingBank:
                 self.pose_views[label] = pose
             else:
                 self.pose_views.pop(label, None)
+            colors = {view: torch.as_tensor(color_sig.mean_signature(sigs)) for view, sigs in (color_vectors or {}).items()
+                      if sigs and view in views}
+            if colors:
+                self.color_views[label] = colors
+            else:
+                self.color_views.pop(label, None)
             self.meta[label] = dict(metadata)
             self.cad.setdefault(label, None)
             self.created[label] = _now_iso()
@@ -622,6 +663,7 @@ class EmbeddingBank:
             stack = torch.stack(all_vecs)
             return {
                 "label": label, "vectors": len(all_vecs), "views": counts, "pose_views": sorted(pose),
+                "color_views": sorted(colors),
                 "consistency": round(float((stack @ global_centroid).mean()), 4), "metadata": dict(metadata),
             }
 
@@ -630,7 +672,8 @@ class EmbeddingBank:
             if label not in self.centroids:
                 return False
             del self.centroids[label]
-            for table in (self.exemplars, self.views, self.view_counts, self.pose_views, self.meta, self.cad, self.created):
+            for table in (self.exemplars, self.views, self.view_counts, self.pose_views, self.color_views, self.meta,
+                          self.cad, self.created):
                 table.pop(label, None)
             self._rebuild()
             self.save()
@@ -640,8 +683,8 @@ class EmbeddingBank:
         """Drop every enrolled class and persist the empty database. Returns how many were removed."""
         with self._lock:
             n = len(self.centroids)
-            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.pose_views, self.meta, self.cad,
-                          self.created):
+            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.pose_views, self.color_views,
+                          self.meta, self.cad, self.created):
                 table.clear()
             self._rebuild()
             self.save()
@@ -651,8 +694,8 @@ class EmbeddingBank:
         """Drop every enrolled class and delete the database file (plus old-embedder backups) from disk."""
         with self._lock:
             n = len(self.centroids)
-            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.pose_views, self.meta, self.cad,
-                          self.created):
+            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.pose_views, self.color_views,
+                          self.meta, self.cad, self.created):
                 table.clear()
             self._rebuild()
             if self.path is not None:
@@ -666,9 +709,11 @@ class EmbeddingBank:
             return n
 
     def rank(self, vec, domain: tuple[str, ...] | None = None) -> list[tuple[str, float, str | None]]:
-        """(label, score, matched view) best first. Smartphone classes with view centroids use rear-weighted view
-        reliability (device_taxonomy); other classes take the best cosine over their global + view centroids.
-        `domain` restricts the search to those categories (classes without a category always stay eligible)."""
+        """(label, score, matched view) best first. A class enrolled with view centroids scores the best-fit view only
+        (max over its view centroids - the global mean of front / back / rails is a diluted vector no single physical
+        pose matches); legacy single-shot classes use their global centroid. Smartphone views pass through the optional
+        reliability discount (device_taxonomy, off by default). `domain` restricts the search to those categories
+        (classes without a category always stay eligible)."""
         with self._lock:
             if self._matrix is None:
                 return []
@@ -682,13 +727,14 @@ class EmbeddingBank:
                 if domain and category and category not in domain:
                     continue
                 views = {k: v for k, v in table.items() if k != "global"}
-                if category == "smartphone" and views:
+                if not views:
+                    out.append((label, table["global"], None))
+                elif category == "smartphone":
                     score, view = device_taxonomy.weighted_phone_score(views)
+                    out.append((label, score, view))
                 else:
-                    view = max(table, key=table.get)
-                    score = table[view]
-                    view = None if view == "global" else view
-                out.append((label, score, view))
+                    view = max(views, key=views.get)
+                    out.append((label, views[view], view))
             return sorted(out, key=lambda item: -item[1])
 
     def scores(self, vec, domain: tuple[str, ...] | None = None) -> list[tuple[str, float]]:
@@ -702,6 +748,24 @@ class EmbeddingBank:
     def has_pose_views(self, label: str | None) -> bool:
         with self._lock:
             return bool(label) and bool(self.pose_views.get(label))
+
+    def color_refs(self, label: str) -> dict[str, np.ndarray]:
+        with self._lock:
+            return {view: sig.numpy() for view, sig in (self.color_views.get(label) or {}).items()}
+
+    def has_color(self) -> bool:
+        with self._lock:
+            return bool(self.color_views)
+
+    def vocabulary(self) -> list[str]:
+        """Printable words of every enrolled class (raw name, brand, variant) for the OCR autocorrect dictionary."""
+        with self._lock:
+            out = []
+            for label in self._labels:
+                meta = self.meta.get(label) or {}
+                out += [str(meta.get(f, "")) for f in ("raw_name", "brand", "variant")]
+                out.append(label.replace("_", " "))
+            return out
 
     def pose_view_sims(self, label: str, desc: np.ndarray) -> dict[str, float]:
         """Similarity of a DINOv2 descriptor with the label's per-view DINOv2 centroids ({} if none were enrolled).
@@ -735,7 +799,8 @@ class EmbeddingBank:
     def set_cad(self, label: str, info: dict | None) -> None:
         with self._lock:
             if label in self.centroids:
-                self.cad[label] = dict(info) if info else None
+                # JSON round-trip: the DB is loaded with weights_only=True, so only plain Python types may be stored
+                self.cad[label] = json.loads(json.dumps(info, default=_plain)) if info else None
                 self.save()
 
     def info(self) -> list[dict]:
@@ -754,7 +819,9 @@ class EmbeddingBank:
         return {
             "label": k, "class_id": k, "canonical_name": taxonomy.display_name(meta) if meta else k.replace("_", " ").title(),
             "vectors": len(self.exemplars.get(k, [])), "views": counts, "view_count": len(counts),
+            "view_expected": len(taxonomy.wizard_views(meta.get("category"))),
             "pose_views": sorted(self.pose_views.get(k, {})),
+            "color_views": {v: color_sig.dominant(s.numpy()) for v, s in (self.color_views.get(k) or {}).items()},
             "metadata": meta, "category": meta.get("category"), "created_at": self.created.get(k),
             "phone_tier": device_taxonomy.tier_for(meta), "cad_path": cad_path,
             "cad_asset": cad, "cad_model_url": (cad or {}).get("glb_url") or None,
@@ -778,6 +845,7 @@ class EmbeddingBank:
                     "views": dict(self.views.get(label, {})),
                     "view_counts": dict(self.view_counts.get(label, {})),
                     "pose_views": dict(self.pose_views.get(label, {})),
+                    "color_views": dict(self.color_views.get(label, {})),
                     "global_centroid": self.centroids[label],
                     "created_at": self.created.get(label),
                     "cad_asset": self.cad.get(label),
@@ -818,6 +886,8 @@ class EmbeddingBank:
                 dino_ok = data.get("pose_embedder") == npu_mod.DINO_ID
                 self.pose_views = {k: {taxonomy.canonical_view(vn): vv.float() for vn, vv in (p.get("pose_views") or {}).items()}
                                    for k, p in protos.items() if dino_ok and p.get("pose_views")}
+                self.color_views = {k: {taxonomy.canonical_view(vn): vv.float() for vn, vv in p["color_views"].items()}
+                                    for k, p in protos.items() if p.get("color_views")}
                 self.meta = {k: dict(p.get("metadata") or {}) for k, p in protos.items()}
                 self.cad = {k: p.get("cad_asset") for k, p in protos.items()}
                 self.created = {k: p.get("created_at") or _now_iso() for k, p in protos.items()}
@@ -925,7 +995,8 @@ class Enroller:
 
 
 class MultiViewEnroller:
-    """Guided 360-degree enrollment wizard: front -> right -> back -> left -> top, N frames per view.
+    """Guided enrollment wizard with category-specific steps (taxonomy.wizard_views): smartphone front -> back ->
+    right rail -> left rail -> camera-cluster tilt; can / bottle front -> back -> side -> top tilt. N frames per view.
 
     Phases: idle -> ready (waiting for the user to present the current view) -> capturing -> ready (next view)
     ... -> done. A view can be re-captured, and the session can be finished early once a view exists.
@@ -941,14 +1012,17 @@ class MultiViewEnroller:
         self.phase = "idle"
         self.meta: dict | None = None
         self.label = ""
+        self.steps: tuple[str, ...] = taxonomy.wizard_views(None)
         self.per_view = FRAMES_PER_VIEW
         self.current: str | None = None
         self.captured: dict[str, list] = {}
         self.pose_captured: dict[str, list] = {}
+        self.color_captured: dict[str, list] = {}
         self.stability: dict[str, float] = {}
         self.warnings: dict[str, str] = {}
         self._buf: list = []
         self._pose_buf: list = []
+        self._color_buf: list = []
         self.rejected = 0
         self.reject_reason = ""
         self.result: dict | None = None
@@ -974,9 +1048,11 @@ class MultiViewEnroller:
                 raise EnrollmentBusy(f"a view of {self.label!r} is still being captured")
             self._reset()
             self.meta, self.label, self.per_view = dict(meta), label, frames_per_view
-            self.phase, self.current = "ready", taxonomy.VIEWS[0]
+            self.steps = taxonomy.wizard_views(meta.get("category"))
+            self.phase, self.current = "ready", self.steps[0]
             self._cond.notify_all()
-        log.info("Multi-view enrollment started: %s %s (%d frames/view)", label, meta, frames_per_view)
+        log.info("Multi-view enrollment started: %s %s (%d frames/view, steps %s)", label, meta, frames_per_view,
+                 "/".join(self.steps))
         return self.status()
 
     def capture(self, view: str | None = None) -> dict:
@@ -987,23 +1063,26 @@ class MultiViewEnroller:
                 raise EnrollmentBusy("no multi-view enrollment in progress - call /api/enroll/start first")
             if view is not None:
                 view = taxonomy.canonical_view(view)
-                if view not in taxonomy.VIEWS:
-                    raise ValueError(f"view must be one of {', '.join(taxonomy.VIEWS)}")
+                if view not in self.steps:
+                    raise ValueError(f"view must be one of {', '.join(self.steps)}")
                 self.current = view
-            self._buf, self._pose_buf, self.error, self.phase = [], [], None, "capturing"
+            self._buf, self._pose_buf, self._color_buf, self.error, self.phase = [], [], [], None, "capturing"
             self.rejected, self.reject_reason = 0, ""
             self._touched = time.monotonic()
             self._cond.notify_all()
         return self.status()
 
-    def feed(self, vec, pose_desc=None) -> str | None:
-        """Offer a frame embedding (and optionally its DINOv2 pose descriptor). Returns "view_done", "complete" or None."""
+    def feed(self, vec, pose_desc=None, color=None) -> str | None:
+        """Offer a frame embedding (plus optionally its DINOv2 pose descriptor and colour signature).
+        Returns "view_done", "complete" or None."""
         with self._cond:
             if self.phase != "capturing":
                 return None
             self._buf.append(vec)
             if pose_desc is not None:
                 self._pose_buf.append(pose_desc)
+            if color is not None:
+                self._color_buf.append(color)
             self._touched = time.monotonic()
             if len(self._buf) < self.per_view:
                 return None
@@ -1012,7 +1091,11 @@ class MultiViewEnroller:
                 self.pose_captured[view] = self._pose_buf
             else:
                 self.pose_captured.pop(view, None)
-            self._pose_buf = []
+            if self._color_buf:
+                self.color_captured[view] = self._color_buf
+            else:
+                self.color_captured.pop(view, None)
+            self._pose_buf, self._color_buf = [], []
             centroid = EmbeddingBank._unit_mean(buf)
             self.captured[view] = buf
             self.stability[view] = round(float((torch.stack(buf) @ centroid).mean()), 3)
@@ -1024,7 +1107,7 @@ class MultiViewEnroller:
             if self.stability[view] < 0.6:
                 self.warnings[view] = "unstable capture - hold the object steadier"
             self._buf = []
-            pending = [v for v in taxonomy.VIEWS if v not in self.captured]
+            pending = [v for v in self.steps if v not in self.captured]
             if pending:
                 self.phase, self.current = "ready", pending[0]
                 self._cond.notify_all()
@@ -1043,14 +1126,15 @@ class MultiViewEnroller:
             self._touched = time.monotonic()
             if self.rejected < max(3 * self.per_view, 30):
                 return False
-            self._buf, self._pose_buf, self.phase = [], [], "ready"
+            self._buf, self._pose_buf, self._color_buf, self.phase = [], [], [], "ready"
             self.error = f"capture failed: {reason}"
             self._cond.notify_all()
             return True
 
     def _finalize(self) -> None:
         try:
-            self.result = self.bank.add_multiview(self.label, self.captured, self.meta or {}, self.pose_captured)
+            self.result = self.bank.add_multiview(self.label, self.captured, self.meta or {}, self.pose_captured,
+                                                  color_vectors=self.color_captured)
             self.phase = "done"
             log.info("Multi-view enrolled %s: %s", self.label, {k: v for k, v in self.result.items() if k != "metadata"})
             if self.on_complete:
@@ -1087,13 +1171,14 @@ class MultiViewEnroller:
     def status(self) -> dict:
         with self._cond:
             category = (self.meta or {}).get("category", "beverage_can")
+            brand = (self.meta or {}).get("brand", "")
             views = []
-            for v in taxonomy.VIEWS:
-                title, instruction = taxonomy.view_step(category, v)
+            for v in self.steps:
+                title, instruction, target = taxonomy.view_detail(category, v, brand)
                 done = v in self.captured
                 is_current = v == self.current and self.active
                 views.append({
-                    "view": v, "title": title, "instruction": instruction,
+                    "view": v, "title": title, "instruction": instruction, "target": target,
                     "state": "done" if done and not (is_current and self.capturing) else ("current" if is_current else "pending"),
                     "captured": len(self.captured[v]) if done else (len(self._buf) if is_current else 0),
                     "total": self.per_view, "stability": self.stability.get(v), "warning": self.warnings.get(v),
@@ -1105,7 +1190,9 @@ class MultiViewEnroller:
                 "current_view": self.current if self.active else None,
                 "current_title": current["title"] if current else None,
                 "current_instruction": current["instruction"] if current else None,
+                "current_target": current["target"] if current else None, "steps": list(self.steps),
                 "collected": len(self._buf), "views": views, "pose_views": sorted(self.pose_captured),
+                "color_views": sorted(self.color_captured),
                 "rejected": self.rejected, "reject_reason": self.reject_reason,
                 "done": self.phase == "done", "ok": self.phase == "done", "error": self.error, "result": self.result,
             }
@@ -1126,24 +1213,31 @@ class FrameScore:
     cap: float | None = None  # calibrated-confidence ceiling (front-screen penalty)
     prompt: str | None = None  # model-specific guidance text for the hint
     empty: bool = False  # the empty-scene gate fired: nothing inside the reticle
+    f1: float | None = None  # tri-modal fused calibrated confidence of the best class (vision + OCR text + colour)
+    f2: float | None = None  # same for the runner-up
+
+    def _base1(self) -> float:
+        return self.f1 if self.f1 is not None else calibrate(self.s1)
 
     @property
     def c1(self) -> float:
         if self.empty or self.label is None:
             return 0.0
-        c = calibrate(self.s1)
+        c = self._base1()
         return min(c, self.cap) if self.cap is not None else c
 
     @property
     def c2(self) -> float:
-        return calibrate(self.s2) if self.top2 else 0.0
+        if not self.top2:
+            return 0.0
+        return self.f2 if self.f2 is not None else calibrate(self.s2)
 
     @property
     def margin(self) -> float:
         """Calibrated top-1 minus top-2 (0 when there is no candidate)."""
         if self.empty or self.label is None:
             return 0.0
-        return max(0.0, calibrate(self.s1) - self.c2)
+        return max(0.0, self._base1() - self.c2)
 
 
 class StateMachine:
@@ -1268,7 +1362,7 @@ def phone_hint(category: str | None, best_view: str | None, margin: float, front
 
 def led_params(state: str, score: float) -> tuple[int, int, int, int, int]:
     if state == IDENTIFIED:
-        return (0, 255, 0, 50, max(1, min(8, int(score * 8))))
+        return (0, 255, 0, 50, max(1, min(8, int(score / CAL_CAP * 8 + 1e-6))))  # full bar at the calibration cap
     if state == GUIDING:
         return (255, 120, 0, 40, 4)
     return (0, 100, 150, 15, 1)
@@ -1367,14 +1461,22 @@ class AssetManager:
         self._gen: dict[str, int] = {}
         self.offline = bool(offline)
         self.source = source if source in cad_harvester.SOURCES else "auto"
+        self._online_source = self.source if self.source not in cad_harvester.OFFLINE_SOURCES else "auto"
+        if self.offline and self.source not in cad_harvester.OFFLINE_SOURCES:
+            self.source = "local"
+        netguard.set_offline(self.offline)
         self.meta_lookup: Callable[[str], dict | None] | None = None
         self.on_resolved: Callable[[str, dict | None], None] | None = None
 
     # -- settings ------------------------------------------------------------------------
 
     def mode(self) -> dict:
+        """Offline mode = strict: only the local cache / operator uploads, and the process-wide netguard blocks every
+        external request. The dashboard source dropdown is built from `sources` (the ones valid in this mode)."""
+        allowed = cad_harvester.OFFLINE_SOURCES if self.offline else cad_harvester.SOURCES
         return {"mode": "offline" if self.offline else "online", "offline": self.offline, "source": self.source,
-                "sources": list(cad_harvester.SOURCES)}
+                "sources": list(allowed), "all_sources": list(cad_harvester.SOURCES),
+                "source_names": {s: CAD_SOURCE_NAMES[s] for s in cad_harvester.SOURCES}, "network": netguard.stats()}
 
     def set_mode(self, mode: str | None = None, source: str | None = None) -> dict:
         if mode is not None:
@@ -1384,10 +1486,19 @@ class AssetManager:
         if source is not None and source not in cad_harvester.SOURCES:
             raise ValueError(f"source must be one of {', '.join(cad_harvester.SOURCES)}")
         with self._lock:
-            if mode is not None:
-                self.offline = mode == "offline"
+            offline = self.offline if mode is None else mode == "offline"
+            if offline and source is not None and source not in cad_harvester.OFFLINE_SOURCES:
+                raise ValueError(f"offline mode only allows sources {', '.join(cad_harvester.OFFLINE_SOURCES)}")
             if source is not None:
                 self.source = source
+                if source not in cad_harvester.OFFLINE_SOURCES:
+                    self._online_source = source
+            elif offline and not self.offline and self.source not in cad_harvester.OFFLINE_SOURCES:
+                self.source = "local"  # going offline: external sources are not selectable
+            elif not offline and self.offline and self.source in cad_harvester.OFFLINE_SOURCES:
+                self.source = self._online_source  # back online: restore the last online source
+            self.offline = offline
+            netguard.set_offline(offline)
             self._not_found.clear()  # new mode / source: every missing class may be searched again
         log.info("CAD retrieval mode: %s, source %s", "offline" if self.offline else "online", self.source)
         return self.mode()
@@ -1419,11 +1530,12 @@ class AssetManager:
                 return {"glb_url": f"/static/models/{slug}.glb?v={version}", "status": "ready",
                         "title": attr.get("title") or info.get("title", label), "attribution": attr,
                         "credit": cad_harvester.attribution_line(attr), "badge": attr.get("badge", ""),
-                        "source_key": attr.get("source_key", ""), "spec": attr.get("spec")}
+                        "source_key": attr.get("source_key", ""), "spec": attr.get("spec"),
+                        "orientation": attr.get("orientation_fix")}
         if busy:
             status = "resolving"
         elif missing:
-            status = "not_found"
+            status = missing.get("status") or "not_found"
         else:
             status = "pending"
         return {"glb_url": "", "status": status, "title": info.get("title", label), "attribution": None, "credit": "",
@@ -1480,7 +1592,8 @@ class AssetManager:
                 self._info[label] = {"title": result.get("title", label), "source": result.get("source") or result.get("status")}
                 self._not_found.pop(label, None)
             else:
-                self._not_found[label] = {"reason": result.get("reason") or "no verified 3D model found", "at": time.time()}
+                self._not_found[label] = {"reason": result.get("reason") or "no verified 3D model found", "at": time.time(),
+                                          "status": "offline_missing" if result.get("status") == "offline_missing" else "not_found"}
                 log.info("CAD NOT_FOUND for %s: %s", label, self._not_found[label]["reason"])
         if result.get("glb_url") and self.on_resolved:
             self.on_resolved(label, {k: result.get(k) for k in
@@ -1494,7 +1607,7 @@ class AssetManager:
 
     def candidates(self, label: str, limit: int = 4, source: str | None = None) -> list[dict]:
         src = source or self.source
-        if src == "local":
+        if src in cad_harvester.OFFLINE_SOURCES:
             src = "auto"
         return cad_harvester.candidates(self._product(label), limit=limit, source=src, budget_s=CAD_BROWSE_BUDGET_S)
 
@@ -1516,8 +1629,22 @@ class AssetManager:
         return self._explicit(label, lambda: cad_harvester.select(self._product(label), uid))
 
     def upload(self, label: str, data: bytes, filename: str = "") -> dict:
-        title = self._product(label).canonical_name if self.meta_lookup else label
-        return self._explicit(label, lambda: cad_harvester.upload_glb(label, data, filename, title))
+        product = self._product(label) if self.meta_lookup else None
+        title = product.canonical_name if product else label
+        category = product.category if product else None
+        return self._explicit(label, lambda: cad_harvester.upload_glb(label, data, filename, title, category))
+
+    def orient(self, label: str, op: str, axis: str = "y", deg: float = 90.0) -> dict:
+        """Auto / rotate / reset the orientation fix of the cached GLB (glb_orient)."""
+        try:
+            category = self._product(label).category if self.meta_lookup else None
+        except (taxonomy.MetadataError, ValueError):
+            category = None
+        with self._lock:
+            if label in self._inflight:
+                raise RuntimeError(f"a CAD search for {label} is running - try again when it lands")
+        return {**cad_harvester.reorient(label, op, axis=axis, deg=deg, category=category),
+                "glb_url": self.peek(label)["glb_url"]}
 
     def generate(self, label: str) -> dict:
         return self._explicit(label, lambda: cad_harvester.generate_from_specs(self._product(label)))
@@ -1535,6 +1662,7 @@ class AssetManager:
             if not vendor.is_file() or vendor.stat().st_size < 50_000:
                 try:
                     vendor.parent.mkdir(parents=True, exist_ok=True)
+                    netguard.check(MODEL_VIEWER_URL)
                     req = urllib.request.Request(MODEL_VIEWER_URL, headers={"User-Agent": "kamikaze-edge/1.0"})
                     with urllib.request.urlopen(req, timeout=20) as resp:
                         vendor.write_bytes(resp.read())
@@ -1832,6 +1960,7 @@ class Pipeline:
         self.extractor, self.bank, self.leds, self.assets = extractor, bank, leds, assets
         self.detector = detector
         self.ocr = ocr if ocr is not None else ocr_fusion.OcrWorker(None)
+        self._vocab_key: tuple | None = None
         self._lighting: dict = {"ok": True, "issue": None, "message": "", "mean_luma": None, "glare_fraction": None,
                                 "gate": LIGHT_GATE}
         self.pose_worker = PoseWorker(pose_embedder, bank) if pose_embedder is not None else None
@@ -1943,6 +2072,27 @@ class Pipeline:
 
     def camera_live(self) -> bool:
         return self.camera is not None and bool(self.camera.live)
+
+    def camera_focus(self, auto=None, value=None, write: bool = False) -> dict:
+        """Focus status of the on-board camera; write=True applies {auto, value}. RuntimeError when there is no
+        on-board camera (HTTP ingest: focus belongs to the streaming host)."""
+        cam = self.camera
+        if cam is None or getattr(cam, "focus", None) is None:
+            raise RuntimeError("no on-board camera is attached (HTTP ingest): set focus on the streaming host")
+        if not write:
+            return {"ok": True, "camera": cam.name or cam.device, **cam.focus.status()}
+        if auto is not None and not isinstance(auto, bool):
+            raise ValueError("auto must be true or false")
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1023:
+                raise ValueError("value must be a number in 0-1023 (device range applies)")
+            value = int(round(value))
+            auto = False if auto is None else auto
+        if auto is None and value is None:
+            raise ValueError("send {\"auto\": true} or {\"auto\": false, \"value\": 0-255}")
+        status = cam.focus.set(auto=auto, value=value)
+        log.info("Camera focus set: %s", "continuous AF" if status.get("auto") else f"manual {status.get('value')}")
+        return {"ok": True, "camera": cam.name or cam.device, **status}
 
     def camera_frame(self, data: bytes) -> None:
         cam = self.camera
@@ -2065,9 +2215,16 @@ class Pipeline:
                 arr = None
             else:
                 box, detect_ms = self._locate(image)
+                crop_box = box or center_crop_box(*image.size)
                 if self.ocr.enabled and not enrolling:
-                    size, left, top = box or center_crop_box(*image.size)
+                    size, left, top = crop_box
                     self.ocr.submit(np.asarray(image.crop((left, top, left + size, top + size))))
+                live_color = None
+                if self.mv.capturing or self.bank.has_color():
+                    try:
+                        live_color = color_signature(image, crop_box)
+                    except Exception:
+                        log.exception("colour signature failed")
                 arr = preprocess(image, box)
                 t1 = time.perf_counter()
                 vec = self.extractor.embed_array(arr)
@@ -2080,9 +2237,9 @@ class Pipeline:
                         log.exception("DINOv2 enrollment descriptor failed")
                 if self.enroller.feed(vec):
                     self.sm.reset()
-                if self.mv.feed(vec, pose_desc) == "complete":
+                if self.mv.feed(vec, pose_desc, live_color) == "complete":
                     capturing = False
-                frame, views, best_view, category, arb = self._arbitrate(vec)
+                frame, views, best_view, category, arb = self._arbitrate(vec, live_color)
             prev = (self.sm.state, self.sm.label)
             snap = self.sm.update(frame)
             state, label, score = snap["state"], snap["label"], snap["score"]
@@ -2151,9 +2308,9 @@ class Pipeline:
             "lighting": light, "ocr": arb.get("ocr"),
         }
 
-    def _arbitrate(self, vec) -> tuple[FrameScore, dict, str | None, str | None, dict]:
-        """Rank enrolled classes inside the detector's domain gate and attach phone / conflict guidance.
-        Returns (frame score, view sims of top-1, best view, top-1 category, diagnostics)."""
+    def _arbitrate(self, vec, live_color=None) -> tuple[FrameScore, dict, str | None, str | None, dict]:
+        """Rank enrolled classes inside the detector's domain gate, fuse vision with OCR text and colour, and attach
+        phone / conflict guidance. Returns (frame score, view sims of top-1, best view, top-1 category, diagnostics)."""
         target = self._detection.get("target")
         domain = device_taxonomy.domain_for(target)
         ranked_all = self.bank.rank(vec)
@@ -2161,7 +2318,7 @@ class Pipeline:
         info = {"domain": list(domain) if domain else None, "conflict": False, "front_dominant": False,
                 "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None,
                 "ocr": None}
-        ranked, info["ocr"] = self._fuse_text(ranked)
+        ranked, fused, info["ocr"] = self._fuse(ranked, live_color)
         lead = ranked_all[0] if ranked_all else None
         lead_cat = self.bank.category(lead[0]) if lead else None
         conflict = bool(domain and lead and lead_cat and lead_cat not in domain and calibrate(lead[1]) >= C_SEARCH)
@@ -2174,7 +2331,7 @@ class Pipeline:
         views = self.bank.view_sims(label, vec)
         if best_view is None and views:
             best_view = max(views, key=views.get)
-        frame = FrameScore(label, s1, s2, top2)
+        frame = FrameScore(label, s1, s2, top2, f1=fused.get(label), f2=fused.get(top2) if top2 else None)
         if conflict:
             info["conflict"] = True
             frame.hint = "verify"
@@ -2191,29 +2348,54 @@ class Pipeline:
                 frame.prompt = device_taxonomy.disambiguation_prompt(self.bank.metadata(label), self.bank.metadata(top2))
         return frame, views, best_view, category, info
 
-    def _fuse_text(self, ranked: list) -> tuple[list, dict | None]:
-        """Late fusion S = 0.65 S_vision + 0.35 S_text over the top candidates, using the words OCR read on the crop
-        in the last WINDOW_S. Classes whose printed words were not seen keep their pure vision score; a different
-        brand's name in view pulls a class down. Text alone can never identify (it caps at 0.35 of the score)."""
-        if not self.ocr.enabled:
-            return ranked, None
-        recent = self.ocr.recent()
-        seen = set(recent["tokens"])
-        info = {"texts": recent["texts"], "tokens": recent["tokens"][:16], "ms": recent["ms"], "applied": False,
-                "s_text": None, "s_vision": None}
-        if not seen or not ranked:
-            return ranked, info
+    def _fuse(self, ranked: list, live_color=None) -> tuple[list, dict, dict | None]:
+        """Tri-modal late fusion over the top-5 candidates in calibrated space:
+        C = (0.60 C_vision + 0.25 C_text + 0.15 C_colour) / (sum of the weights of the modalities present).
+        C_text comes from the (fuzzy-corrected) words OCR read on the crop in the last WINDOW_S, C_colour from the
+        HSV-histogram intersection with the class's per-view colour signatures. A modality that has nothing to say
+        about a class (no words seen / no colour reference) drops out instead of counting as 0, and below the
+        SEARCHING floor vision is returned unchanged, so text or colour can never lift background into a match.
+        Returns (ranked re-sorted by fused confidence with the raw cosines kept, {label: fused}, diagnostics)."""
+        recent = None
+        if self.ocr.enabled:
+            key = tuple(self.bank.labels())
+            if key != self._vocab_key:  # enrolled classes changed: their brand / variant words join the corrector vocab
+                self._vocab_key = key
+                self.ocr.set_vocabulary(self.bank.vocabulary())
+            recent = self.ocr.recent()
+        seen = set(recent["tokens"]) if recent else set()
+        if live_color is None and not seen:
+            return ranked, {}, self._ocr_info(recent, None, live_color)
         head, tail = ranked[:5], ranked[5:]
         scored = []
         for lab, s, view in head:
-            st = ocr_fusion.text_score(ocr_fusion.class_words(self.bank.metadata(lab), lab), seen)
-            scored.append((lab, ocr_fusion.fuse(s, st), view, st, s))
-        scored.sort(key=lambda r: -r[1])
-        top = scored[0]
-        info.update(applied=any(r[3] is not None for r in scored), s_text=top[3], s_vision=round(top[4], 4),
-                    fused=round(top[1], 4), label=top[0])
-        merged = [(lab, s, view) for lab, s, view, _, _ in scored] + list(tail)
-        return sorted(merged, key=lambda r: -r[1]), info
+            cv = calibrate(s)
+            ct = ocr_fusion.text_score(ocr_fusion.class_words(self.bank.metadata(lab), lab), seen) if seen else None
+            cc = color_sig.score(live_color, self.bank.color_refs(lab)) if live_color is not None else None
+            scored.append((lab, s, view, ocr_fusion.fuse_calibrated(cv, ct, cc, gate=C_SEARCH), cv, ct, cc))
+        scored.sort(key=lambda r: -r[3])
+        fused = {r[0]: r[3] for r in scored}
+        # Candidates outside the top-5 keep their vision-only calibrated score for ordering.
+        merged = sorted([(lab, s, view) for lab, s, view, *_ in scored] + list(tail),
+                        key=lambda r: -fused.get(r[0], calibrate(r[1])))
+        return merged, fused, self._ocr_info(recent, scored[0] if scored else None, live_color)
+
+    @staticmethod
+    def _ocr_info(recent: dict | None, top: tuple | None, live_color) -> dict | None:
+        if recent is None and live_color is None:
+            return None
+        info = {"texts": [], "corrected": [], "corrections": [], "tokens": [], "ms": 0.0, "applied": False,
+                "s_text": None, "s_vision": None, "s_color": None, "fused": None, "label": None,
+                "color": color_sig.dominant(live_color) if live_color is not None else None,
+                "weights": {"vision": ocr_fusion.W_VISION, "text": ocr_fusion.W_TEXT, "color": ocr_fusion.W_COLOR}}
+        if recent:
+            info.update(texts=recent["texts"], corrected=recent.get("corrected", []),
+                        corrections=recent.get("corrections", []), tokens=recent["tokens"][:16], ms=recent["ms"])
+        if top is not None:
+            lab, _s, _view, f, cv, ct, cc = top
+            info.update(applied=ct is not None or cc is not None, label=lab, fused=round(f, 4), s_vision=round(cv, 4),
+                        s_text=None if ct is None else round(ct, 3), s_color=None if cc is None else round(cc, 3))
+        return info
 
     def _locate(self, image: Image.Image) -> tuple[tuple[int, int, int] | None, float]:
         """NPU object detection -> smoothed square crop around the target inside the reticle (None = center crop)."""
@@ -2339,6 +2521,10 @@ class Pipeline:
             if self.assets.offline:
                 raise PermissionError("offline mode: spec lookup needs online access")
             result = self.assets.generate(label)
+        elif action == "orient":
+            info = self.assets.orient(label, kw.get("op", "auto"), kw.get("axis", "y"), kw.get("deg", 90.0))
+            self._bump()
+            return {"ok": True, "label": label, "orientation": info, "asset": self.assets.peek(label)}
         else:
             raise ValueError(action)
         self._bump()
@@ -2384,6 +2570,7 @@ class Pipeline:
             "asset_badge": viewer.get("badge", ""),
             "asset_reason": viewer.get("reason", ""),
             "asset_spec": viewer.get("spec"),
+            "asset_orientation": viewer.get("orientation"),
             "cad_mode": self.assets.mode() if hasattr(self.assets, "mode") else None,
             "ocr": last.get("ocr"),
             "lighting": last.get("lighting") or self._lighting,
@@ -2416,7 +2603,8 @@ class Pipeline:
             "bank": self.bank.info(),
             "classes": self.bank.counts(),
             "backend": self.extractor.name,
-            "thresholds": {"calibration": {"form": "sigmoid(k(S-c))/sigmoid(k(1-c))", "k": CAL_SLOPE, "c": CAL_CENTER},
+            "thresholds": {"calibration": {"form": "piecewise-linear", "knots": list(CAL_KNOTS), "mid": CAL_MID,
+                                           "cap": CAL_CAP, "matching": "max over view centroids"},
                            "ema_alpha": EMA_ALPHA, "identified": C_IDENT, "searching": C_SEARCH,
                            "margin": MIN_MARGIN, "identified_raw_cosine": round(T_IDENT, 4),
                            "searching_raw_cosine": round(T_SEARCH, 4), "phone_margin": PHONE_AMBIG_MARGIN,
@@ -2575,6 +2763,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, p.telemetry_snapshot())
         if path == "/api/settings/mode":
             return self._json(200, {"ok": True, **p.assets.mode()})
+        if path == "/api/camera/focus":
+            try:
+                return self._json(200, p.camera_focus())
+            except RuntimeError as exc:
+                return self._json(409, {"ok": False, "error": str(exc), "supported": False})
         parts = [urllib.parse.unquote(s) for s in path.split("/") if s]
         if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] == "cad_candidates":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -2747,7 +2940,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._json(400, {"ok": False, "error": str(exc)})
             return True
-        if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] in ("cad_select", "upload_cad", "generate_spec"):
+        if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] in (
+                "cad_select", "upload_cad", "generate_spec", "cad_orient"):
             return self._cad_post(parts[2], parts[3], body)
         if path == "/api/settings/mode":
             try:
@@ -2755,6 +2949,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, p.set_cad_mode(req.get("mode"), req.get("source")))
             except (TypeError, ValueError) as exc:
                 self._json(400, {"ok": False, "error": str(exc)})
+            return True
+        if path == "/api/camera/focus":
+            try:
+                req = self._json_body(body)
+                self._json(200, p.camera_focus(req.get("auto"), req.get("value"), write=True))
+            except RuntimeError as exc:
+                self._json(409, {"ok": False, "error": str(exc)})
+            except LookupError as exc:
+                self._json(422, {**p.camera_focus(), "ok": False, "error": str(exc)})
+            except (TypeError, ValueError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            except OSError as exc:
+                self._json(503, {"ok": False, "error": f"V4L2 control failed: {exc}"})
             return True
         if path not in ("/api/enroll/start", "/api/enroll/capture", "/api/enroll/finish", "/api/enroll/cancel",
                         "/api/db/save", "/api/cad/fetch", "/api/classes/reset", "/api/classes/purge", "/api/resolve"):
@@ -2842,11 +3049,30 @@ class Handler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
                 name = query.get("filename", [self.headers.get("X-Filename", "")])[0]
                 result = p.cad_action(label, "upload", data=body, filename=name)
+            elif action == "cad_orient":
+                req = self._json_body(body)
+                if req.get("reset"):
+                    op = "reset"
+                elif req.get("auto"):
+                    op = "auto"
+                elif req.get("axis") is not None:
+                    op = "rotate"
+                else:
+                    op = "status"
+                axis = str(req.get("axis") or "y").lower()
+                if op == "rotate" and axis not in ("x", "y", "z"):
+                    raise ValueError("axis must be x, y or z")
+                deg = float(req.get("deg", 90))
+                if op == "rotate" and (not math.isfinite(deg) or abs(deg) > 360):
+                    raise ValueError("deg must be a finite angle within [-360, 360]")
+                result = p.cad_action(label, "orient", op=op, axis=axis, deg=deg)
             else:
                 result = p.cad_action(label, "generate")
             self._json(200 if result["ok"] else 404, result)
         except NotEnrolled:
             self._json(404, {"ok": False, "error": f"class {raw_id!r} is not enrolled"})
+        except FileNotFoundError as exc:
+            self._json(404, {"ok": False, "error": str(exc)})
         except PermissionError as exc:
             self._json(409, {"ok": False, "error": str(exc), "offline": True})
         except RuntimeError as exc:

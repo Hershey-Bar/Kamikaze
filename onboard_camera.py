@@ -13,6 +13,7 @@ parent); "none" / "off" disables on-board capture; "0" means /dev/video0; anythi
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Callable
 
 import numpy as np
 
+import v4l2_ctrl
 try:
     import cv2
 except ImportError:  # pragma: no cover - the board venv ships opencv-python-headless
@@ -103,6 +105,8 @@ class LocalBrioCapture:
         self.lock = threading.Lock()
         self.running = False
         self.thread: threading.Thread | None = None
+        self.focus = v4l2_ctrl.FocusControl(v4l2_ctrl.V4L2Controls(device_path))
+        self.focus_env = os.environ.get("KAMIKAZE_FOCUS", "")
 
     # -- device ---------------------------------------------------------------------------------------------------
     def open(self) -> bool:
@@ -136,7 +140,19 @@ class LocalBrioCapture:
         self.status, self.error = "open", None
         log.info("[ONBOARD-CAM] Opened %s (%s): %dx%d %s @ %.0f FPS", self.device, self.name or "?", self.actual_w,
                  self.actual_h, self.fourcc or "?", self.actual_fps)
+        self._apply_focus_env()
         return True
+
+    def _apply_focus_env(self) -> None:
+        """KAMIKAZE_FOCUS=auto|<0-255>: pin the focus on every (re)open; fixed-focus cameras just log it."""
+        try:
+            auto, value = v4l2_ctrl.parse_focus_env(self.focus_env)
+            if auto is None:
+                return
+            st = self.focus.set(auto=auto, value=value)
+            log.info("[ONBOARD-CAM] Focus: %s", "continuous AF" if st["auto"] else f"manual {st['value']}")
+        except (LookupError, ValueError, OSError) as exc:
+            log.warning("[ONBOARD-CAM] KAMIKAZE_FOCUS=%s not applied: %s", self.focus_env, exc)
 
     def release(self) -> None:
         cap, self.cap = self.cap, None

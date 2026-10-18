@@ -20,6 +20,7 @@ from PIL import Image
 
 import cad_retriever
 import mcp_server
+import netguard
 import pose
 import receiver
 import taxonomy
@@ -103,9 +104,53 @@ class MetadataTests(unittest.TestCase):
             title, instruction = taxonomy.view_step("smartphone", view)
             self.assertTrue(title and instruction)
 
+    def test_wizard_steps_are_category_specific(self):
+        self.assertEqual(taxonomy.wizard_views("smartphone"), ("front", "back", "right", "left", "top"))
+        self.assertEqual(taxonomy.wizard_views("beverage_can"), ("front", "back", "right", "top"))
+        self.assertEqual(taxonomy.wizard_views(None), taxonomy.wizard_views("beverage_can"))
+        for cat in taxonomy.CATEGORIES:
+            for view in taxonomy.wizard_views(cat):
+                title, prompt, target = taxonomy.view_detail(cat, view)
+                self.assertTrue(title and prompt and target)
+                self.assertNotIn("?", title)  # degree signs, not mojibake
+        self.assertEqual(taxonomy.view_step("beverage_can", "right")[0], "Side seam (90°)")
+        self.assertIn("power and volume", taxonomy.view_step("smartphone", "right", "Samsung")[1])
+        self.assertIn("Action button", taxonomy.view_step("smartphone", "left", "Apple")[1])
+        self.assertIn("pull-tab", taxonomy.view_step("beverage_can", "top")[1])
+
+
+class ColorSignatureTests(unittest.TestCase):
+    @staticmethod
+    def solid(rgb, size=(48, 32)):
+        return np.full((size[1], size[0], 3), rgb, np.uint8)
+
+    def test_signature_separates_brand_colours(self):
+        import color_sig
+        red = color_sig.signature(self.solid((200, 20, 30)))
+        red2 = color_sig.signature(self.solid((180, 30, 25)))
+        blue = color_sig.signature(self.solid((20, 40, 190)))
+        green = color_sig.signature(self.solid((30, 170, 60)))
+        self.assertAlmostEqual(float(red.sum()), 1.0, places=5)
+        self.assertEqual(color_sig.dominant(red), "red")
+        self.assertEqual(color_sig.dominant(blue), "blue")
+        self.assertGreater(color_sig.score(red2, {"front": red}), 0.9)
+        self.assertLess(color_sig.score(blue, {"front": red}), 0.2)
+        self.assertLess(color_sig.score(green, [red]), 0.2)
+        self.assertIsNone(color_sig.score(red, {}))
+        self.assertEqual(color_sig.score(blue, {"front": red, "back": blue}), 1.0)  # best view wins
+        crop = receiver.color_signature(Image.fromarray(self.solid((200, 20, 30), (320, 240))),
+                                        receiver.center_crop_box(320, 240))
+        self.assertEqual(color_sig.dominant(crop), "red")
+
 
 class PoseTests(unittest.TestCase):
     BOX = receiver.center_crop_box(320, 240)
+
+    def test_top_view_pitches_toward_camera(self):
+        est = pose.PoseEstimator(smoothing=1.0)
+        out = est.update(rect_image(60, 80), self.BOX, {"front": 0.2, "top": 0.95}, "c", "beverage_can")
+        self.assertTrue(out["valid"])
+        self.assertGreater(out["pitch"], 20.0)  # positive = top tilted toward the camera
 
     def test_roll_is_recovered(self):
         est = pose.PoseEstimator(smoothing=1.0)
@@ -153,7 +198,7 @@ class CadFallbackTests(unittest.TestCase):
             label = taxonomy.label_from_metadata(meta)
             with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mcp_server, "MODELS_DIR", Path(tmp)):
                 info = cad_retriever.retrieve(label, meta, offline=True)
-                self.assertEqual((info["status"], info["glb_url"]), ("not_found", ""), raw)
+                self.assertEqual((info["status"], info["glb_url"]), ("offline_missing", ""), raw)
                 self.assertTrue(info["reason"], raw)
                 self.assertEqual(list(Path(tmp).iterdir()), [], raw)
 
@@ -263,20 +308,23 @@ class MultiViewFlowTests(unittest.TestCase):
             "variant": "original", "package_type": "can", "container_volume": "330ml", "frames_per_view": 6})
         self.assertEqual((status, st["phase"]), (200, "ready"))
         self.assertEqual(st["current_view"], "front")
-        base = {v: unit(i + 1) for i, v in enumerate(taxonomy.VIEWS)}
-        for i, view in enumerate(taxonomy.VIEWS):
+        steps = taxonomy.wizard_views("beverage_can")
+        self.assertEqual(st["steps"], list(steps))
+        base = {v: unit(i + 1) for i, v in enumerate(steps)}
+        for i, view in enumerate(steps):
             self.assertEqual(self.call("POST", "/api/enroll/capture", {})[1]["current_view"], view)
             for k in range(6):
                 self.frame(torch.nn.functional.normalize(base[view] + 0.02 * unit(900 + k), dim=0))
             _, st = self.call("GET", "/api/enroll/status")
-            if i < len(taxonomy.VIEWS) - 1:
+            if i < len(steps) - 1:
                 self.assertEqual(st["phase"], "ready")
                 self.assertEqual(st["views"][i]["state"], "done")
         self.assertEqual(st["phase"], "done", st)
         label = "coca_cola_330ml_can"
         entry = self.bank.info()[0]
         self.assertEqual(entry["label"], label)
-        self.assertEqual(set(entry["views"]), set(taxonomy.VIEWS))
+        self.assertEqual(set(entry["views"]), set(steps))
+        self.assertEqual(set(entry["color_views"]), set(steps))
         self.assertEqual(entry["metadata"]["category"], "beverage_can")
         sims = self.bank.view_sims(label, base["right"])
         self.assertEqual(max(sims, key=sims.get), "right")
@@ -351,10 +399,11 @@ class MultiViewFlowTests(unittest.TestCase):
 
         dino = FakeDino()
         self.pipe.pose_worker = receiver.PoseWorker(dino, self.bank, hz=1000)
-        descs = {v: np.eye(8, dtype=np.float32)[i] for i, v in enumerate(taxonomy.VIEWS)}
+        steps = taxonomy.wizard_views("beverage_can")
+        descs = {v: np.eye(8, dtype=np.float32)[i] for i, v in enumerate(steps)}
         self.call("POST", "/api/enroll/start", {"raw_name": "Sprite Can", "category": "beverage_can", "frames_per_view": 3})
-        base = {v: unit(40 + i) for i, v in enumerate(taxonomy.VIEWS)}
-        for view in taxonomy.VIEWS:
+        base = {v: unit(40 + i) for i, v in enumerate(steps)}
+        for view in steps:
             self.call("POST", "/api/enroll/capture", {"view": view})
             dino.desc = descs[view]
             for _ in range(3):
@@ -362,7 +411,7 @@ class MultiViewFlowTests(unittest.TestCase):
         _, st = self.call("GET", "/api/enroll/status")
         self.assertEqual(st["phase"], "done", st)
         label = self.bank.labels()[0]
-        self.assertEqual(self.bank.info()[0]["pose_views"], sorted(taxonomy.VIEWS))
+        self.assertEqual(self.bank.info()[0]["pose_views"], sorted(steps))
         buf = io.BytesIO()
         rect_image(60, 120, size=(320, 240)).save(buf, "JPEG")
         self.ext.vec, dino.desc = base["right"], descs["right"]
@@ -430,9 +479,29 @@ class OcrFusionTests(unittest.TestCase):
         self.assertEqual(ocr_fusion.text_score(zero, ocr_fusion.tokens_of("Coca-Cola")), 0.6)
         self.assertIsNone(ocr_fusion.text_score(zero, set()))
         self.assertIsNone(ocr_fusion.text_score(zero, ocr_fusion.tokens_of("330 ml")))
-        self.assertAlmostEqual(ocr_fusion.fuse(0.8, 1.0), 0.65 * 0.8 + 0.35)
+        self.assertAlmostEqual(ocr_fusion.fuse(0.8, 1.0), (0.60 * 0.8 + 0.25) / 0.85)
         self.assertEqual(ocr_fusion.fuse(0.8, None), 0.8)
         self.assertLessEqual(ocr_fusion.fuse(0.0, 1.0), 0.35)  # text alone can never identify
+        # Tri-modal: absent modalities drop out, below the gate vision passes through untouched.
+        self.assertAlmostEqual(ocr_fusion.fuse_calibrated(0.8, 1.0, 1.0), 0.6 * 0.8 + 0.25 + 0.15)
+        self.assertAlmostEqual(ocr_fusion.fuse_calibrated(0.8, None, 0.0), 0.6 * 0.8 / 0.75)
+        self.assertEqual(ocr_fusion.fuse_calibrated(0.2, 1.0, 1.0, gate=0.25), 0.2)
+
+    def test_corrector_fixes_ocr_glyph_errors(self):
+        import ocr_fusion
+        c = ocr_fusion.Corrector()
+        c.set_extra(["Kirkland", "grapefruit"])
+        for raw, want in (("c0ke", "coke"), ("samsunq", "samsung"), ("S2S", "s25"), ("ZER0", "zero"),
+                          ("kirklond", "kirkland"), ("grapefrult", "grapefruit"), ("PEPSI", "pepsi")):
+            self.assertEqual(c.word(raw), want, raw)
+        self.assertEqual(c.word("cake"), "cake")  # short, non-glyph difference: never forced onto "coke"
+        self.assertIsNone(c.word("ml"))  # too short to be a token
+        words, fixes = c.text("C0KE ZER0 sugar")
+        self.assertEqual(words, ["coke", "zero", "sugar"])
+        self.assertEqual(fixes, [("c0ke", "coke"), ("zer0", "zero")])
+        seen = set(ocr_fusion.tokens_from_words(words))
+        zero = ocr_fusion.class_words(self.COKE_ZERO)
+        self.assertEqual(ocr_fusion.text_score(zero, seen), 1.0)
 
     def test_worker_reads_into_recent_window(self):
         import ocr_fusion
@@ -537,6 +606,7 @@ class CadModeEndpointTests(unittest.TestCase):
         for p in self.patches:
             p.stop()
         self.tmp.cleanup()
+        netguard.set_offline(False)  # process-global: later tests need the network
 
     def call(self, method, path, body=None, headers=None):
         payload = json.dumps(body).encode() if isinstance(body, dict) else body
@@ -557,17 +627,32 @@ class CadModeEndpointTests(unittest.TestCase):
     def test_mode_toggle_and_validation(self):
         status, out = self.call("GET", "/api/settings/mode")
         self.assertEqual((status, out["mode"], out["offline"]), (200, "offline", True))
-        self.assertEqual(out["sources"], list(cad_harvester_sources()))
+        self.assertEqual((out["sources"], out["source"]), (list(receiver.cad_harvester.OFFLINE_SOURCES), "local"))
+        self.assertEqual(out["all_sources"], list(cad_harvester_sources()))
+        self.assertTrue(out["network"]["offline"])
+        self.assertTrue(netguard.is_offline())
+        status, out = self.call("POST", "/api/settings/mode", {"source": "sketchfab"})
+        self.assertEqual(status, 400, out)  # online repositories are refused while offline
+        self.assertEqual(self.call("POST", "/api/settings/mode", {"source": "upload"})[1]["source"], "upload")
+        status, out = self.call("POST", "/api/settings/mode", {"mode": "online"})
+        self.assertEqual((status, out["source"], out["sources"]), (200, "auto", list(cad_harvester_sources())), out)
+        self.assertFalse(netguard.is_offline())
         status, out = self.call("POST", "/api/settings/mode", {"mode": "online", "source": "polypizza"})
         self.assertEqual((status, out["mode"], out["source"]), (200, "online", "polypizza"))
         self.assertFalse(self.assets.offline)
         self.assertEqual(self.call("POST", "/api/settings/mode", {"mode": "sideways"})[0], 400)
         self.assertEqual(self.call("POST", "/api/settings/mode", {"source": "thingiverse"})[0], 400)
-        self.assertEqual(self.call("POST", "/api/settings/mode", {"mode": "offline"})[1]["mode"], "offline")
+        status, out = self.call("POST", "/api/settings/mode", {"mode": "offline"})
+        self.assertEqual((out["mode"], out["source"]), ("offline", "local"))
+        self.assertEqual(self.call("POST", "/api/settings/mode", {"mode": "online"})[1]["source"], "polypizza")
 
-    def test_offline_class_is_not_found_and_no_file_is_written(self):
-        self.assets.get(self.label)
-        info = self.wait_status("not_found")
+    def test_offline_class_is_offline_missing_and_no_request_is_made(self):
+        before = netguard.stats()["blocked"]
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("network used offline")) as net:
+            self.assets.get(self.label)
+            info = self.wait_status("offline_missing")
+        net.assert_not_called()
+        self.assertEqual(netguard.stats()["blocked"], before)  # nothing even tried to leave the box
         self.assertEqual(info["glb_url"], "")
         self.assertIn("offline", info["reason"])
         self.assertEqual(list(Path(self.tmp.name).glob("*.glb")), [])
@@ -606,6 +691,215 @@ class CadModeEndpointTests(unittest.TestCase):
         self.assertEqual((status, out["status"]), (200, "generated"), out)
         self.assertEqual(out["asset"]["badge"], receiver.cad_harvester.SPEC_BADGE)
         self.assertEqual(out["result"]["spec"]["diameter_mm"], 66.0)
+
+    def test_cad_orient_endpoint(self):
+        import procedural_glb
+        self.assertEqual(self.call("POST", f"/api/classes/{self.label}/cad_orient", {"auto": True})[0], 404)  # no GLB yet
+        self.assertEqual(self.call("POST", "/api/classes/ghost_can/cad_orient", {"auto": True})[0], 404)
+        hdr = {"Content-Type": "model/gltf-binary"}
+        self.call("POST", f"/api/classes/{self.label}/upload_cad", procedural_glb.build_can_spec(66.0, 115.2, 54.0), hdr)
+        url0 = self.assets.peek(self.label)["glb_url"]
+        self.assertEqual(self.call("POST", f"/api/classes/{self.label}/cad_orient", {"axis": "q"})[0], 400)
+        self.assertEqual(self.call("POST", f"/api/classes/{self.label}/cad_orient", {"axis": "x", "deg": 1e9})[0], 400)
+        time.sleep(0.01)
+        status, out = self.call("POST", f"/api/classes/{self.label}/cad_orient", {"axis": "x", "deg": 90})
+        self.assertEqual(status, 200, out)
+        self.assertFalse(out["orientation"]["identity"])
+        self.assertFalse(out["asset"]["orientation"]["identity"])
+        self.assertNotEqual(out["asset"]["glb_url"], url0)  # cache-busted
+        status, out = self.call("POST", f"/api/classes/{self.label}/cad_orient", {"auto": True})
+        self.assertTrue(out["orientation"]["identity"])  # upright can: auto removes the manual tilt
+        status, out = self.call("POST", f"/api/classes/{self.label}/cad_orient", {})
+        self.assertEqual((status, out["orientation"]["identity"]), (200, True))
+
+
+
+class FakeV4L2:
+    """In-memory V4L2 device: QUERYCTRL / G_CTRL / S_CTRL over the real struct layouts."""
+
+    def __init__(self, controls):
+        import v4l2_ctrl as v
+        self.v = v
+        self.ctrls = {c.cid: c for c in controls}
+        self.values = {c.cid: c.default for c in controls}
+        self.writes = []
+
+    def __call__(self, fd, req, buf):
+        import struct
+        v = self.v
+        if req == v.VIDIOC_QUERYCTRL:
+            cid = struct.unpack_from("I", buf)[0]
+            if cid & v.CTRL_FLAG_NEXT_CTRL:
+                nxt = sorted(c for c in self.ctrls if c > cid & ~v.CTRL_FLAG_NEXT_CTRL)
+                if not nxt:
+                    raise OSError(22, "EINVAL")
+                cid = nxt[0]
+            c = self.ctrls.get(cid)
+            if c is None:
+                raise OSError(22, "EINVAL")
+            buf[:] = struct.pack(v.QUERYCTRL_FMT, c.cid, c.type, c.name.encode(), c.minimum, c.maximum, c.step,
+                                 c.default, c.flags, 0, 0)
+        elif req in (v.VIDIOC_G_CTRL, v.VIDIOC_S_CTRL):
+            cid, val = struct.unpack(v.CONTROL_FMT, buf)
+            if cid not in self.ctrls:
+                raise OSError(22, "EINVAL")
+            if req == v.VIDIOC_S_CTRL:
+                self.values[cid] = val
+                self.writes.append((cid, val))
+            else:
+                buf[:] = struct.pack(v.CONTROL_FMT, cid, self.values[cid])
+        else:
+            raise OSError(25, "ENOTTY")
+        return 0
+
+
+def brio_controls(focus=True):
+    import v4l2_ctrl as v
+    out = [v.Control(0x00980900, v.CTRL_TYPE_INTEGER, "Brightness", 0, 255, 1, 128, 0)]
+    if focus:
+        out += [v.Control(v.CID_FOCUS_ABSOLUTE, v.CTRL_TYPE_INTEGER, "Focus, Absolute", 0, 255, 5, 0, 0),
+                v.Control(v.CID_FOCUS_AUTO, v.CTRL_TYPE_BOOLEAN, "Focus, Automatic Continuous", 0, 1, 1, 1, 0)]
+    return out
+
+
+def focus_for(dev):
+    import v4l2_ctrl as v
+    return v.FocusControl(v.V4L2Controls("/dev/video0", ioctl=dev, opener=lambda path: 3, closer=lambda fd: None))
+
+
+class V4L2FocusTests(unittest.TestCase):
+    def test_query_list_and_clamp(self):
+        import v4l2_ctrl as v
+        dev = FakeV4L2(brio_controls())
+        ctl = v.V4L2Controls("/dev/video0", ioctl=dev, opener=lambda path: 3, closer=lambda fd: None)
+        self.assertEqual([c.name for c in ctl.list()], ["Brightness", "Focus, Absolute", "Focus, Automatic Continuous"])
+        absolute = ctl.query(v.CID_FOCUS_ABSOLUTE)
+        self.assertEqual((absolute.minimum, absolute.maximum, absolute.step), (0, 255, 5))
+        self.assertEqual([absolute.clamp(x) for x in (-9, 12, 13, 999)], [0, 10, 15, 255])
+        self.assertIsNone(ctl.query(0x12345678))
+        self.assertEqual(v.VIDIOC_QUERYCTRL, 0xC0445624)  # the kernel's _IOWR('V', 36, struct v4l2_queryctrl)
+        self.assertEqual((v.VIDIOC_G_CTRL, v.VIDIOC_S_CTRL), (0xC008561B, 0xC008561C))
+
+    def test_manual_focus_disables_af_and_snaps(self):
+        import v4l2_ctrl as v
+        dev = FakeV4L2(brio_controls())
+        focus = focus_for(dev)
+        st = focus.status()
+        self.assertEqual((st["supported"], st["auto_supported"], st["auto"], st["max"]), (True, True, True, 255))
+        st = focus.set(auto=False, value=122)
+        self.assertEqual((st["auto"], st["value"]), (False, 120))
+        self.assertEqual(dev.writes, [(v.CID_FOCUS_AUTO, 0), (v.CID_FOCUS_ABSOLUTE, 120)])
+        self.assertTrue(focus.set(auto=True)["auto"])
+
+    def test_fixed_focus_camera_reports_unsupported(self):
+        focus = focus_for(FakeV4L2(brio_controls(focus=False)))
+        st = focus.status()
+        self.assertEqual((st["supported"], st["auto_supported"]), (False, False))
+        self.assertIn("fixed-focus", st["reason"])
+        with self.assertRaises(LookupError):
+            focus.set(auto=False, value=100)
+
+    def test_unavailable_host_and_env_parsing(self):
+        import v4l2_ctrl as v
+        ctl = v.V4L2Controls("/dev/video0", ioctl=None)
+        ctl._ioctl = None
+        self.assertIn("unavailable", v.FocusControl(ctl).status()["reason"])
+        self.assertEqual([v.parse_focus_env(x) for x in ("", "auto", " 40 ")], [(None, None), (True, None), (False, 40)])
+        with self.assertRaises(ValueError):
+            v.parse_focus_env("sharp")
+
+
+class NetguardTests(unittest.TestCase):
+    def tearDown(self):
+        netguard.set_offline(False)
+
+    def test_blocks_external_hosts_only_when_offline(self):
+        netguard.set_offline(False)
+        netguard.check("https://api.sketchfab.com/v3/search")
+        netguard.set_offline(True)
+        before = netguard.stats()["blocked"]
+        for url in ("http://127.0.0.1:5000/api/state", "http://localhost/x", "http://[::1]:8080/"):
+            netguard.check(url)
+        for url in ("https://api.sketchfab.com/v3/search", "https://api.poly.pizza/v1.1/search", "http://10.0.0.2/"):
+            with self.assertRaises(netguard.NetworkBlocked):
+                netguard.check(url)
+        st = netguard.stats()
+        self.assertEqual((st["offline"], st["blocked"] - before), (True, 3))
+        self.assertEqual(st["last_blocked"]["host"], "10.0.0.2")
+
+    def test_offline_mcp_and_spec_lookups_never_open_sockets(self):
+        import spec_search
+        netguard.set_offline(True)
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("socket opened offline")) as net:
+            with self.assertRaises(Exception):
+                mcp_server._http_json("https://api.sketchfab.com/v3/search?q=x")
+            with self.assertRaises(Exception):
+                spec_search._get("https://www.gsmarena.com/x.php")
+        net.assert_not_called()
+
+
+@needs_torch
+class FocusEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.pipe = receiver.Pipeline(FakeExtractor(), receiver.EmbeddingBank(None), receiver.LedDriver(lambda *a: True),
+                                      receiver.AssetManager(offline=True))
+        self.server = receiver.make_server(self.pipe, "127.0.0.1", 0)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.conn = HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.conn.close()
+        netguard.set_offline(False)
+
+    def call(self, method, body=None):
+        self.conn.request(method, "/api/camera/focus", body=json.dumps(body) if body is not None else None)
+        resp = self.conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    def attach(self, controls):
+        cam = mock.Mock(name="cam", live=False, device="/dev/video0")
+        cam.name = "Brio 101"
+        cam.focus = focus_for(FakeV4L2(controls))
+        self.pipe.attach_camera(cam)
+
+    def test_http_ingest_has_no_focus(self):
+        self.assertEqual(self.call("GET")[0], 409)
+        self.assertEqual(self.call("POST", {"auto": True})[0], 409)
+
+    def test_focus_camera(self):
+        self.attach(brio_controls())
+        status, out = self.call("GET")
+        self.assertEqual((status, out["camera"], out["supported"]), (200, "Brio 101", True))
+        status, out = self.call("POST", {"auto": False, "value": 63})
+        self.assertEqual((status, out["auto"], out["value"]), (200, False, 65))
+        self.assertEqual(self.call("POST", {"value": 5000})[0], 400)
+        self.assertEqual(self.call("POST", {"auto": "yes"})[0], 400)
+        self.assertEqual(self.call("POST", {})[0], 400)
+
+    def test_fixed_focus_camera_is_422_with_status(self):
+        self.attach(brio_controls(focus=False))
+        status, out = self.call("GET")
+        self.assertEqual((status, out["supported"]), (200, False))
+        status, out = self.call("POST", {"auto": False, "value": 100})
+        self.assertEqual((status, out["ok"], out["supported"]), (422, False, False), out)
+        self.assertIn("fixed-focus", out["reason"])
+
+
+class BankDbTypesTests(unittest.TestCase):
+    @needs_torch
+    def test_cad_info_with_numpy_values_round_trips_weights_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = receiver.EmbeddingBank(Path(tmp) / "db.pt")
+            bank.add_multiview("pepsi_can", {"front": [unit(1)]}, {"category": "beverage_can"})
+            bank.set_cad("pepsi_can", {"glb_url": "/static/models/pepsi_can.glb",
+                                       "attribution": {"orientation_fix": {"rotation": [np.float64(0.5)] * 4,
+                                                                           "identity": np.bool_(False)}}})
+            data = torch.load(Path(tmp) / "db.pt", map_location="cpu", weights_only=True)
+            fix = data["prototypes"]["pepsi_can"]["cad_asset"]["attribution"]["orientation_fix"]
+            self.assertEqual((fix["rotation"], fix["identity"]), ([0.5] * 4, False))
+            self.assertIs(type(fix["rotation"][0]), float)
 
 
 def cad_harvester_sources():

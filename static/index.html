@@ -64,12 +64,22 @@
   .gauge16 > div { height:100%; width:0; background:linear-gradient(90deg,var(--green),var(--amber)); transition:width .3s; }
   .freqs { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:8px; font-size:10px; }
   .freqs div { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:3px 4px; text-align:center; font-variant-numeric:tabular-nums; }
-  .leds { display:flex; gap:6px; margin:10px 0 8px; }
-  .led { width:16px; height:16px; border-radius:50%; background:#141c33; border:1px solid var(--line); transition:background .2s, box-shadow .2s; }
-  .led.on { box-shadow:0 0 10px currentColor; }
+  .leds { display:flex; gap:5px; }
+  .led { width:11px; height:11px; border-radius:50%; background:#1e293b; border:1px solid #334155; transition:background .2s, box-shadow .2s; }
+  .led.on { box-shadow:0 0 8px currentColor; border-color:transparent; }
+  .hdr { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+  .hwchip { color:var(--blue); border-color:#0c4a6e; background:#082f49; font-family:ui-monospace,monospace; vertical-align:middle; margin-left:8px; }
+  .ledhud { display:inline-flex; align-items:center; gap:10px; padding:5px 14px; border-radius:999px; background:#050913; border:1px solid var(--line); }
+  .ledhud .lh { font-size:11px; color:var(--mute); font-weight:600; }
+  .ledhud b { font:600 11px ui-monospace,monospace; color:var(--blue); min-width:118px; }
+  .ledhud.stale { opacity:.55; }
+  .orient { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top:8px; }
+  .orient .mute { margin-right:4px; }
+  .focusrow { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; font-size:12px; }
+  .focusrow input[type=range] { flex:1; min-width:140px; accent-color:var(--blue); }
   input[type=text], select { flex:1; min-width:120px; background:var(--panel2); border:1px solid var(--line); color:var(--text); padding:9px 10px; border-radius:8px; font:inherit; }
   .frow { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
-  .steps { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin-top:12px; }
+  .steps { display:grid; grid-template-columns:repeat(var(--nsteps,5),minmax(0,1fr)); gap:8px; margin-top:12px; }
   @media (max-width:760px) { .steps { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .step { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:8px; font-size:12px; }
   .step.current { border-color:var(--amber); box-shadow:0 0 0 1px var(--amber) inset; }
@@ -92,6 +102,10 @@
   .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; min-height:22px; align-items:center; }
   .chip { font-size:11px; padding:2px 8px; border-radius:6px; background:rgba(232,121,249,.12); border:1px solid rgba(232,121,249,.5); color:#f5d0fe; font-family:ui-monospace,monospace; }
   .chip.hit { background:rgba(16,185,129,.15); border-color:var(--green); color:#c9f7e4; }
+  .chip.fix { background:rgba(245,158,11,.12); border-color:var(--amber); color:#fde68a; }
+  .chip s { opacity:.6; }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:3px; border:1px solid var(--line); vertical-align:-2px; margin-right:4px; }
+  .step .tgt { color:var(--blue); font-size:11px; margin-top:2px; }
   .cadbar { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
   .cadbar select { flex:0 0 auto; min-width:0; padding:5px 8px; font-size:12px; }
   .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
@@ -128,8 +142,15 @@
 </head>
 <body>
 <header>
-  <h1>KAMIKAZE <small>edge visual → 3D retrieval · VENTUNO Q</small></h1>
-  <span><span class="pill" id="lightPill" title="Lighting gate on the reticle crop">light: —</span> <span class="pill" id="modePill">mode: —</span> <span id="conn">connecting…</span></span>
+  <h1>KAMIKAZE <small>edge visual → 3D retrieval · VENTUNO Q</small> <span class="pill hwchip">QCS8275 + STM32H5F5</span></h1>
+  <span class="hdr">
+    <span class="ledhud" id="ledHud" title="Modulino Pixels as last commanded over the arduino-router socket (set_pixels RPC)">
+      <span class="lh">Modulino Pixels (Wire1)</span>
+      <span class="leds" id="leds"></span>
+      <b id="ledMode">—</b>
+    </span>
+    <span class="pill" id="lightPill" title="Lighting gate on the reticle crop">light: —</span> <span class="pill" id="modePill">mode: —</span> <span id="conn">connecting…</span>
+  </span>
 </header>
 
 <div class="wrap">
@@ -147,11 +168,18 @@
           <div class="stat"><b>Confidence</b><span id="tSim">0.0%</span><div class="bar"><div id="confBar"></div></div></div>
           <div class="stat"><b>Margin Δ (top-1 − top-2)</b><span id="tMargin">0.0%</span><div class="bar m"><div id="marginBar"></div></div></div>
         </div>
-        <div class="chips" id="ocrChips" title="Words read by on-device OCR (fused 0.65 vision / 0.35 text)"></div>
+        <div class="chips" id="ocrChips" title="Tri-modal fusion: 0.60 vision + 0.25 OCR text + 0.15 colour (OCR glyph-corrected against the enrolled vocabulary)"></div>
+        <div class="focusrow" id="focusRow" title="On-board camera focus (V4L2): pin a manual focal distance to stop autofocus hunting">
+          <span class="mute">Focus</span>
+          <span class="seg"><button type="button" id="focusAuto">Auto Focus</button><button type="button" id="focusMan">Manual Focus</button></span>
+          <input type="range" id="focusVal" min="0" max="255" step="5" value="120" disabled>
+          <b id="focusNum">—</b>
+          <span class="mute" id="focusNote">checking camera…</span>
+        </div>
       </section>
 
       <section class="panel">
-        <h2>Training console · guided 360° enrollment (front · right · back · left · top)</h2>
+        <h2>Training console · guided 360° enrollment <span class="pill" id="wizSteps">phone: 5 views · can: 4 views</span></h2>
         <div class="frow">
           <input type="text" id="mName" placeholder="Object name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
           <select id="mCat">
@@ -211,7 +239,6 @@
         <h3>Co-processor · STM32H5F5</h3>
         <div class="sub">Modulino Pixels (8 LEDs) on Wire1 (I2C4) · Zephyr</div>
         <div class="big" id="tBus">— <small>ms set_pixels RPC</small></div>
-        <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
         <dl class="kvs">
           <dt>Bridge state</dt><dd id="tBridge">—</dd>
           <dt>RPC p95 / calls</dt><dd id="tRpc">—</dd>
@@ -255,11 +282,9 @@
           <span class="seg" title="Offline: local verified cache only. Online: Sketchfab / Poly Pizza search">
             <button type="button" id="modeOff">Offline</button><button type="button" id="modeOn">Online</button>
           </span>
-          <select id="srcSel" title="CAD source">
-            <option value="auto">Source: auto (Sketchfab → Poly Pizza)</option>
-            <option value="sketchfab">Source: Sketchfab</option>
-            <option value="polypizza">Source: Poly Pizza</option>
-            <option value="local">Source: local cache only</option>
+          <select id="srcSel" title="CAD source (Offline: local cache / uploads only)">
+            <option value="local">Source: Local Cache</option>
+            <option value="upload">Source: Custom Scan Upload</option>
           </select>
           <button class="ghost" id="browseBtn" type="button" title="Show the top ranked online models for the class on screen">Browse options</button>
           <span class="pill" id="cadPill">CAD: —</span>
@@ -288,6 +313,15 @@
           <span id="viewerLabel">No model</span>
           <span id="estBadge">ESTIMATED · spec-generated geometry</span>
           <div id="badge"></div>
+        </div>
+        <div class="orient" id="orientBar" title="Fix the model's frame so 0° = its front faces you and +Y is up (stored as a wrapper node; credited as a modification)">
+          <span class="mute">Model frame:</span>
+          <button class="ghost" type="button" data-axis="x">Rot X 90°</button>
+          <button class="ghost" type="button" data-axis="y">Rot Y 90°</button>
+          <button class="ghost" type="button" data-axis="z">Rot Z 90°</button>
+          <button class="ghost" type="button" data-op="auto">Auto-orient</button>
+          <button class="ghost" type="button" data-op="reset">Reset</button>
+          <span class="pill" id="orientPill">frame: —</span>
         </div>
       </section>
 
@@ -511,15 +545,22 @@
     requestAnimationFrame(tick);
   }
 
-  function renderLeds(led) {
+  function renderLeds(led, s) {
     const lit = led && led.ok !== false ? led.count : 0;
-    const color = led ? `rgb(${led.r},${led.g},${led.b})` : '#141c33';
+    const color = led ? `rgb(${led.r},${led.g},${led.b})` : '#1e293b';
     ledEls.forEach((el, i) => {
       const on = i < lit;
       el.classList.toggle('on', on);
       el.style.background = on ? color : '';
       el.style.color = on ? color : '';
     });
+    const mv = s && s.multiview;
+    const mode = !led ? '—' : led.ok === false ? 'BRIDGE DOWN' : mv && mv.phase === 'capturing' ? 'CAPTURING' : (s && s.state) || '—';
+    $('ledMode').textContent = led && led.ok !== false ? `${mode} (${lit}/8)` : mode;
+    $('ledMode').style.color = lit ? color : '';
+    $('ledHud').classList.toggle('stale', !led || led.ok === false);
+    $('ledHud').title = led ? `Modulino Pixels as last commanded: set_pixels(${led.r}, ${led.g}, ${led.b}, ${led.brightness}, ${led.count})` +
+      (led.latency_ms != null ? ` · RPC ${led.latency_ms} ms` : '') : 'Modulino Pixels: no bridge status yet';
   }
 
   async function refetchCad(id) {
@@ -535,7 +576,7 @@
 
   let classSig = '';
   function renderClasses(protos, active) {
-    const sig = JSON.stringify([(protos || []).map((p) => [p.class_id, p.view_count, p.vectors, p.cad_status, p.cad_source, p.cad_path]), active]);
+    const sig = JSON.stringify([(protos || []).map((p) => [p.class_id, p.view_count, p.view_expected, p.vectors, p.cad_status, p.cad_source, p.cad_path]), active]);
     if (sig === classSig) return;  // avoid rebuilding (and eating clicks on) the table at frame rate
     classSig = sig;
     const body = $('classRows');
@@ -554,7 +595,7 @@
       name.title = p.class_id + (p.created_at ? ' · enrolled ' + p.created_at : '');
       cell((p.category || '—').replace('_', ' ') + (p.phone_tier ? ' · ' + p.phone_tier.replace('_', ' ') : ''));
       const views = p.views ? Object.keys(p.views).join(', ') : '';
-      cell(`${p.view_count}/5${views ? ' (' + views + ')' : ''}`);
+      cell(`${p.view_count}/${p.view_expected || p.view_count}${views ? ' (' + views + ')' : ''}`);
       cell(p.cad_status === 'ready' || p.cad_path ? (p.cad_source || 'cached') + (p.cad_path ? ' · ' + p.cad_path.split('/').pop() : '') : 'missing',
         p.cad_status === 'ready' || p.cad_path ? 'cad-ready' : 'cad-missing');
       const tdR = document.createElement('td');
@@ -661,14 +702,18 @@
   function renderSteps(mv) {
     const box = $('steps');
     box.replaceChildren();
-    (mv.views || []).forEach((v) => {
+    const views = mv.views || [];
+    box.style.setProperty('--nsteps', Math.max(1, views.length));
+    $('wizSteps').textContent = mv.category ? `${mv.category.replace('_', ' ')}: ${views.length} views` : 'phone: 5 views · can / bottle: 4 views';
+    views.forEach((v) => {
       const d = document.createElement('div');
       d.className = 'step ' + (v.state === 'done' ? 'done' : v.state === 'current' ? 'current' : '');
       const pct = v.total ? Math.min(100, Math.round(100 * v.captured / v.total)) : 0;
-      d.innerHTML = `<b></b><div class="mute"></div><div class="bar"><div style="width:${pct}%"></div></div><div class="mute">${v.captured}/${v.total}` +
+      d.innerHTML = `<b></b><div class="tgt"></div><div class="mute ins"></div><div class="bar"><div style="width:${pct}%"></div></div><div class="mute">${v.captured}/${v.total}` +
         `${v.stability != null ? ' · stability ' + v.stability : ''}</div><div class="warn"></div>`;
       d.querySelector('b').textContent = v.title;
-      d.querySelector('.mute').textContent = v.state === 'current' ? v.instruction : '';
+      d.querySelector('.tgt').textContent = v.target || '';
+      d.querySelector('.ins').textContent = v.state === 'current' ? v.instruction : '';
       d.querySelector('.warn').textContent = v.warning || '';
       box.appendChild(d);
     });
@@ -699,10 +744,28 @@
     else { icon.textContent = '⟳'; icon.className = 'on rotate'; }
   }
 
+  // Physical pose -> <model-viewer>. Yaw / pitch drive the camera orbit (pitch > 0 = top tilted toward the camera, so
+  // the virtual camera rises: phi = 90 - pitch). Image roll (+ = clockwise as seen by the camera) is a rotation of the
+  // model about the virtual camera's viewing axis; model-viewer's `orientation` is "roll pitch yaw" =
+  // Euler(x=pitch, y=yaw, z=roll, 'YXZ') in model space, so convert the axis-angle rotation to that Euler triple.
+  function viewRollOrientation(thetaDeg, phiDeg, rollDeg) {
+    const D = Math.PI / 180, t = thetaDeg * D, p = phiDeg * D, a = -rollDeg * D;
+    const ax = Math.sin(p) * Math.sin(t), ay = Math.cos(p), az = Math.sin(p) * Math.cos(t);
+    const c = Math.cos(a), s = Math.sin(a), C = 1 - c;
+    const m11 = c + ax * ax * C, m13 = ax * az * C + ay * s, m21 = ay * ax * C + az * s, m22 = c + ay * ay * C;
+    const m23 = ay * az * C - ax * s, m31 = az * ax * C - ay * s, m33 = c + az * az * C;
+    const x = Math.asin(-Math.max(-1, Math.min(1, m23)));
+    let y, z;
+    if (Math.abs(m23) < 0.9999999) { y = Math.atan2(m13, m33); z = Math.atan2(m21, m22); }
+    else { y = Math.atan2(-m31, m11); z = 0; }
+    return `${(z / D).toFixed(1)}deg ${(x / D).toFixed(1)}deg ${(y / D).toFixed(1)}deg`;
+  }
+
   function applyPose() {
     if (!syncPose || !pose || !pose.valid) return;
-    viewer.cameraOrbit = `${pose.yaw}deg ${90 + pose.pitch}deg auto`;
-    viewer.setAttribute('orientation', `0deg 0deg ${pose.roll}deg`);
+    const phi = Math.max(15, Math.min(165, 90 - pose.pitch));
+    viewer.cameraOrbit = `${pose.yaw}deg ${phi}deg auto`;
+    viewer.setAttribute('orientation', viewRollOrientation(pose.yaw, phi, pose.roll));
   }
 
   function render(s) {
@@ -727,7 +790,7 @@
     $('tMargin').textContent = (marg * 100).toFixed(1) + '%';
     $('marginBar').style.width = marg * 100 + '%';
     $('viewPill').textContent = 'view: ' + (shown && s.best_view ? s.best_view : '—');
-    renderLeds(s.led);
+    renderLeds(s.led, s);
     renderClasses(s.bank, s.confirmed_label);
     renderSteps(s.multiview);
 
@@ -746,16 +809,41 @@
     applyPose();
   }
 
-  let offlinePrompted = '', uploadBusy = false;
+  let offlinePrompted = '', uploadBusy = false, srcSig = '', orientBusy = false;
+  function renderSources(m) {
+    const sel = $('srcSel');
+    const sig = JSON.stringify([m.sources, m.source_names]);
+    if (sig !== srcSig && m.sources) {
+      srcSig = sig;
+      const names = m.source_names || {};
+      sel.replaceChildren(...m.sources.map((k) => {
+        const o = document.createElement('option'); o.value = k; o.textContent = 'Source: ' + (names[k] || k); return o;
+      }));
+    }
+    if (document.activeElement !== sel) sel.value = m.source;
+  }
+
+  function renderOrient(s, glb) {
+    const bar = $('orientBar');
+    bar.style.display = glb ? '' : 'none';
+    if (!glb) return;
+    const o = s.asset_orientation;
+    bar.querySelectorAll('button').forEach((b) => { b.disabled = orientBusy; });
+    const pill = $('orientPill');
+    pill.textContent = !o || o.identity ? 'frame: as authored' : 'frame: ' + (o.description || 'rotated');
+    pill.className = 'pill' + (o && !o.identity ? ' on' : '');
+    pill.title = (o && o.note) || 'Rotations are applied to the model frame on disk and persist; licence credit notes the modification.';
+  }
+
   function renderCad(s, name, glb) {
     const m = s.cad_mode;
     const offline = !!(m && m.offline);
     if (m) {
       $('modeOn').classList.toggle('on', !offline);
       $('modeOff').classList.toggle('on', offline);
-      if (document.activeElement !== $('srcSel')) $('srcSel').value = m.source;
+      renderSources(m);
     }
-    const nf = !!name && s.asset_status === 'not_found';
+    const nf = !!name && (s.asset_status === 'not_found' || s.asset_status === 'offline_missing');
     $('emptyStage').classList.toggle('show', !name);
     $('notFound').classList.toggle('show', nf);
     $('estBadge').classList.toggle('show', !!glb && !!s.asset_badge);
@@ -763,21 +851,53 @@
     $('nfOnline').style.display = offline ? '' : 'none';
     $('nfBrowse').style.display = offline ? 'none' : '';
     $('nfGen').style.display = offline ? 'none' : '';
+    renderOrient(s, glb);
     if (nf && !uploadBusy) {
       $('nfTitle').textContent = s.asset_title || name;
       const why = s.asset_reason || 'No verified 3D model matches this object.';
-      const next = offline ? ' Offline mode searches the local cache only.'
+      const next = offline ? ' Offline mode makes zero network requests: upload a .glb or switch to Online Search.'
         : ' Pick a ranked online option, upload your own .glb, or generate geometry from verified published dimensions.';
       if ($('nfReason').dataset.busy !== '1') $('nfReason').textContent = why + next;
     }
     const st = !name ? 'CAD: —' : glb ? `CAD: ${s.asset_badge ? 'estimated' : 'verified'}` : `CAD: ${String(s.asset_status || '').replace('_', ' ')}`;
-    $('cadPill').textContent = st + (m ? ` · ${m.mode}` : '');
+    const net = m && m.network;
+    const blocked = offline && net && net.blocked ? ` · ${net.blocked} net req blocked` : '';
+    $('cadPill').textContent = st + (m ? ` · ${m.mode}` : '') + blocked;
     $('cadPill').className = 'pill' + (glb ? ' on' : nf ? ' warn' : '');
     if (nf && offline && offlinePrompted !== name && !$('modal').classList.contains('show')) {
       offlinePrompted = name;
-      modal('No local 3D model found', `"${s.asset_title || name}" has no verified model in the local cache. Switch to Online Search?`, null,
-        [['Stay offline', 'ghost', closeModal], ['Switch to Online Search', '', () => { closeModal(); setMode('online'); }]]);
+      modal('No local CAD model', `"${s.asset_title || name}" has no local CAD model. Switch to Online Search mode to query repositories?`, null,
+        [['Stay offline', 'ghost', closeModal], ['Switch to Online & Fetch', '', () => { closeModal(); setMode('online'); }]]);
     }
+  }
+
+  async function orientCad(body) {
+    const id = activeName();
+    if (!id || orientBusy) return;
+    orientBusy = true;
+    $('orientBar').querySelectorAll('button').forEach((b) => { b.disabled = true; });
+    const j = await post(`/api/classes/${encodeURIComponent(id)}/cad_orient`, body);
+    orientBusy = false;
+    if (j.ok && j.orientation) {
+      $('enrollMsg').textContent = `Model frame for ${id}: ${j.orientation.description || 'updated'}.`;
+      lastSrc = '';  // force model-viewer to reload the rewritten GLB
+    }
+    pullState();
+  }
+  $('orientBar').querySelectorAll('button').forEach((b) => {
+    b.onclick = () => orientCad(b.dataset.op === 'auto' ? { auto: true } : b.dataset.op === 'reset' ? { reset: true } : { axis: b.dataset.axis, deg: 90 });
+  });
+
+  const SWATCH = { red: '#e11d2a', orange: '#f97316', yellow: '#facc15', lime: '#84cc16', green: '#16a34a', teal: '#14b8a6',
+    cyan: '#06b6d4', blue: '#2563eb', violet: '#7c3aed', purple: '#9333ea', magenta: '#d946ef', pink: '#ec4899',
+    black: '#0a0a0a', 'silver/grey': '#9ca3af', white: '#f8fafc' };
+  function chip(box, text, cls, title) {
+    const c = document.createElement('span');
+    c.className = 'chip' + (cls ? ' ' + cls : '');
+    c.textContent = text;
+    if (title) c.title = title;
+    box.appendChild(c);
+    return c;
   }
 
   function renderSignals(s) {
@@ -788,23 +908,69 @@
     lp.className = 'pill' + (!known ? '' : li.ok ? ' on' : ' bad');
     const box = $('ocrChips');
     const o = s.ocr;
-    const sig = JSON.stringify(o ? [o.texts, o.applied, o.s_text] : null);
+    const sig = JSON.stringify(o ? [o.texts, o.corrections, o.applied, o.s_vision, o.s_text, o.s_color, o.fused, o.color, o.label] : null);
     if (box.dataset.sig === sig) return;
     box.dataset.sig = sig;
     box.replaceChildren();
     if (!o) return;
+    const f2 = (x) => (x == null ? '—' : Number(x).toFixed(2));
+    if (o.fused != null) {
+      const w = o.weights || {};
+      chip(box, `${o.label || '?'} · fused ${(o.fused * 100).toFixed(0)}% = V ${f2(o.s_vision)} · T ${f2(o.s_text)} · C ${f2(o.s_color)}`, o.applied ? 'hit' : '',
+        `FinalScore = ${w.vision} × vision + ${w.text} × OCR text + ${w.color} × colour on calibrated scores; a missing modality drops out and is renormalised`);
+    }
+    if (o.color) {
+      const c = chip(box, o.color, '', 'Dominant tone of the crop (soft-binned hue / achromatic histogram)');
+      const sw = document.createElement('span');
+      sw.className = 'swatch';
+      sw.style.background = SWATCH[o.color] || '#64748b';
+      c.prepend(sw);
+    }
     const lab = document.createElement('span');
     lab.className = 'mute';
-    lab.textContent = o.texts && o.texts.length ? `OCR${o.applied && o.s_text != null ? ' · S_text ' + Number(o.s_text).toFixed(2) : ''}:` : 'OCR: no text in view';
+    lab.textContent = o.texts && o.texts.length ? `OCR ${Math.round(o.ms || 0)} ms:` : 'OCR: no text in view';
     box.appendChild(lab);
-    (o.texts || []).slice(0, 6).forEach((t) => {
-      const c = document.createElement('span');
-      c.className = 'chip' + (o.applied && o.s_text > 0 ? ' hit' : '');
-      c.textContent = t;
-      box.appendChild(c);
+    (o.texts || []).slice(0, 6).forEach((t) => chip(box, t, o.applied && o.s_text > 0 ? 'hit' : ''));
+    (o.corrections || []).slice(0, 6).forEach((pair) => {
+      const [from, to] = Array.isArray(pair) ? pair : [pair.from, pair.to];
+      if (!from || !to) return;
+      const c = chip(box, '', 'fix', 'Fuzzy glyph correction against the enrolled brand vocabulary');
+      const del = document.createElement('s'); del.textContent = from;
+      c.append(del, ' → ' + to);
     });
   }
 
+  let focusInfo = null;
+  function renderFocus(f) {
+    focusInfo = f;
+    const ok = !!(f && f.ok && f.supported);
+    $('focusAuto').disabled = !(ok && f.auto_supported);
+    $('focusMan').disabled = !ok;
+    $('focusAuto').classList.toggle('on', ok && !!f.auto);
+    $('focusMan').classList.toggle('on', ok && !f.auto);
+    const r = $('focusVal');
+    if (ok) { r.min = f.min; r.max = f.max; r.step = f.step || 1; if (document.activeElement !== r && f.value != null) r.value = f.value; }
+    r.disabled = !ok || !!f.auto;
+    $('focusNum').textContent = ok && f.value != null ? f.value : '—';
+    $('focusNote').textContent = !f ? 'receiver unreachable' : ok ? `${f.camera || f.device}` : (f.reason || f.error || 'focus control unavailable');
+    $('focusRow').classList.toggle('off', !ok);
+  }
+  async function getFocus() {
+    try { renderFocus(await (await fetch('/api/camera/focus', { cache: 'no-store' })).json()); } catch (e) { renderFocus(null); }
+  }
+  async function setFocus(body) {
+    try {
+      const j = await (await fetch('/api/camera/focus', { method: 'POST', body: JSON.stringify(body) })).json();
+      if (j.ok) { renderFocus(j); return; }
+      await getFocus();
+      $('focusNote').textContent = j.error || 'focus change rejected';
+    } catch (e) { renderFocus(null); }
+  }
+  $('focusAuto').onclick = () => setFocus({ auto: true });
+  $('focusMan').onclick = () => setFocus({ auto: false, value: Number($('focusVal').value) });
+  $('focusVal').oninput = () => { $('focusNum').textContent = $('focusVal').value; };
+  $('focusVal').onchange = () => setFocus({ auto: false, value: Number($('focusVal').value) });
+  getFocus();
   function closeModal() { $('modal').classList.remove('show'); }
   function modal(head, sub, body, actions) {
     $('mHead').textContent = head;
@@ -868,7 +1034,7 @@
   async function browse() {
     const id = activeName();
     if (!id) return;
-    const src = $('srcSel').value === 'local' ? 'auto' : $('srcSel').value;
+    const src = ['local', 'upload'].includes($('srcSel').value) ? 'auto' : $('srcSel').value;
     const grid = document.createElement('div');
     grid.className = 'cands';
     grid.textContent = 'Searching Sketchfab / Poly Pizza…';

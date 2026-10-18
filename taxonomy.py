@@ -8,34 +8,67 @@ from __future__ import annotations
 import re
 
 CATEGORIES = ("beverage_can", "beverage_bottle", "smartphone")
-# Four cardinal yaw views (front 0, right 90, back 180, left 270) make the yaw circle unambiguous - a single "side"
-# view cannot tell a +90 from a -90 turn - and "top" (tilted 30-45 deg) anchors pitch.
+# Every view key a class can hold. Four cardinal yaw views (front 0, right 90, back 180, left 270) make the yaw circle
+# unambiguous and "top" (tilted 35-45 deg) anchors pitch. Which of them the guided wizard captures, in which order and
+# with which prompt is category-specific (WIZARD_VIEWS / view_step): a can is rotationally near-symmetric, so its
+# "side seam" step is stored as the +90 "right" view and it has no separate left view.
 VIEWS = ("front", "right", "back", "left", "top")
 VIEW_YAW = {"front": 0.0, "right": 90.0, "back": 180.0, "left": 270.0}
 LEGACY_VIEW_ALIASES = {"detail": "top", "side": "right"}
 
+WIZARD_VIEWS = {
+    "smartphone": ("front", "back", "right", "left", "top"),
+    "beverage_can": ("front", "back", "right", "top"),
+    "beverage_bottle": ("front", "back", "right", "top"),
+}
+
+# (title, prompt, what the step must capture)
 VIEW_STEPS = {
     "beverage_can": {
-        "front": ("Front (0?)", "Face the main label / branding toward the camera."),
-        "right": ("Right (90?)", "Turn the can a quarter-turn clockwise (seen from above)."),
-        "back": ("Back (180?)", "Keep turning to show the barcode and nutrition facts."),
-        "left": ("Left (270?)", "One more quarter-turn clockwise to show the other side."),
-        "top": ("Top (tilt 30-45?)", "Tilt the can toward the camera to show the pull-tab."),
+        "front": ("Front branding (0°)", "Position the main brand logo directly facing the camera, centered and upright.",
+                  "Primary brand graphics and flavour name."),
+        "back": ("Rear panel (180°)", "Rotate the can 180°. Show the nutrition facts grid, barcode and manufacturer text.",
+                 "Ingredients table, barcode, regulatory markings."),
+        "right": ("Side seam (90°)", "Turn the can 90°. Show the lateral seam, volume markings and side artwork.",
+                  "Cylindrical curvature, side packaging text."),
+        "left": ("Other side (270°)", "Turn the can 90° the other way to show the remaining side artwork.",
+                 "Opposite side artwork."),
+        "top": ("Top rim & pull-tab (tilt 35-45°)",
+                "Tilt the top of the can 35-45° toward the camera to reveal the pull-tab and lid opening.",
+                "Pull-tab colour / style, stay-on tab geometry, aluminium rim."),
     },
     "beverage_bottle": {
-        "front": ("Front (0?)", "Face the main label toward the camera."),
-        "right": ("Right (90?)", "Turn the bottle a quarter-turn clockwise (seen from above)."),
-        "back": ("Back (180?)", "Keep turning to show the barcode and nutrition facts."),
-        "left": ("Left (270?)", "One more quarter-turn clockwise to show the other side."),
-        "top": ("Cap (tilt 30-45?)", "Tilt the bottle so the cap and neck face the camera."),
+        "front": ("Front label (0°)", "Face the main label directly toward the camera, centered and upright.",
+                  "Brand label and flavour name."),
+        "back": ("Rear label (180°)", "Rotate the bottle 180°. Show the nutrition facts and barcode.",
+                 "Ingredients table, barcode."),
+        "right": ("Side (90°)", "Turn the bottle 90° to show its side profile and label edge.", "Bottle profile."),
+        "left": ("Other side (270°)", "Turn the bottle 90° the other way.", "Opposite side."),
+        "top": ("Cap & neck (tilt 35-45°)", "Tilt the bottle 35-45° so the cap and neck face the camera.",
+                "Cap colour and shape."),
     },
     "smartphone": {
-        "front": ("Front (0?)", "Show the screen side facing the camera."),
-        "right": ("Right edge (90?)", "Turn the phone a quarter-turn to show its right edge / button rail."),
-        "back": ("Back (180?)", "Keep turning to show the rear shell and camera island."),
-        "left": ("Left edge (270?)", "One more quarter-turn to show the left edge."),
-        "top": ("Camera island (tilt)", "Tilt the back 30-45? toward the camera so the lens island fills the box."),
+        "front": ("Front face (display)", "Face the screen directly toward the camera, centered and upright.",
+                  "Screen surface, bezels, Dynamic Island / punch-hole camera."),
+        "back": ("Rear shell (180°)", "Rotate the phone 180°. Show the rear glass, camera bump, lenses and flash.",
+                 "Lens cluster, LiDAR / sensors, rear logo."),
+        "right": ("Right rail (90°)", "Turn the phone 90° so its right edge faces the camera.",
+                  "Button placement, rail curvature, frame material."),
+        "left": ("Left rail (270°)", "Turn the phone 90° the other way so its left edge faces the camera.",
+                 "Left-rail buttons, antenna bands."),
+        "top": ("Camera cluster (tilt 35-45°)",
+                "Tilt the phone's top edge 35-45° toward the camera to expose lens elevation and depth.",
+                "Periscope cut-out, lens ring height, 3D contours."),
     },
+}
+# Where the physical buttons really are, so the rail prompts name a feature the user can see instead of a rotation
+# direction ("clockwise" is ambiguous depending on whether you look from above or from the camera).
+PHONE_RAILS = {
+    "Apple": {"right": ("with the side (power) button", "Side button, rail curvature, frame material."),
+              "left": ("with the volume buttons and Action button / mute switch",
+                       "Volume buttons, Action button / mute switch, antenna bands.")},
+    "Samsung": {"right": ("with the power and volume keys", "Power + volume keys, rail curvature, frame material."),
+                "left": ("(no buttons - antenna bands only)", "Plain rail, antenna bands, frame material.")},
 }
 
 MSG_PHONE_FLIP = "Front screen detected. Flip phone 180° to expose camera island."
@@ -304,5 +337,22 @@ def canonical_view(name: str) -> str:
     return LEGACY_VIEW_ALIASES.get(name, name)
 
 
-def view_step(category: str, view: str) -> tuple[str, str]:
-    return VIEW_STEPS.get(category, VIEW_STEPS["beverage_can"])[view]
+def wizard_views(category: str | None) -> tuple[str, ...]:
+    """Ordered view keys the guided enrollment captures for a category."""
+    return WIZARD_VIEWS.get(category or "", WIZARD_VIEWS["beverage_can"])
+
+
+def view_step(category: str, view: str, brand: str = "") -> tuple[str, str]:
+    """(title, prompt) for one wizard step; phone rail prompts name the brand's real buttons."""
+    title, prompt, _ = view_detail(category, view, brand)
+    return title, prompt
+
+
+def view_detail(category: str, view: str, brand: str = "") -> tuple[str, str, str]:
+    """(title, prompt, capture target) for one wizard step."""
+    title, prompt, target = VIEW_STEPS.get(category, VIEW_STEPS["beverage_can"])[view]
+    rails = PHONE_RAILS.get(brand) if category == "smartphone" else None
+    if rails and view in rails:
+        desc, target = rails[view]
+        prompt = f"Turn the phone 90° so its {view} edge {desc} faces the camera."
+    return title, prompt, target

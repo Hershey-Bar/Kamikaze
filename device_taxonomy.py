@@ -1,7 +1,7 @@
 """Structural smartphone taxonomy, asymmetric phone view weighting and detector domain gating for Kamikaze.
 
 Pure Python (no torch / network). receiver.py uses it to
-  * score smartphone classes with rear-camera-weighted view centroids (the front screen carries little identity),
+  * score smartphone classes by their best-fit view centroid (optionally reliability-discounted, KAMIKAZE_VIEW_KAPPA),
   * cap confidence and prompt a flip when the live frame matches a phone's screen better than its back,
   * pick tier-specific orientation prompts when two enrolled phones are too close to call,
   * restrict the prototype search to the domain the NPU object detector reports (detector = domain gate only).
@@ -9,6 +9,7 @@ Pure Python (no torch / network). receiver.py uses it to
 
 from __future__ import annotations
 
+import os
 import re
 
 PHONE_STRUCTURAL_TAXONOMY = {
@@ -62,10 +63,11 @@ PHONE_STRUCTURAL_TAXONOMY = {
 PHONE_VIEW_WEIGHTS = {"back": 0.65, "right": 0.15, "left": 0.15, "side": 0.15, "top": 0.10, "front": 0.10}
 
 # A weighted *average* of view similarities can never be high for a single physical pose (the camera sees one side at
-# a time), so the weights are applied as per-view reliability: the back view is trusted fully and every other view is
-# discounted in proportion to its weight relative to the back. kappa = 0.25 puts side at 0.81 and top / front at 0.79,
-# which keeps them below the IDENTIFIED floor (calibrated 0.70 needs raw 0.856) - only the rear shell can verify a phone.
-VIEW_RELIABILITY_KAPPA = 0.25
+# a time), so identity is the best-fit enrolled view (max over view centroids). The weights survive only as an optional
+# per-view reliability discount: kappa > 0 multiplies a view's similarity by 1 - kappa (1 - w / w_back). It defaults to
+# 0 - on-board data showed a 0.81x rail / 0.79x top discount pushed a correctly presented phone (raw 0.80-0.85) to
+# ~45%; the front screen is handled by FRONT_CONFIDENCE_CAP + the flip hint and phone-vs-phone by the top-2 margin.
+VIEW_RELIABILITY_KAPPA = float(os.environ.get("KAMIKAZE_VIEW_KAPPA", "0"))
 
 FRONT_CONFIDENCE_CAP = 0.35
 MSG_FRONT_SCREEN = "Front screen detected. Flip phone 180° to expose camera island."

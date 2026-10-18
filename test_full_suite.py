@@ -21,9 +21,12 @@ from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 import cad_harvester
 import device_taxonomy
 import entity_resolver
+import glb_orient
 import mcp_server
 import procedural_glb
 import spec_search
@@ -327,6 +330,102 @@ class SpecGlbTests(unittest.TestCase):
             procedural_glb.build_from_spec({"verified": False, "category": "beverage_can", "reason": "volume unknown"})
 
 
+class GlbOrientTests(unittest.TestCase):
+    """Repository models arrive in arbitrary frames; glb_orient stands them up without touching the mesh data."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def authored(self, data: bytes, axis: str, deg: float) -> Path:
+        """Write `data` as if its author had exported it tilted by `deg` about `axis` (Z-up export, phone lying flat)."""
+        path = Path(self.tmp.name) / f"m{len(list(Path(self.tmp.name).iterdir()))}.glb"
+        path.write_bytes(data)
+        doc, chunks = glb_orient.read_glb(path)
+        scene = doc["scenes"][doc.get("scene", 0)]
+        doc["nodes"].append({"name": "author_root", "children": scene["nodes"],
+                             "rotation": glb_orient.matrix_to_quat(glb_orient.axis_rotation(axis, deg))})
+        scene["nodes"] = [len(doc["nodes"]) - 1]
+        glb_orient.write_glb(path, doc, chunks)
+        return path
+
+    def extent(self, path: Path):
+        lo, hi = glb_orient.world_bounds(glb_orient.read_glb(path)[0], skip_wrapper=False)
+        return hi - lo
+
+    def test_z_up_can_is_stood_up_and_binary_is_untouched(self):
+        path = self.authored(procedural_glb.build_can_spec(66.0, 115.2, 54.0), "x", 90)
+        self.assertEqual(int(self.extent(path).argmax()), 2)  # lying along Z as exported
+        bin_before = glb_orient.read_glb(path)[1]
+        info = glb_orient.auto_orient(path, "beverage_can")
+        self.assertTrue(info["changed"])
+        self.assertFalse(info["identity"])
+        ext = self.extent(path)
+        self.assertEqual(int(ext.argmax()), 1)
+        self.assertAlmostEqual(float(ext[1]), 0.1152, delta=0.002)  # + pull tab
+        self.assertEqual(glb_orient.read_glb(path)[1], bin_before)
+        self.assertTrue(cad_harvester.validate_glb(path)[0])
+        self.assertFalse(glb_orient.auto_orient(path, "beverage_can")["changed"])  # idempotent
+
+    def test_flat_phone_gets_height_up_and_thickness_in_depth(self):
+        data = procedural_glb.build_from_spec(SpecGlbTests.S25U, "galaxy s25 ultra")
+        path = self.authored(data, "x", -90)
+        glb_orient.auto_orient(path, "smartphone")
+        ext = self.extent(path) * 1000
+        self.assertAlmostEqual(float(ext[1]), 162.8, delta=1.0)
+        self.assertLess(float(ext[2]), 20.0)
+        self.assertGreater(float(ext[0]), 70.0)
+
+    def test_upright_model_is_left_alone(self):
+        path = Path(self.tmp.name) / "up.glb"
+        path.write_bytes(procedural_glb.build_can_spec(66.0, 115.2, 54.0))
+        before = path.read_bytes()
+        info = glb_orient.auto_orient(path, "beverage_can")
+        self.assertEqual((info["changed"], info["identity"]), (False, True))
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_manual_rotate_accumulates_and_reset_restores(self):
+        path = Path(self.tmp.name) / "r.glb"
+        path.write_bytes(procedural_glb.build_can_spec(66.0, 115.2, 54.0))
+        ext0 = self.extent(path)
+        glb_orient.rotate(path, "x", 90)
+        self.assertEqual(int(self.extent(path).argmax()), 2)
+        info = glb_orient.rotate(path, "x", 90)
+        self.assertIn("180", info["description"])
+        self.assertTrue(glb_orient.reset(path)["identity"])
+        np.testing.assert_allclose(self.extent(path), ext0, atol=1e-6)
+        self.assertTrue(cad_harvester.validate_glb(path)[0])
+        with self.assertRaises(ValueError):
+            glb_orient.rotate(path, "w", 90)
+
+    def test_quaternion_round_trip(self):
+        for axis in "xyz":
+            for deg in (90, 180, -90, 30):
+                m = glb_orient.axis_rotation(axis, deg)
+                np.testing.assert_allclose(glb_orient.quat_to_matrix(glb_orient.matrix_to_quat(m)), m, atol=1e-7)
+        self.assertEqual(len(glb_orient.ROTATIONS), 24)
+
+    def test_reorient_marks_downloaded_model_modified_in_credit(self):
+        with tempfile.TemporaryDirectory() as models, mock.patch.object(cad_harvester.mcp, "MODELS_DIR", Path(models)):
+            cid = "orient_test_can"
+            cad_harvester.upload_glb(cid, procedural_glb.build_can_spec(66.0, 115.2, 54.0), "c.glb", "Test can",
+                                     "beverage_can")
+            attr = cad_harvester.read_attribution(cid)
+            attr.update({"source_key": "sketchfab", "attribution_text": "\u201cCan\u201d by someone - CC BY"})
+            cad_harvester._write_json(cad_harvester.sidecar_path(cid), attr)
+            cad_harvester.reorient(cid, "rotate", "y", 180)
+            attr = cad_harvester.read_attribution(cid)
+            self.assertTrue(attr["modified"])
+            self.assertFalse(attr["orientation_fix"]["identity"])
+            self.assertIn("re-oriented", cad_harvester.attribution_line(attr))
+            cad_harvester.reorient(cid, "reset")
+            attr = cad_harvester.read_attribution(cid)
+            self.assertFalse(attr["modified"])
+            self.assertNotIn("re-oriented", cad_harvester.attribution_line(attr))
+            with self.assertRaises(FileNotFoundError):
+                cad_harvester.reorient("never_cached", "auto")
+
+
 class SpecSearchTests(unittest.TestCase):
     PAGE = ('<td class="nfo" data-spec="dimensions">162.8 x 77.6 x 8.2 mm (6.41 x 3.06 x 0.32 in)</td>'
             '<td class="nfo" data-spec="weight">218 g (7.69 oz)</td>'
@@ -400,10 +499,10 @@ class CadCacheTests(unittest.TestCase):
         self.assertFalse(cad_harvester.glb_path(cid).exists())
         self.assertIsNone(cad_harvester.read_attribution(cid))
 
-    def test_offline_without_cache_is_not_found(self):
+    def test_offline_without_cache_is_offline_missing(self):
         prod = self.product("coke zero can 330ml", "offline_can")
         out = cad_harvester.harvest(prod, offline=True)
-        self.assertEqual((out["status"], out["glb_url"]), ("not_found", ""))
+        self.assertEqual((out["status"], out["glb_url"]), ("offline_missing", ""))
         self.assertIn("offline", out["reason"])
         self.assert_no_model(prod.class_id)
         self.assertEqual(cad_harvester.harvest(prod, source="local")["status"], "not_found")
@@ -447,7 +546,7 @@ class CadCacheTests(unittest.TestCase):
         cad_harvester.upload_glb(prod.class_id, self.GOOD, "x.glb")
         cad_harvester.sidecar_path(prod.class_id).unlink()
         out = cad_harvester.harvest(prod, offline=True)
-        self.assertEqual(out["status"], "not_found")
+        self.assertEqual(out["status"], "offline_missing")
         self.assertFalse(cad_harvester.glb_path(prod.class_id).exists())
 
     def test_credits_listing_includes_author_and_licence(self):
@@ -529,7 +628,7 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         status, st = self.call("POST", "/api/enroll/start", {"raw_name": name, "frames_per_view": frames, **meta})
         self.assertEqual(status, 200, st)
         base = tc.unit(seed)
-        for i, view in enumerate(taxonomy.VIEWS):
+        for i, view in enumerate(st["steps"]):
             self.assertEqual(self.call("POST", "/api/enroll/capture", {"view": view})[0], 200)
             vec = torch.nn.functional.normalize(base + 0.6 * tc.unit(seed * 10 + i), dim=0)
             for k in range(frames):
@@ -1352,21 +1451,28 @@ class DeviceTaxonomyTests(unittest.TestCase):
     """Phone tiers, rear-weighted view reliability, front-screen detection and the detector domain gate."""
 
     def test_view_reliability_ranks_back_first(self):
-        rel = {v: device_taxonomy.view_reliability(v) for v in ("back", "right", "top", "front")}
-        self.assertEqual(rel["back"], 1.0)
-        self.assertGreater(rel["right"], rel["top"])
-        self.assertEqual(device_taxonomy.view_reliability("left"), rel["right"])
-        self.assertAlmostEqual(rel["top"], rel["front"])
-        self.assertEqual(device_taxonomy.view_reliability(None), 1.0)
-        self.assertEqual(device_taxonomy.view_reliability("global"), 1.0)
+        # Default (kappa 0): matching is a plain max over view centroids - every view counts equally.
+        for v in ("back", "right", "left", "top", "front", None, "global"):
+            self.assertEqual(device_taxonomy.view_reliability(v), 1.0)
+        with mock.patch.object(device_taxonomy, "VIEW_RELIABILITY_KAPPA", 0.25):
+            rel = {v: device_taxonomy.view_reliability(v) for v in ("back", "right", "top", "front")}
+            self.assertEqual(rel["back"], 1.0)
+            self.assertGreater(rel["right"], rel["top"])
+            self.assertEqual(device_taxonomy.view_reliability("left"), rel["right"])
+            self.assertAlmostEqual(rel["top"], rel["front"])
+            self.assertEqual(device_taxonomy.view_reliability(None), 1.0)
+            self.assertEqual(device_taxonomy.view_reliability("global"), 1.0)
 
     def test_weighted_phone_score_prefers_back(self):
-        score, view = device_taxonomy.weighted_phone_score({"back": 0.80, "front": 0.85})
-        self.assertEqual(view, "back")
-        self.assertAlmostEqual(score, 0.80)
         score, view = device_taxonomy.weighted_phone_score({"back": 0.40, "front": 0.90})
-        self.assertEqual(view, "front")
-        self.assertLess(score, 0.90)
+        self.assertEqual((view, score), ("front", 0.90))  # default: max over views
+        with mock.patch.object(device_taxonomy, "VIEW_RELIABILITY_KAPPA", 0.25):
+            score, view = device_taxonomy.weighted_phone_score({"back": 0.80, "front": 0.85})
+            self.assertEqual(view, "back")
+            self.assertAlmostEqual(score, 0.80)
+            score, view = device_taxonomy.weighted_phone_score({"back": 0.40, "front": 0.90})
+            self.assertEqual(view, "front")
+            self.assertLess(score, 0.90)
         self.assertAlmostEqual(device_taxonomy.weighted_average({"back": 1.0, "front": 0.0}), 0.65 / 0.75)
 
     def test_front_dominates(self):

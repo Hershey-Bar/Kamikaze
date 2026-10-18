@@ -43,6 +43,7 @@ from typing import Any
 import msgpack
 from mcp.server.fastmcp import FastMCP
 
+import netguard
 
 def load_dotenv(path: Path | None = None) -> int:
     """Load KEY=VALUE pairs from .env next to this file into os.environ (never overrides real variables)."""
@@ -231,6 +232,7 @@ _online_cache_lock = threading.Lock()
 
 
 def _http_json(url: str, headers: dict[str, str] | None = None, timeout: float = HTTP_TIMEOUT) -> Any:
+    netguard.check(url)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json", **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
@@ -373,6 +375,7 @@ def download_glb(url: str, slug: str) -> Path | None:
         tmp = dest.with_suffix(".part")
         try:
             MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            netguard.check(url)
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp, open(tmp, "wb") as out:
                 total = 0

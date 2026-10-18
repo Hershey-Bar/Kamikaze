@@ -47,6 +47,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import entity_resolver
+import glb_orient
 import mcp_server as mcp
 import procedural_glb
 import spec_search
@@ -69,7 +70,8 @@ TIER_CONFLICT = 6.0
 POLY_PIZZA_SEARCH = "https://api.poly.pizza/v1.1/search/{query}"
 LEVEL_SCORE = {"exact": 0.0, "similar": 30.0, "category": 10.0}
 PROVIDERS = ("sketchfab", "polypizza")
-SOURCES = ("auto", "sketchfab", "polypizza", "local")
+SOURCES = ("auto", "sketchfab", "polypizza", "local", "upload")
+OFFLINE_SOURCES = ("local", "upload")  # the only sources that make no network request (dashboard Offline mode)
 SPEC_BADGE = "Estimated Model: Dimensionally Calibrated via Spec Search"
 
 PHONE_TIERS = {"pro", "max", "plus", "ultra", "mini", "fe", "edge", "air", "lite"}
@@ -181,8 +183,10 @@ def _write_json(path: Path, data: dict) -> None:
 
 def attribution_line(attr: dict) -> str:
     """One-line human credit: '"Coke Zero" by <author> (<url>) - licensed under CC Attribution (<url>) - via Sketchfab (<url>)'."""
+    changed = " - modified: re-oriented by Kamikaze" if (
+        attr.get("modified") and (attr.get("orientation_fix") or {}).get("identity") is False) else ""
     if attr.get("attribution_text"):
-        return str(attr["attribution_text"])
+        return str(attr["attribution_text"]) + changed
     title = attr.get("title") or "Untitled"
     author = attr.get("author") or "unknown author"
     parts = [f"\u201c{title}\u201d by {author}" + (f" ({attr['author_url']})" if attr.get("author_url") else "")]
@@ -190,7 +194,7 @@ def attribution_line(attr: dict) -> str:
         parts.append(f"licensed under {attr['license']}" + (f" ({attr['license_url']})" if attr.get("license_url") else ""))
     if attr.get("source"):
         parts.append(f"via {attr['source']}" + (f" ({attr['source_url']})" if attr.get("source_url") else ""))
-    return " - ".join(parts)
+    return " - ".join(parts) + changed
 
 
 def credits() -> list[dict]:
@@ -677,7 +681,7 @@ def _search_polypizza(product, queries: list[str], level: str, deadline: float) 
     return list(best.values())
 
 
-SOURCE_NAMES = {"sketchfab": "Sketchfab", "polypizza": "Poly Pizza"}
+SOURCE_NAMES = {"sketchfab": "Sketchfab", "polypizza": "Poly Pizza", "local": "Local Cache", "upload": "Custom Scan Upload"}
 
 
 def _fetch(cand: Candidate, slug: str) -> bool:
@@ -805,9 +809,9 @@ def _providers(source: str) -> tuple[str, ...]:
         return PROVIDERS
     if source in PROVIDERS:
         return (source,)
-    if source == "local":
+    if source in OFFLINE_SOURCES:
         return ()
-    raise ValueError(f"unknown CAD source {source!r} (auto, sketchfab, polypizza, local)")
+    raise ValueError(f"unknown CAD source {source!r} ({', '.join(SOURCES)})")
 
 
 def _result(product, attr: dict, status: str, source: str, cached: bool, query: str = "") -> dict:
@@ -819,15 +823,64 @@ def _result(product, attr: dict, status: str, source: str, cached: bool, query: 
     }
 
 
-def not_found(class_id: str, title: str, reason: str) -> dict:
-    """The explicit NOT_FOUND outcome: no model is shown rather than a substitute."""
-    return {"class_id": class_id, "title": title, "glb_url": "", "status": "not_found", "source": "none", "query": "",
+def not_found(class_id: str, title: str, reason: str, status: str = "not_found") -> dict:
+    """The explicit NOT_FOUND outcome: no model is shown rather than a substitute. status "offline_missing" = nothing
+    is cached locally and Offline mode forbids searching online."""
+    return {"class_id": class_id, "title": title, "glb_url": "", "status": status, "source": "none", "query": "",
             "cached": False, "attribution": {}, "credit": "", "thumbnail_url": "", "match": "", "badge": "",
             "reason": reason}
 
 
+def _auto_orient(class_id: str, category: str | None) -> dict | None:
+    """Stand a freshly landed GLB up for its category (glb_orient). Never fails the landing."""
+    try:
+        info = glb_orient.auto_orient(glb_path(class_id), category)
+    except (OSError, ValueError) as exc:
+        log.warning("auto-orient skipped for %s: %s", class_id, exc)
+        return None
+    if info.get("changed"):
+        log.info("CAD %s auto-oriented: %s (%s)", class_id, info["description"], info["note"])
+    return info
+
+
+def _orientation_fields(info: dict | None) -> dict:
+    if not info:
+        return {}
+    out = {"orientation_fix": {k: info[k] for k in ("rotation", "description", "note", "identity")}}
+    if not info.get("identity"):
+        out["modified"] = True  # CC-BY: indicate that the model was changed (re-oriented)
+    return out
+
+
+def reorient(class_id: str, op: str, axis: str = "y", deg: float = 90.0, category: str | None = None) -> dict:
+    """Dashboard orientation fix for a cached GLB: op = "auto" | "rotate" | "reset" | "status". Updates the sidecar."""
+    path = glb_path(class_id)
+    if not mcp.is_valid_glb(path):
+        raise FileNotFoundError(f"no cached GLB for {class_id!r}")
+    with _lock_for(_slug(class_id)):
+        if op == "auto":
+            info = glb_orient.auto_orient(path, category)
+        elif op == "rotate":
+            info = glb_orient.rotate(path, axis, deg)
+        elif op == "reset":
+            info = glb_orient.reset(path)
+        elif op == "status":
+            return glb_orient.status(path)
+        else:
+            raise ValueError("op must be auto, rotate, reset or status")
+        attr = read_attribution(class_id)
+        if attr is not None:
+            attr["orientation_fix"] = _orientation_fields(info)["orientation_fix"]
+            if attr.get("source_key") not in ("upload", "spec_generated"):
+                attr["modified"] = not info.get("identity")  # CC-BY: indicate changes
+            _write_json(sidecar_path(class_id), attr)
+            write_credits_md()
+    return info
+
+
 def _finish(product, cand: Candidate, source_name: str, status: str, extra: dict | None = None) -> dict:
     attr = {**_record(product, cand, source_name), **(extra or {})}
+    attr.update(_orientation_fields(_auto_orient(product.class_id, product.category)))
     _write_json(sidecar_path(product.class_id), attr)
     write_credits_md()
     log.info("CAD for %s: %s | %s", product.class_id, source_name, attribution_line(attr))
@@ -839,9 +892,9 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
     """Resolve + cache a GLB for `product` (CanonicalProduct | metadata dict | free text) and write its attribution.
 
     Only exact-product matches are accepted automatically; similar / category models are offered through candidates()
-    for an explicit user choice. offline=True (or source="local") only consults the local cache.
-    Returns {"class_id", "title", "glb_url", "status": "online"|"cached"|"not_found", "source", "query", "cached",
-    "attribution", "credit", "reason"?}.
+    for an explicit user choice. offline=True (or source "local" / "upload") only consults the local cache and makes
+    no network request. Returns {"class_id", "title", "glb_url", "status": "online"|"cached"|"not_found"|
+    "offline_missing", "source", "query", "cached", "attribution", "credit", "reason"?}.
     """
     product = _coerce(product)
     providers = _providers(source)
@@ -858,9 +911,13 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
                 dest.unlink()  # a GLB without attribution cannot be shown - re-harvest it
             except OSError:
                 pass
-        if offline or not providers:
+        if offline:
             return not_found(product.class_id, product.canonical_name,
-                             "offline mode: no local 3D model is cached for this class")
+                             "offline mode: no local 3D model is cached for this class", "offline_missing")
+        if not providers:
+            return not_found(product.class_id, product.canonical_name,
+                             f"source {SOURCE_NAMES.get(source, source)}: no 3D model is cached for this class - "
+                             "upload a GLB or pick an online source")
         deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
         queries = [q for q, lv in search_plan(product) if lv == "exact"]
         found = None
@@ -924,7 +981,7 @@ def select(product, uid: str) -> dict:
         return _finish(product, cand, SOURCE_NAMES.get(cand.provider, cand.provider), "online", {"selected_by_user": True})
 
 
-def upload_glb(class_id: str, data: bytes, filename: str = "", title: str = "") -> dict:
+def upload_glb(class_id: str, data: bytes, filename: str = "", title: str = "", category: str | None = None) -> dict:
     """Install a user-supplied GLB for `class_id` after the quality gate. Raises ValueError when it is rejected."""
     slug = _slug(class_id)
     dest = glb_path(class_id)
@@ -946,6 +1003,9 @@ def upload_glb(class_id: str, data: bytes, filename: str = "", title: str = "") 
             "class_id": class_id, "match": "user", "quality": info, "filename": name,
             "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         }
+        info = _auto_orient(class_id, category)
+        if info:
+            attr["orientation_fix"] = _orientation_fields(info)["orientation_fix"]
         _write_json(sidecar_path(class_id), attr)
         write_credits_md()
     product = SimpleNamespace(class_id=class_id, canonical_name=title or class_id)

@@ -354,21 +354,39 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(out["state"], receiver.GUIDING)
 
     def test_background_cosine_calibrates_low_and_smooth(self):
-        for raw in (-0.3, 0.0, 0.38, 0.45, 0.52):
+        # Measured on the board: idle room 0.40-0.48, empty scene 0.13-0.30 -> all well under SEARCHING.
+        for raw in (-0.3, 0.0, 0.30, 0.38, 0.45):
             self.assertLess(receiver.calibrate(raw), 0.15)
+        self.assertLess(receiver.calibrate(0.52), receiver.C_SEARCH)
         grid = [i / 100 for i in range(-30, 101)]
         cal = [receiver.calibrate(s) for s in grid]
-        self.assertTrue(all(b > a for a, b in zip(cal, cal[1:])))  # strictly monotone: no hard 0% floor
+        self.assertTrue(all(b >= a for a, b in zip(cal, cal[1:])))  # monotone
+        lo, hi = receiver.CAL_KNOTS[0], receiver.CAL_KNOTS[2]
+        active = [receiver.calibrate(s) for s in grid if lo <= s <= hi]
+        self.assertTrue(all(b > a for a, b in zip(active, active[1:])))  # strictly increasing over the working range
         self.assertTrue(all(b - a < 0.03 for a, b in zip(cal, cal[1:])))  # no jumps between 0.01 cosine steps
-        self.assertAlmostEqual(receiver.calibrate(1.0), 1.0)
+        self.assertAlmostEqual(receiver.calibrate(1.0), receiver.CAL_CAP)  # never a literal 100%
         self.assertAlmostEqual(receiver.calibrate(receiver.T_IDENT), receiver.C_IDENT)
         self.assertAlmostEqual(receiver.calibrate(receiver.T_SEARCH), receiver.C_SEARCH)
-        self.assertAlmostEqual(receiver.T_IDENT, 0.856, places=2)  # operating points kept from the linear calibration
-        self.assertAlmostEqual(receiver.T_SEARCH, 0.640, places=2)
+        self.assertAlmostEqual(receiver.T_IDENT, 0.804, places=2)
+        self.assertAlmostEqual(receiver.T_SEARCH, 0.560, places=2)
+        for s in (0.6, 0.75, 0.85, 0.95):
+            self.assertAlmostEqual(receiver.raw_threshold(receiver.calibrate(s)), s, places=6)
+        # Presented objects (0.62-0.89 measured) span GUIDING -> IDENTIFIED instead of saturating.
+        self.assertLess(receiver.calibrate(0.75), receiver.C_IDENT)
+        self.assertGreater(receiver.calibrate(0.85), receiver.C_IDENT)
         sm = receiver.StateMachine()
         out = self.feed(sm, [receiver.FrameScore("coke_can", 0.45, 0.40, "pepsi_can")] * 5)
         self.assertEqual(out["state"], receiver.SEARCHING)
         self.assertLess(out["score"], receiver.C_SEARCH)
+
+    def test_fused_confidence_overrides_vision(self):
+        f = receiver.FrameScore("coke_can", 0.75, 0.5, "pepsi_can", f1=0.8, f2=0.3)
+        self.assertAlmostEqual(f.c1, 0.8)
+        self.assertAlmostEqual(f.c2, 0.3)
+        self.assertAlmostEqual(f.margin, 0.5)
+        capped = receiver.FrameScore("iphone_16", 0.97, f1=0.9, cap=0.35)
+        self.assertAlmostEqual(capped.c1, 0.35)
 
     def test_reported_confidence_is_ema(self):
         sm = receiver.StateMachine()

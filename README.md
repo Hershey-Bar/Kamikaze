@@ -125,6 +125,15 @@ reported as `beverage can`, never `cup`. With the COCO fallback (`KAMIKAZE_DETEC
 H/W 1.4–2.6, are relabelled `beverage can`. When nothing is found the center crop is used. A custom-trained YOLO can be
 exported with `./export_yolo.sh best.pt` and selected with `KAMIKAZE_DETECTOR=best`.
 
+### Camera focus
+
+`v4l2_ctrl.py` drives V4L2 controls with raw `VIDIOC_QUERYCTRL` / `G_CTRL` / `S_CTRL` ioctls (no `v4l-utils` needed).
+For an autofocus webcam, Manual Focus turns continuous AF off and pins `focus_absolute` (clamped and snapped to the
+control's step) so AF hunting cannot blur the reticle crop; `KAMIKAZE_FOCUS=auto|<n>` applies it at every camera open.
+The **Logitech Brio 101 on the board is fixed-focus**: it exposes no focus controls (only brightness, contrast,
+saturation, white balance, gain, sharpness, backlight and exposure), so `/api/camera/focus` honestly reports
+`supported: false` with the reason, and the dashboard disables the controls. Keep objects ≥ ~30 cm from it.
+
 ### Memory
 
 Models, the embedding bank and all `static/` files (GLB models, JS) are kept in RAM (`KAMIKAZE_ASSET_CACHE_MB`,
@@ -138,16 +147,18 @@ make inference faster; it is always off in deployment mode.
 
 1. Type a plain-text name in the dashboard (e.g. `coke zero can 330ml`, `s25 ultra black`, `iphone 15 pro max`). It is
    resolved to a canonical class (`coca_cola_zero_330ml_can`, `galaxy_s25_ultra`, ...); colour is kept as metadata only.
-2. For each view, hold the object inside the reticle and click **Capture [view] & Next**. The server samples the next
-   10 frames, keeps only the embedding vectors (no images are written to disk) and advances:
-   - **Front (0°)**: upright, label or screen facing the camera
-   - **Right (90°)**: turned a quarter clockwise (phone volume rail, can right profile)
-   - **Back (180°)**: turned around (phone camera island, can nutrition panel)
-   - **Left (270°)**: turned a further quarter (phone power rail, can left profile)
-   - **Top (tilt 30–45°)**: tilted toward the camera (can pull-tab, lens cluster) - used for pitch
+2. The wizard is category-specific (`taxonomy.WIZARD_VIEWS`) and every step card shows what it must capture:
+   - **Smartphone (5 steps)**: Front (screen) → Back (camera island) → Right rail → Left rail → Top (tilt 30–45°). The
+     rail prompts name the brand's real buttons.
+   - **Beverage can / bottle (4 steps)**: Front (logo) → Back (nutrition panel) → Side (seam / barcode) → Top (pull-tab,
+     tilt 30–45°). A can is rotationally near-symmetric, so a fifth "left" view adds no information.
+   Each class records how many views its category expects (`view_expected`), shown as `views 4/4` / `5/5` in the
+   classes table. For each view, hold the object inside the reticle and click **Capture [view] & Next**. The server samples the next
+   10 frames, keeps only the embedding, DINOv2 pose and colour vectors (no images are written to disk) and advances.
 3. Click **Done** to save. CAD retrieval runs in the background and never blocks enrollment.
 
-Four cardinal views make the yaw unambiguous over the full 360° (a single "side" view cannot tell left from right).
+For phones the four cardinal views make the yaw unambiguous over the full 360° (a single "side" view cannot tell left
+from right); a can's yaw is resolved by front / side / back.
 Databases enrolled with the older 4-view wizard still load: their `side` view is treated as `right` and `detail` as `top`.
 Captures are paused by the lighting gate (below); a view whose frames keep failing it for 3 × frames-per-view (min 30)
 frames is aborted with *capture failed: ...* so the operator can fix the light and retry.
@@ -180,23 +191,37 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
 2. **Detector = domain gate.** YOLO-World on the NPU only restricts *which classes may match*: `smartphone` ≥ 0.50 →
    smartphones only, `beverage can` / `soda can` / `bottle` ≥ 0.50 → beverage cans/bottles only. If the unrestricted top-1 is from the other domain the frame is
    **GUIDING** with *Verifying object geometry... Hold steady in center.*
-3. **Calibrated confidence.** Raw cosine `S` maps through a normalised logistic
-   `C = σ(k(S − c)) / σ(k(1 − c))` with `k = 7.38`, `c = 0.8334` (`KAMIKAZE_CAL_SLOPE` / `KAMIKAZE_CAL_CENTER`), so `C = 1`
-   at `S = 1` and there is no hard 0% cliff. (The directive's `1/(1+e^(−12(S−0.45)))` was not used: MobileNetV3 cosines of
-   empty backgrounds already sit at 0.45–0.52, which that curve would report as 50–70%, i.e. near-false IDENTIFIED; the
-   fitted curve keeps the gates exact: C(0.856) = 0.70, C(0.64) = 0.25, C(0.52) = 0.12.) The reported confidence is smoothed
-   with an EMA `C̄ₜ = 0.25·Cₜ + 0.75·C̄ₜ₋₁` (`KAMIKAZE_EMA_ALPHA`). **IDENTIFIED** needs `C ≥ 0.70` *and* margin `Δ ≥ 0.15`
-   for 3 consecutive frames (green, LEDs 1–8 by confidence); `0.25 ≤ C < 0.70` or `Δ < 0.15` is **GUIDING** (amber
-   `(255,120,0)`, 4 LEDs); `C < 0.25` is **SEARCHING** (dim cyan `(0,100,150)`, 1 LED).
-   **OCR fusion.** RapidOCR (ONNX Runtime, CPU) reads the crop in its own worker at ~3 Hz (`KAMIKAZE_OCR_HZ`; ~170 ms per
-   read on the QCS8275 CPU, so it never runs in the frame path). Words read in the last 1.5 s are matched against each
-   candidate's brand / flavour / variant words: `S = 0.65·S_vision + 0.35·S_text` on the raw cosine, before calibration,
-   for the top 5 candidates. `S_text` is 1.0 for brand + detail, 0.6 for brand only, 0.4 for detail only and 0.0 when
-   another brand's name is in view; classes with no informative words (or sizes such as `330ml`, printed on every brand)
-   keep their pure vision score, so text alone can never identify an object. `KAMIKAZE_OCR=0` disables it.
-4. **Smartphones.** Views are weighted back 0.65 / right 0.15 / left 0.15 / top 0.10 / front 0.10 (`device_taxonomy.py`). Because the camera
-   sees one face at a time, the weights act as per-view reliability (back × 1.00, side × 0.81, top/front × 0.79): only the rear
-   shell can push a phone over the IDENTIFIED floor. If the live frame matches a phone's screen better than its back,
+3. **Max-over-views, calibrated confidence.** Each class keeps one centroid per enrolled view; its raw score is the
+   **maximum** cosine over those views (`S = maxᵥ cos(x, μᵥ)`), so a can seen from its back is not penalised for not
+   looking like its front (averaging views pulled every partial view toward ~0.5). `S` is mapped to a confidence by a
+   monotone piecewise-linear curve through measured knots (`KAMIKAZE_CAL_KNOTS`, default 0.42 / 0.70 / 0.95):
+   `S ≤ 0.42 → 0` (backgrounds and wrong objects measure 0.30–0.45 with MobileNetV3), `0.70 → 0.50`, `≥ 0.95 → 0.98`
+   (`KAMIKAZE_CAL_CAP`: never a fake 100%). The gates are exact in raw terms: C = 0.70 at S ≈ 0.80, C = 0.25 at
+   S ≈ 0.56. (A logistic `1/(1+e^(−12(S−0.45)))` was rejected: it reports empty backgrounds at 50–70%.) The confidence
+   is smoothed with an EMA `C̄ₜ = 0.25·Cₜ + 0.75·C̄ₜ₋₁`. **IDENTIFIED** needs `C ≥ 0.70` *and* a top-1/top-2 margin
+   `Δ ≥ 0.15` for 3 consecutive frames (green, LEDs 1–8 proportional to C / 0.98); `0.25 ≤ C < 0.70` or `Δ < 0.15` is
+   **GUIDING** (amber `(255,120,0)`, 4 LEDs); `C < 0.25` is **SEARCHING** (dim cyan `(0,100,150)`, 1 LED).
+   **Tri-modal fusion** (`ocr_fusion.fuse_calibrated`, top 5 candidates, in calibrated space):
+
+       C_fused = (0.60·C_vision + 0.25·C_text + 0.15·C_color) / (sum of the weights of the modalities present)
+
+   - **Text**: RapidOCR (ONNX Runtime, CPU) reads the crop in its own worker at ~3 Hz (`KAMIKAZE_OCR_HZ`). A read costs
+     ~160 ms on the QCS8275 Kryo cores, so a 20 ms OCR budget is not achievable on this board; it therefore never runs
+     in the frame path. Words then pass a non-intrusive autocorrect (~0.2 ms): OCR glyph swaps (`c0ke → coke`,
+     `5prite → sprite`) are kept only when they land on a vocabulary word, and fuzzy matching (`difflib`, ratio ≥
+     `KAMIKAZE_OCR_FUZZY` = 0.8) applies only to words of ≥ 5 letters, against the canonical brand vocabulary plus every
+     enrolled class's words. Short words are never fuzzed (`cake` stays `cake`). `C_text` is 1.0 for brand + detail,
+     0.6 for brand only, 0.4 for detail only and 0.0 when another brand is read; it is absent when the text says
+     nothing about the class.
+   - **Colour** (`color_sig.py`, ~0.3 ms): a 21-float signature of the crop (18 saturation-weighted, soft-binned hue
+     bins + dark / grey / bright) stored per view at enrollment (vectors only, no images). `C_color` is the best-view
+     histogram intersection mapped from [0.30, 0.70] to [0, 1] (`KAMIKAZE_COLOR_I_LO/HI`). Coke red, Pepsi blue, Sprite
+     green and a pink Kirkland can separate even when the embedding is unsure.
+   - A missing modality drops out and the weights renormalise. Below the SEARCHING floor the vision score is returned
+     unchanged, so text and colour can confirm or veto an object the camera sees but never conjure one out of
+     background print. `KAMIKAZE_OCR=0` disables OCR.
+4. **Smartphones.** Matching is the same max over views (the optional per-view reliability prior in
+   `device_taxonomy.py`, which favours the rear shell, is off by default: `VIEW_RELIABILITY_KAPPA = 0`). If the live frame matches a phone's screen better than its back,
    confidence is capped at 35%, LEDs go amber and the banner says *Front screen detected. Flip phone 180° to expose camera
    island.* When two enrolled phones are within Δ 0.15, the tier taxonomy picks the cue that separates them
    (Pro LiDAR aperture, Ultra boxy corners + periscope, iPhone lens layout, Apple vs Samsung island).
@@ -204,15 +229,28 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
    the identified crop. During enrollment each view also stores a 768-d DINOv2 centroid ([CLS | mean patch]); live, the
    descriptor is compared with the view centroids after subtracting their mean (the shared object identity cancels, so
    neighbouring views separate), the similarities are soft-maxed and blended on the yaw circle (front 0°, right +90°,
-   back 180°, left −90°): a continuous, unambiguous 360° yaw. Pitch comes from the Top-view weight plus the perspective taper of the object outline. Classes enrolled before the pose worker existed fall back to MobileNet view centroids
+   back 180°, left −90°): a continuous, unambiguous 360° yaw. Tilting the top toward the camera is positive pitch; the
+   dashboard drives model-viewer's `orientation` (`roll pitch yaw`) with matching signs. Pitch comes from the Top-view weight plus the perspective taper of the object outline. Classes enrolled before the pose worker existed fall back to MobileNet view centroids
    (`pose.source` = `mobilenet-views` instead of `dinov2-npu`); re-enroll them for DINOv2 pose. `KAMIKAZE_POSE_DINO=0`
    disables the worker.
 
 ## Dashboard
 
+The header carries an **LED HUD**: eight dots mirroring exactly what was last sent to the Modulino Pixels
+(`set_pixels(r, g, b, brightness, count)`, colour and count) with the mode: `IDENTIFIED (6/8)`, `GUIDING (4/8)`,
+`SEARCHING (1/8)`, `CAPTURING (n/8)` during enrollment, or a dimmed `BRIDGE DOWN` when the router RPC fails. Its
+tooltip shows the RPC round-trip latency.
+
+Under the camera, chips show the fused score (`label · fused % = V / T / C`), the dominant-colour swatch, the OCR words
+and corrected words (~~c0ke~~ coke), and a **Focus** row (Auto / Manual + slider; disabled with the reason when the
+camera has no focus control). Above the 3D stage, the **Online / Offline** toggle and source selector (online: Auto,
+Sketchfab, Poly Pizza, Local Cache, Custom Scan Upload; offline: Local Cache and Custom Scan Upload only). Under the
+stage, the **model frame** toolbar (Rotate X / Y / Z 90°, Auto-orient, Reset) fixes a downloaded model whose author
+used another up-axis or front (see 3D models).
+
 Two columns. **Left**, top to bottom: live camera (16:9) with the 75% corner-bracket reticle, status pill and guidance
-banner (plus a lighting pill); the guided 5-view training console (name + category, Capture Front 0° → Right 90° →
-Back 180° → Left 270° → Top); a 2×2 grid
+banner (plus a lighting pill), the fusion chips and focus row; the category-specific training console (name + category,
+4 or 5 step cards); a 2×2 grid
 of telemetry cards — Host QCS8275 (junction °C, per-core GHz, load), Memory (16 GB LPDDR5 used/total), STM32H5F5 bridge
 (`set_pixels` RPC ms, LEDs, router socket) and Edge-AI pipeline (NPU runtime, embed/detect ms, DINOv2 pose ms, fps,
 calibrated similarity %, margin %, scene-gate values, active detector domain, OCR words read and the fused score).
@@ -220,8 +258,7 @@ calibrated similarity %, margin %, scene-gate values, active detector domain, OC
 `exposure="1.0"`, `shadow-intensity="1.2"`, `tone-mapping="aces"`; Auto Rotate / **Sync Physical Pose** / Re-Fetch CAD
 for Active; author + licence badge), then the enrolled classes table (Name · Category · Views · CAD · Re-Fetch CAD ·
 Delete) and **PURGE DATABASE**. Sync Physical Pose drives `camera-orbit` from the live yaw/pitch; the pill shows the
-pose and its source. An **Online / Offline** toggle and a source selector (Auto, Sketchfab, Poly Pizza, Local cache)
-sit above the stage. A class without a verified model shows an empty stage with a **3D MODEL NOT FOUND** overlay and
+pose and its source. A class without a verified model shows an empty stage with a **3D MODEL NOT FOUND** overlay and
 the reason, plus three explicit choices: **Browse options** (top ranked online candidates with thumbnail, author,
 licence and score; one click downloads, validates and attaches the chosen one), **Upload GLB** (validated like any
 download, credited as a user upload) and **Generate from specs** (below). Nothing is ever substituted automatically.
@@ -257,8 +294,25 @@ standard can table (the class must state its volume, e.g. `330ml`, snapped to a 
 listed in the sidecar; the model is neutral (no brand graphics) and the stage shows the badge *Estimated Model:
 Dimensionally Calibrated via Spec Search*. If no verified spec is found it stays NOT_FOUND.
 
-In **Offline** mode (or source *Local cache*) only cached, attributed models are used; browse and spec generation need
-online mode. Every model has a JSON sidecar with title, author, author URL, licence and source; credits are shown in the
+**Offline mode is enforced, not just a preference.** `netguard.py` is a process-wide guard checked before every
+external request (`mcp_server` Sketchfab / Poly Pizza / downloads, `spec_search`, model-viewer vendoring): while offline
+any non-loopback host raises `NetworkBlocked` and is counted (`/api/settings/mode` → `network.blocked`, shown in the CAD
+pill), so the receiver makes zero outbound requests. Offline, only the `local` and `upload` sources can be selected;
+going online restores the last online source. A class with no cached model is **OFFLINE_MISSING** (not NOT_FOUND: a
+model may exist online) and the dashboard asks *Object has no local CAD model. Switch to Online Search mode to query
+repositories?* with **Switch to Online & Fetch**. The one-time NPU model download at first start (`npu.py`) is
+provisioning, not retrieval, and is not guarded. Browse and spec generation need online mode.
+
+**Model frame (orientation).** Repository models come in arbitrary frames (Z-up CAD exports, phones lying flat, cans on
+their side), which breaks pose sync. `glb_orient.py` reads the GLB's node bounds and, per category, rotates the model so
++Y is up and the front faces +Z (a can's long axis up; a phone's thinnest axis toward the camera and its longest up).
+The fix is a single wrapper node with a quaternion (mesh data untouched, idempotent, reversible with **Reset**), applied
+automatically after each download and adjustable with the toolbar (`POST /api/classes/<id>/cad_orient`). Whether a
+phone's screen or back faces +Z cannot be inferred from bounds; press **Rotate Y 90°** twice if it is reversed. A
+rotated CC-BY model is a modification, so the sidecar records `modified` + `orientation_fix` and the credit line says
+*(re-oriented)*.
+
+Every model has a JSON sidecar with title, author, author URL, licence and source; credits are shown in the
 dashboard and written to `static/models/CREDITS.md`.
 
 ## API
@@ -280,7 +334,9 @@ dashboard and written to `static/models/CREDITS.md`.
 | POST | `/api/classes/purge` | wipe all classes, delete `enrolled_classes.pt` and the CAD cache (`{"delete_cad": false}` keeps models) |
 | POST | `/api/classes/reset` | delete all classes and their CAD cache |
 | POST | `/api/resolve`, `/api/cad/fetch` | plain-text resolution, CAD retrieval (`status: not_found` + `reason` when nothing verified exists) |
-| GET, POST | `/api/settings/mode` | `{"mode": "online"\|"offline", "source": "auto"\|"sketchfab"\|"polypizza"\|"local"}` |
+| GET, POST | `/api/settings/mode` | `{"mode": "online"\|"offline", "source": "auto"\|"sketchfab"\|"polypizza"\|"local"\|"upload"}`; returns the `sources` allowed in this mode and `network` guard stats (400 for an online source while offline) |
+| POST | `/api/classes/<id>/cad_orient` | `{"auto": true}` \| `{"axis": "x"\|"y"\|"z", "deg": 90}` \| `{"reset": true}`: re-orient the cached GLB (404 without one) |
+| GET, POST | `/api/camera/focus` | on-board camera focus `{"auto": true}` \| `{"auto": false, "value": n}`; 409 for HTTP ingest, 422 + status when the camera has no focus control |
 | GET | `/api/classes/<id>/cad_candidates?source=&limit=4` | ranked online candidates, nothing downloaded (409 offline, 404 not enrolled) |
 | POST | `/api/classes/<id>/cad_select` `{"uid": ...}` | download + validate + attach a browsed candidate |
 | POST | `/api/classes/<id>/upload_cad?filename=x.glb` | raw GLB body (≤ `KAMIKAZE_CAD_UPLOAD_MB`, 35); 422 when it fails the quality gate |

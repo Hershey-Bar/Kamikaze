@@ -23,6 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
+import netguard
+
 log = logging.getLogger("kamikaze.specs")
 
 GSMARENA = "https://www.gsmarena.com"
@@ -67,6 +69,7 @@ class SpecError(RuntimeError):
 
 
 def _get(url: str, timeout: float = TIMEOUT_S) -> bytes:
+    netguard.check(url)
     req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept": "text/html,application/json,*/*",
                                                "Accept-Language": "en-US,en;q=0.9"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:

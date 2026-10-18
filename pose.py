@@ -8,7 +8,7 @@ NumPy only (no OpenCV needed), ~1-2 ms per frame on 72x72 pixels:
             Legacy banks with a single "side" view fall back to +/-90 with the last known side. The descriptor is DINOv2 ViT-S/14 (NPU pose worker in receiver.py) when the class
             was enrolled with DINOv2 view centroids, else the MobileNet embedding. For phones the apparent width/height
             ratio (oriented-box foreshortening) refines the magnitude.
-  * pitch - top-view weight plus the perspective taper of the mask along its major axis.
+  * pitch - top-view weight plus the perspective taper of the mask along its major axis; > 0 = top toward the camera.
 The result is an approximation intended to drive the dashboard's 3D model, not a metrology-grade pose.
 """
 
@@ -26,6 +26,7 @@ MIN_FILL, MAX_FILL = 0.03, 0.92
 MIN_CONTRAST = 18.0
 VIEW_TEMPERATURE = 0.06
 YAW_ANGLES = {"front": 0.0, "right": 90.0, "back": 180.0, "left": -90.0, "side": 90.0}
+TOP_VIEW_PITCH = 40.0  # the enrolled "top" view is captured at a 35-45 deg tilt toward the camera
 
 
 def _wrap180(deg: float) -> float:
@@ -173,7 +174,10 @@ class PoseEstimator:
             sign = -1.0 if yaw < 0 else 1.0
             yaw = sign * (fold if abs(yaw) <= 90.0 else 180.0 - fold)
 
-        pitch = -75.0 * top_w + max(-45.0, min(45.0, geo["taper"] * 120.0))
+        # Pitch > 0 = the object's top tilted toward the camera. The "top" wizard view is a 35-45 deg tilt, and a
+        # top edge that images wider than the bottom edge (perspective taper > 0) is nearer the camera, i.e. tilted
+        # toward it - both terms share that sign.
+        pitch = TOP_VIEW_PITCH * top_w + max(-45.0, min(45.0, geo["taper"] * 120.0))
 
         if self._pose is None:
             sm = {"pitch": pitch, "yaw": yaw, "roll": roll}
