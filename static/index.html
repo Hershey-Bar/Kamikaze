@@ -488,6 +488,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   const viewer = $('viewer');
   let kiosk = false, viewSynced = false;
   let frameBusy = false, lastSrc = '', syncPose = false, autoRotate = true, state = null, pose = null, lastSse = 0, lastTel = 0, preview = null;
+  let lastDetection = '';
 
   function brackets(x, y, side, color) {
     const L = side * 0.16;
@@ -948,6 +949,32 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
       ? `yaw ${Math.round(ori.yaw)}° · pitch ${Math.round(ori.pitch)}° · roll ${Math.round(ori.roll)}°` : raw;
   }
 
+  function renderDetectedModel(s, name, glb) {
+    const detection = s.confirmed_label ? `${s.view}:${s.detection_id}:${s.confirmed_label}` : '';
+    if (detection && detection !== lastDetection) {
+      lastDetection = detection;
+      if (preview) stopPreview(false);
+    }
+    if (preview) return;
+    const url = glb ? new URL(glb, location.href) : null;
+    if (url && s.detection_id) url.searchParams.set('_detection', s.detection_id);
+    const src = url ? url.href : '';
+    if (src !== lastSrc) {
+      lastSrc = src;
+      ori.yaw = null;
+      if (src) {
+        viewer.setAttribute('camera-orbit', autoOrient ? ORI_ORBIT : IDLE_ORBIT);
+        viewer.setAttribute('camera-target', 'auto auto auto');
+        if (!autoOrient) viewer.removeAttribute('orientation');
+        viewer.setAttribute('src', src);
+      } else {
+        viewer.removeAttribute('src');
+      }
+    }
+    $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${String(s.asset_status || '').replace('_', ' ')}` : 'No model';
+    renderCredit(glb ? s.asset_attribution : null);
+  }
+
   function render(s) {
     state = s; pose = s.pose; lastStateAt = Date.now();
     const live = isLive();
@@ -976,12 +1003,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
 
     const name = s.view === 'smart' ? s.viewer_label : (s.confirmed_label || s.viewer_label);
     const glb = name && s.glb_url ? s.glb_url : '';
-    const src = glb ? new URL(glb, location.href).href : '';
-    if (!preview) {
-      if (src !== lastSrc) { lastSrc = src; ori.yaw = null; if (glb) viewer.setAttribute('src', glb); else viewer.removeAttribute('src'); }
-      $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${String(s.asset_status || '').replace('_', ' ')}` : 'No model';
-      renderCredit(glb ? s.asset_attribution : null);
-    }
+    renderDetectedModel(s, name, glb);
     $('refetchActiveBtn').disabled = !name;
     renderCad(s, name, glb);
     syncView(s.view);
@@ -1431,10 +1453,10 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     $('emptyStage').classList.remove('show'); $('notFound').classList.remove('show');
     renderCredit(attr);
   }
-  function stopPreview() {
-    preview = null; lastSrc = '';
+  function stopPreview(renderLive = true) {
+    preview = null; lastSrc = null;
     $('previewBar').classList.remove('show'); viewer.closest('.vstage').classList.remove('previewing');
-    if (state) render(state);
+    if (renderLive && state) render(state);
   }
   $('previewExit').onclick = stopPreview;
 

@@ -273,6 +273,29 @@ class ZeroTouchPipelineTests(unittest.TestCase):
         self.assertEqual(self.pipe.smart.status, "inconclusive")
         self.assertIsNone(self.pipe._viewer_label)
 
+    def test_smart_detection_id_changes_only_on_each_lock(self):
+        initial = self.pipe.snapshot()["detection_id"]
+        self.step()
+        self.assertEqual(self.pipe.snapshot()["detection_id"], initial)
+        for i in range(10):
+            self.clock.t += 0.5
+            self.step(i)
+        first = self.pipe.snapshot()["detection_id"]
+        self.assertNotEqual(first, initial)
+        for _ in range(5):
+            self.step()
+        self.assertEqual(self.pipe.snapshot()["detection_id"], first)
+        self.pipe._detection["target"] = None
+        self.clock.t += smart_scan.RELEASE_S + 0.1
+        self.step()
+        self.pipe._detection["target"] = {"label": "beverage can", "score": 0.9}
+        self.step()
+        for i in range(10):
+            self.clock.t += 0.5
+            self.step(i)
+        self.assertEqual(self.pipe.smart.status, "locked")
+        self.assertNotEqual(self.pipe.snapshot()["detection_id"], first)
+
 
 @unittest.skipIf(receiver.torch is None, "PyTorch not installed")
 class KirklandOutputTests(unittest.TestCase):
@@ -337,6 +360,23 @@ class KirklandOutputTests(unittest.TestCase):
         self.assertIsNone(snap["viewer_label"])
         self.assertIsNone(snap["confirmed_label"])
         self.assertIsNone(snap["label"])
+
+    def test_debug_detection_id_changes_on_same_product_reconfirmation(self):
+        initial = self.pipe.snapshot()["detection_id"]
+        for _ in range(receiver.IDENT_FRAMES + 1):
+            self.frame((110, 200, 40))
+        first = self.pipe.snapshot()["detection_id"]
+        self.assertIsInstance(first, str)
+        self.assertNotEqual(first, initial)
+        for _ in range(10):
+            self.frame((110, 200, 40))
+        self.assertEqual(self.pipe.snapshot()["detection_id"], first)
+        for _ in range(receiver.GUIDE_FRAMES + 1):
+            self.frame((225, 225, 225))
+        self.assertEqual(self.pipe.snapshot()["detection_id"], first)
+        for _ in range(receiver.IDENT_FRAMES + 1):
+            self.frame((110, 200, 40))
+        self.assertNotEqual(self.pipe.snapshot()["detection_id"], first)
 
 
 class ProvenanceUpgradeTests(unittest.TestCase):

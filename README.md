@@ -46,6 +46,11 @@ nothing, autonomous mode may generate geometry **only from published dimensions*
 The HUD distinguishes scanning, resolving, ready and model unavailable. Green means the identity is locked **and** an
 asset is ready; amber remains on while retrieving or guiding. Idle LEDs breathe cyan.
 
+The 3D viewport automatically reloads and recentres on every newly confirmed detection in either view, including
+the same product detected again. A new detection also exits a manually recalled library preview. The receiver sends
+a stable `detection_id` between confirmations, so normal camera/SSE updates do not continuously reload the model.
+Pending assets load as soon as they become ready; an existing asset version query is preserved.
+
 Citrus fusion is 60% colour / 40% OCR with conflicting flavour tokens suppressed. Hue bands are in **OpenCV's 0-180
 scale**, not physical degrees. Can volumes use the existing cited Crown table, not a shared assumed size for 250 and
 330 ml. A volume alone does not prove the package profile; inferred profiles remain labelled as assumptions.

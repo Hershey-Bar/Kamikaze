@@ -2229,6 +2229,7 @@ class Pipeline:
         self._fps = 0.0
         self._last_frame_mono = 0.0
         self._viewer_label: str | None = None
+        self._detection_id = time.time_ns()
         self._last = {
             "label": None, "similarity": 0.0, "confidence": 0.0, "margin": 0.0, "top2": None, "frame_confidence": 0.0,
             "embed_ms": 0.0, "detect_ms": 0.0, "total_ms": 0.0, "state": SEARCHING, "guidance": MSG_SEARCHING,
@@ -2541,6 +2542,8 @@ class Pipeline:
                 else:
                     self.leds.set(led_params(state, score))
             if state == IDENTIFIED and self.view != "smart":
+                if (state, label) != prev:
+                    self._detection_id += 1
                 self._viewer_label = label
                 self.assets.get(label)
             if (self.view != "smart" and self._viewer_label and
@@ -2835,6 +2838,7 @@ class Pipeline:
         elif event == "locked":
             lab = self.smart.label
             log.info("SMART scan locked %s (%.0f%%, share %.0f%%)", lab, self.smart.confidence * 100, self.smart.share * 100)
+            self._detection_id += 1
             self._viewer_label = lab
             self.assets.get(lab)
             self._bump()
@@ -3309,6 +3313,7 @@ class Pipeline:
             "confirmed_label": (self.smart.label if self.smart.status == smart_scan.LOCKED else None)
             if self.view == "smart" else (self.sm.label if state == IDENTIFIED else None),
             "viewer_label": self._viewer_label,
+            "detection_id": str(self._detection_id),
             "confidence": round(last["confidence"], 3),
             "similarity": round(last["similarity"], 3),
             "margin": round(last["margin"], 3),
