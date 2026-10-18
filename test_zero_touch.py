@@ -56,6 +56,24 @@ class EvidenceTests(unittest.TestCase):
         for text, volume in [("Red Bull 0.5l", "500ml"), ("Pepsi 12 fl. oz", "355ml")]:
             self.assertEqual(self.evidence(text).resolve("beverage_can")["volume"], volume)
 
+    def test_kirkland_fixed_color_beats_competing_ocr_even_with_mixed_print(self):
+        e = self.evidence("Kirkland lime 355ml")
+        e.colors.append({"verdict": "lemon", "scores": {"lemon": 0.55, "lime": 0.25}})
+        self.assertEqual(e.resolve("beverage_can")["label"], "kirkland_lemon_sparkling_water_355ml_can")
+
+    def test_known_kirkland_appearance_can_select_flavor_without_ocr(self):
+        e = smart_identity.ScanEvidence()
+        e.colors.append(citrus_classifier.color_evidence(np.full((80, 80, 3), (230, 80, 110), np.uint8)))
+        self.assertIsNone(e.resolve("beverage_can"))
+        result = e.resolve("beverage_can", known_brand="Kirkland")
+        self.assertIn("grapefruit", result["label"])
+        self.assertEqual(result["source"], "vision_color")
+
+    def test_visible_competing_brand_is_not_overridden_by_visual_brand(self):
+        e = self.evidence("Pepsi 355ml", (110, 200, 40))
+        result = e.resolve("beverage_can", known_brand="Kirkland")
+        self.assertEqual(result["metadata"]["brand"], "Pepsi")
+
     def test_phone_text_matches_without_prototypes(self):
         self.assertEqual(self.evidence("Apple iPhone 14 Pro").resolve("smartphone")["label"], "iphone_14_pro")
         self.assertEqual(self.evidence("Samsung Galaxy S24 Ultra").resolve("smartphone")["label"], "galaxy_s24_ultra")
@@ -168,6 +186,15 @@ class ZeroTouchPipelineTests(unittest.TestCase):
         self.step()
         self.assertEqual(self.pipe.smart.status, "idle")
         self.assertIsNone(self.pipe._viewer_label)
+
+    def test_known_kirkland_locks_color_flavor_without_text(self):
+        self.frame = receiver.FrameScore("kirkland_lemon_can", 0.95)
+        self.step(text="")
+        for i in range(10):
+            self.clock.t += 0.5
+            self.step(i, text="")
+        self.assertEqual(self.pipe.smart.status, "locked")
+        self.assertIn("lime", self.pipe.smart.label)
 
     def test_asset_readiness_not_scan_completion_controls_green_led(self):
         self.pipe.smart.status = "locked"

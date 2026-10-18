@@ -175,5 +175,50 @@ class ArbitrationTests(unittest.TestCase):
         self.assertGreaterEqual(fused["kirkland_grapefruit_can"] - fused["kirkland_lime_can"], 0.15)
 
 
+class KirklandFixedColorTests(unittest.TestCase):
+    def test_mapping_overrides_ocr_and_large_visual_gap(self):
+        for rgb, wanted in ((YELLOWS[4], "lemon"), (PINKS[3], "grapefruit"), (GREENS[4], "lime")):
+            for wrong in ("lemon", "grapefruit", "lime"):
+                if wrong == wanted:
+                    continue
+                with self.subTest(wanted=wanted, wrong=wrong):
+                    old, new = f"kirkland_{wrong}_can", f"kirkland_{wanted}_can"
+                    ranked = [(old, 0.95, "front"), (new, 0.3, "front")]
+                    fused = {old: 0.95, new: 0.3}
+                    result = cc.arbitrate(ranked, fused, ArbitrationTests.flavor, cc.color_evidence(can(rgb)),
+                                          {wrong}, {wrong: 10}, lexicon_label=old)
+                    self.assertEqual(ranked[0][0], new)
+                    self.assertEqual(result["flavor"], wanted)
+                    self.assertLessEqual(fused[old], 0.45)
+
+    def test_metadata_brand_works_for_custom_class_ids(self):
+        ranked = [("first", 0.9, "front"), ("second", 0.2, "back")]
+        fused = {}
+        metadata = {"first": {"brand": "Kirkland Signature"}, "second": {"brand": "Kirkland"}}
+        cc.arbitrate(ranked, fused, lambda lab: {"first": "lemon", "second": "lime"}[lab],
+                     cc.color_evidence(can(GREENS[4])), metadata_of_label=metadata.get)
+        self.assertEqual(ranked[0][0], "second")
+
+    def test_does_not_promote_a_different_brands_flavor(self):
+        ranked = [("kirkland_lemon_can", 0.95, "front"), ("lacroix_lime_can", 0.2, "front")]
+        fused = {"kirkland_lemon_can": 0.95, "lacroix_lime_can": 0.2}
+        cc.arbitrate(ranked, fused, ArbitrationTests.flavor, cc.color_evidence(can(GREENS[4])))
+        self.assertEqual(fused["lacroix_lime_can"], 0.2)
+        self.assertLessEqual(fused["kirkland_lemon_can"], 0.45)
+
+    def test_non_kirkland_keeps_lexicon_and_confidence_gates(self):
+        ranked = [("lacroix_lemon_can", 0.95, "front"), ("lacroix_lime_can", 0.2, "front")]
+        fused = {"lacroix_lemon_can": 0.95, "lacroix_lime_can": 0.2}
+        cc.arbitrate(ranked, fused, ArbitrationTests.flavor, cc.color_evidence(can(GREENS[4])),
+                     lexicon_label="lacroix_lemon_can")
+        self.assertEqual(ranked[0][0], "lacroix_lemon_can")
+
+    def test_neutral_ambiguous_and_other_colors_do_not_force_a_flavor(self):
+        for ev in (None, cc.color_evidence(can((210, 210, 210))),
+                   {"verdict": None, "scores": {"lime": 0.5, "lemon": 0.49}},
+                   cc.color_evidence(can(hsv_rgb(17, 240, 245)))):
+            self.assertIsNone(cc.kirkland_flavor(ev))
+
+
 if __name__ == "__main__":
     unittest.main()

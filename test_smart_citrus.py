@@ -195,7 +195,7 @@ class CitrusTests(unittest.TestCase):
         self.assertEqual(ranked[0][0], "kirkland_lemon_can")
 
     def test_tiebreak_does_not_apply(self):
-        self.assertIsNone(self.tiebreak(self.LIME, lexicon="kirkland_lemon_can")[2]["action"])  # OCR already decided
+        self.assertEqual(self.tiebreak(self.LIME, lexicon="kirkland_lemon_can")[2]["action"], "promoted")
         ranked, _, info = self.tiebreak((200, 200, 205))  # silver: no colour evidence, leave the ranking alone
         self.assertIsNone(info["verdict"])
         self.assertEqual(ranked[0][0], "kirkland_lemon_can")
@@ -203,9 +203,10 @@ class CitrusTests(unittest.TestCase):
         self.assertIsNone(citrus_classifier.arbitrate(ranked, {}, lambda lab: citrus_classifier.flavor_of({}, lab),
                                                       None))
 
-    def test_far_gap_demotes_instead_of_swapping(self):
-        ranked, fused, info = self.tiebreak(self.LIME, gap=0.4)  # vision far apart: lemon demoted, not swapped
-        self.assertEqual(info["action"], "demoted")
+    def test_kirkland_color_overrides_far_visual_gap(self):
+        ranked, fused, info = self.tiebreak(self.LIME, gap=0.4)
+        self.assertEqual(info["action"], "promoted")
+        self.assertEqual(ranked[0][0], "kirkland_lime_can")
         self.assertLessEqual(fused["kirkland_lemon_can"], 0.45)
 
     def test_grapefruit_print_demotes_lemon_without_grapefruit_class(self):

@@ -37,6 +37,7 @@ WORDS = {
     "orange": {"orange", "oranges", "mandarin", "mandarine", "tangerine", "clementine"},
 }
 W_COLOR, W_OCR = 0.60, 0.40
+KIRKLAND_COLOR_FLAVORS = {"yellow": "lemon", "pink": "grapefruit", "green": "lime"}
 S_OCR_RECENT, S_OCR_ROLLING = 1.0, 0.6
 
 SIDE = int(os.environ.get("KAMIKAZE_CITRUS_SIDE", "96"))  # crop is downsampled to this longer side
@@ -254,9 +255,27 @@ def flavor_of(meta: dict | None, label: str = "") -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def is_kirkland(label: str = "", meta: dict | None = None) -> bool:
+    meta = meta or {}
+    text = " ".join(str(meta.get(k, "")) for k in ("brand", "raw_name", "name")) + " " + label.replace("_", " ")
+    return bool(re.search(r"\bkirkland\b", text, re.I))
+
+
+def kirkland_flavor(evidence: dict | None) -> str | None:
+    """A clear surface colour is authoritative for the three Kirkland citrus variants."""
+    evidence = evidence or {}
+    flavor = evidence.get("verdict")
+    scores = evidence.get("scores") or {}
+    if flavor not in KIRKLAND_COLOR_FLAVORS.values():
+        return None
+    value = scores.get(flavor, 0.0)
+    other = max((scores.get(f, 0.0) for f in FLAVORS if f != flavor), default=0.0)
+    return flavor if value >= VERDICT_MIN and value - other >= VERDICT_MARGIN else None
+
+
 def arbitrate(ranked: list, fused: dict, flavor_of_label, evidence: dict | None, recent=None, rolling=None,
               lexicon_label: str | None = None, calibrate=None, max_gap: float = 0.25, margin: float = 0.15,
-              demote_to: float = 0.45) -> dict | None:
+              demote_to: float = 0.45, metadata_of_label=None) -> dict | None:
     """Correct the visual ranking of citrus-flavoured classes with the fused colour + OCR flavour decision.
 
     Applies when the top-1 class names a citrus flavour and the decision names a different one:
@@ -264,7 +283,8 @@ def arbitrate(ranked: list, fused: dict, flavor_of_label, evidence: dict | None,
         the top's confidence; the old top drops to `margin` + 0.05 below it);
       * otherwise, when the colour verdict is strong and contradicts the top's flavour (S_color <= 0.15), the top is
         demoted to at most `demote_to` (a lemon can must never be identified as the only enrolled lime class).
-    A class the OCR keyword lexicon confirmed is left alone (its tokens were already colour-gated).
+    Kirkland uses its fixed colour mapping, regardless of OCR or the inter-flavour visual gap. Other brands retain
+    the normal confidence/lexicon gates.
     Mutates ranked / fused in place; returns diagnostics or None when no citrus class leads."""
     if not ranked:
         return None
@@ -277,6 +297,21 @@ def arbitrate(ranked: list, fused: dict, flavor_of_label, evidence: dict | None,
     info = {"top": top, "top_flavor": ftop, "flavor": dec["flavor"], "p": dec["p"],
             "verdict": (evidence or {}).get("verdict"), "strong": bool((evidence or {}).get("strong")),
             "suppressed": dec["suppressed"], "action": None}
+    kirkland = lambda lab: is_kirkland(lab, metadata_of_label(lab) if metadata_of_label else None)
+    fixed = kirkland_flavor(evidence) if kirkland(top) else None
+    if fixed is not None:
+        info["flavor"] = fixed
+        hi = fused.get(top, cal(ranked[0][1]))
+        winner = next((row[0] for row in ranked if kirkland(row[0]) and flavor_of_label(row[0]) == fixed), None)
+        for lab, score, _ in ranked:
+            if kirkland(lab) and flavor_of_label(lab) not in (None, fixed):
+                fused[lab] = min(fused.get(lab, cal(score)), demote_to, max(0.0, hi - margin - 0.05))
+        if winner is not None:
+            fused[winner] = max(hi, fused.get(winner, cal(next(r[1] for r in ranked if r[0] == winner))))
+        ranked.sort(key=lambda r: -fused.get(r[0], cal(r[1])))
+        if fixed != ftop:
+            info.update(action="promoted" if winner else "demoted", winner=winner or ranked[0][0])
+        return info
     if dec["flavor"] is None or dec["flavor"] == ftop or lexicon_label == top:
         return info
     f_top = fused.get(top, cal(ranked[0][1]))

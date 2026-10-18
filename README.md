@@ -49,6 +49,8 @@ asset is ready; amber remains on while retrieving or guiding. Idle LEDs breathe 
 Citrus fusion is 60% colour / 40% OCR with conflicting flavour tokens suppressed. Hue bands are in **OpenCV's 0-180
 scale**, not physical degrees. Can volumes use the existing cited Crown table, not a shared assumed size for 250 and
 330 ml. A volume alone does not prove the package profile; inferred profiles remain labelled as assumptions.
+For recognised Kirkland cans, clear surface colour takes priority over conflicting OCR and inter-flavour visual
+scores. This is internal classification logic, not an additional kiosk control or message.
 
 Auto-Orient and Snap to Live Pose use the existing SSE stream (`/api/scan_stream`). Enrolled cardinal views supply
 DINOv2/MobileNet pose; new objects use relative surface-flow yaw plus geometric pitch/roll, explicitly reported as

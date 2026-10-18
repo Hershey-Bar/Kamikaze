@@ -88,7 +88,7 @@ class ScanEvidence:
             scores[best] - scores[ranked[1]] >= citrus.VERDICT_MARGIN) else None
         return {"scores": scores, "verdict": verdict, "strong": bool(verdict and scores[best] >= citrus.STRONG)}
 
-    def resolve(self, category: str | None, phone: dict | None = None) -> dict | None:
+    def resolve(self, category: str | None, phone: dict | None = None, known_brand: str | None = None) -> dict | None:
         self.identity = None
         self.category = category
         self.message = "Rotate slowly to show the brand, flavour and volume."
@@ -99,13 +99,19 @@ class ScanEvidence:
             return None
         text = " ".join(self.texts).lower()
         brands = [brand for brand, pattern in _BRANDS.items() if re.search(pattern, text)]
-        if len(brands) != 1 or self.ocr_passes < 2:
+        color = self.color()
+        fixed = citrus.kirkland_flavor(color)
+        visual_brand = known_brand == "Kirkland" and fixed and not brands
+        if visual_brand:
+            brands = ["Kirkland"]
+        if len(brands) != 1 or (self.ocr_passes < 2 and not visual_brand):
             self.message = "Show the brand clearly; colour alone cannot identify a product."
             return None
         brand = brands[0]
-        color = self.color()
         fused = citrus.fuse(color, citrus.ocr_scores(recent=self.tokens))
         flavor = fused["flavor"] or taxonomy.find_flavor(text)
+        if brand == "Kirkland" and fixed:
+            flavor = fixed
         # A green Sprite or a blue/silver energy drink is not a citrus-flavour declaration.
         if brand not in ("Kirkland", "La Croix"):
             flavor = taxonomy.find_flavor(text)
@@ -124,7 +130,7 @@ class ScanEvidence:
         kind = "sparkling water" if brand in ("Kirkland", "La Croix") else ""
         package = "bottle" if category == "beverage_bottle" else "can"
         product = entity_resolver.resolve(" ".join(filter(None, (brand, tier, flavor, kind, volume, package))), category)
-        return self._result(product, 0.88, "ocr_color" if color else "ocr", volume)
+        return self._result(product, 0.88, "vision_color" if visual_brand else "ocr_color" if color else "ocr", volume)
 
     def _phone(self, phone: dict | None) -> dict | None:
         self.message = "Show the camera island, then the screen cutout or model name."

@@ -2594,7 +2594,8 @@ class Pipeline:
         lex_label = (self._route.get("lexicon") or {}).get("label") if self._route else None
         recent_tokens, roll_tokens = self._ocr_tokens
         citrus = citrus_classifier.arbitrate(ranked, fused, self._flavor_of, self._citrus, recent_tokens, roll_tokens,
-                                             lex_label, calibrate, margin=MIN_MARGIN, demote_to=C_IDENT - 0.25)
+                                             lex_label, calibrate, margin=MIN_MARGIN, demote_to=C_IDENT - 0.25,
+                                             metadata_of_label=self._metadata)
         if citrus is not None and self._route is not None:
             self._route["citrus"] = citrus
         info["route"] = self._route
@@ -2739,7 +2740,12 @@ class Pipeline:
             self.evidence.add(ocr, self._citrus if scan_category != "smartphone" else None, crop, best_view)
             match = self.devices.summary(device_cache.device_id_for(frame.label or "")) if (
                 self.devices is not None and scan_category == "smartphone") else None
-            identity = self.evidence.resolve(scan_category, match)
+            visual = arb.get("raw_top1") or {"label": frame.label, "score": frame.s1}
+            visual_label = visual.get("label") or ""
+            known_brand = "Kirkland" if (scan_category == "beverage_can" and
+                calibrate(visual.get("score", 0.0)) >= C_IDENT and
+                citrus_classifier.is_kirkland(visual_label, self._metadata(visual_label))) else None
+            identity = self.evidence.resolve(scan_category, match, known_brand=known_brand)
             if identity:
                 label, confidence = identity["label"], identity["confidence"]
                 if label not in self._discovered and len(self._discovered) >= 128:
