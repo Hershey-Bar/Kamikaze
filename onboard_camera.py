@@ -35,11 +35,16 @@ REOPEN_AFTER_FAILS = 30  # consecutive failed reads (~1 s) before the device is 
 BACKOFF_MAX_S = 5.0
 
 
+PREFERRED_CAMERA = "brio"  # the board camera (Brio 101); never a laptop webcam
+
+
 def find_camera(sysfs: Path = SYSFS_V4L) -> str | None:
-    """First USB UVC capture node (index 0; index 1 is the UVC metadata node). Platform ISP nodes are skipped."""
+    """USB UVC capture node (index 0; index 1 is the UVC metadata node), preferring the Logitech Brio over any other
+    USB camera. Platform ISP nodes are skipped."""
     if not sysfs.is_dir():
         return None
     nodes = sorted(sysfs.glob("video*"), key=lambda p: int(p.name[5:]) if p.name[5:].isdigit() else 1 << 30)
+    usb = []
     for node in nodes:
         try:
             index = (node / "index").read_text().strip()
@@ -47,8 +52,12 @@ def find_camera(sysfs: Path = SYSFS_V4L) -> str | None:
         except OSError:
             continue
         if index == "0" and "/usb" in parent:
-            return f"/dev/{node.name}"
-    return None
+            try:
+                name = (node / "name").read_text().strip()
+            except OSError:
+                name = ""
+            usb.append((PREFERRED_CAMERA not in name.lower(), len(usb), f"/dev/{node.name}"))
+    return min(usb)[2] if usb else None
 
 
 def device_name(device: str, sysfs: Path = SYSFS_V4L) -> str | None:

@@ -125,6 +125,22 @@ class OnboardCameraTests(unittest.TestCase):
             self.assertEqual(onboard_camera.device_name("/dev/video0", sysfs), "Brio 101")
             self.assertIsNone(onboard_camera.find_camera(root / "missing"))
 
+    def test_find_camera_prefers_brio_over_other_usb_webcams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysfs = root / "video4linux"
+            for name, cam, port in (("video0", "HD Webcam C270", "usb1"), ("video2", "Brio 101", "usb2")):
+                parent = root / "devices" / "platform" / port / "1-1"
+                parent.mkdir(parents=True)
+                (sysfs / name).mkdir(parents=True)
+                (sysfs / name / "index").write_text("0\n")
+                (sysfs / name / "name").write_text(cam + "\n")
+                try:
+                    os.symlink(parent, sysfs / name / "device", target_is_directory=True)
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+            self.assertEqual(onboard_camera.find_camera(sysfs), "/dev/video2")
+
     def test_mjpeg_passthrough_delivers_camera_bytes_unchanged(self):
         fake, got = FakeV4L2(), []
         cam = onboard_camera.LocalBrioCapture("/dev/video9", on_frame=got.append, opener=lambda d: fake).start()
