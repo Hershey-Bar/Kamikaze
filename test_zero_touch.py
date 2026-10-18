@@ -1,5 +1,6 @@
 """Autonomous scans, without a camera, network, enrollment or persistent image files."""
 
+import io
 import tempfile
 import time
 import unittest
@@ -8,6 +9,7 @@ from unittest import mock
 
 import cv2
 import numpy as np
+from PIL import Image
 
 import cad_harvester
 import citrus_classifier
@@ -21,6 +23,7 @@ import smart_identity
 import smart_scan
 from test_kamikaze import FakeAssets, FakeExtractor
 from test_smart_citrus import Clock
+from test_citrus_color import can
 
 
 def read(text, run):
@@ -57,7 +60,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(self.evidence(text).resolve("beverage_can")["volume"], volume)
 
     def test_kirkland_fixed_color_beats_competing_ocr_even_with_mixed_print(self):
-        e = self.evidence("Kirkland lime 355ml")
+        e = self.evidence("Kirkland sparkling water lime 355ml")
         e.colors.append({"verdict": "lemon", "scores": {"lemon": 0.55, "lime": 0.25}})
         self.assertEqual(e.resolve("beverage_can")["label"], "kirkland_lemon_sparkling_water_355ml_can")
 
@@ -65,14 +68,31 @@ class EvidenceTests(unittest.TestCase):
         e = smart_identity.ScanEvidence()
         e.colors.append(citrus_classifier.color_evidence(np.full((80, 80, 3), (230, 80, 110), np.uint8)))
         self.assertIsNone(e.resolve("beverage_can"))
-        result = e.resolve("beverage_can", known_brand="Kirkland")
+        result = e.resolve("beverage_can", known_kirkland_line=True)
         self.assertIn("grapefruit", result["label"])
         self.assertEqual(result["source"], "vision_color")
 
     def test_visible_competing_brand_is_not_overridden_by_visual_brand(self):
         e = self.evidence("Pepsi 355ml", (110, 200, 40))
-        result = e.resolve("beverage_can", known_brand="Kirkland")
+        result = e.resolve("beverage_can", known_kirkland_line=True)
         self.assertEqual(result["metadata"]["brand"], "Pepsi")
+
+    def test_pale_artwork_overrides_stale_text_but_not_other_kirkland_lines(self):
+        e = self.evidence("Kirkland sparkling water lime 355ml", (244, 212, 225))
+        self.assertIn("grapefruit", e.resolve("beverage_can")["label"])
+        for text, category in (("Kirkland lime juice", "beverage_bottle"),
+                               ("Kirkland lime hard seltzer", "beverage_can")):
+            e = self.evidence(text, (244, 212, 225))
+            result = e.resolve(category, known_kirkland_line=True)
+            self.assertNotIn("sparkling_water", result["label"])
+
+    def test_ambiguous_frames_age_out_old_flavor(self):
+        e = self.evidence("Kirkland sparkling water lime", (110, 200, 40))
+        blank = citrus_classifier.color_evidence(np.full((80, 80, 3), 225, np.uint8))
+        for i in range(12):
+            e.add(read("Kirkland sparkling water lime", 10 + i), blank)
+        self.assertIsNone(e.resolve("beverage_can"))
+        self.assertIsNone(citrus_classifier.kirkland_flavor(e.color()))
 
     def test_phone_text_matches_without_prototypes(self):
         self.assertEqual(self.evidence("Apple iPhone 14 Pro").resolve("smartphone")["label"], "iphone_14_pro")
@@ -215,6 +235,108 @@ class ZeroTouchPipelineTests(unittest.TestCase):
         self.step()
         self.assertEqual(self.pipe.smart.status, "idle")
         self.assertIsNone(self.pipe._viewer_label)
+
+    def test_locked_kirkland_rechecks_color_and_releases_on_sustained_swap(self):
+        self.frame = receiver.FrameScore("kirkland_lime_can", 0.95)
+        self.step(text="")
+        for i in range(10):
+            self.clock.t += 0.5
+            self.step(i, text="")
+        self.assertEqual(self.pipe.smart.status, "locked")
+        lime = self.pipe._citrus
+        pink = citrus_classifier.color_evidence(can((244, 212, 225)))
+        self.pipe._citrus = pink
+        self.step(text="")
+        self.assertEqual(self.pipe.smart.status, "locked")  # one frame cannot swap a product
+        self.pipe._citrus = lime
+        self.step(text="")
+        self.pipe._citrus = pink
+        for _ in range(smart_scan.SWAP_FRAMES):
+            self.clock.t += 0.05
+            self.step(text="")
+        self.assertEqual(self.pipe.smart.status, "idle")
+        self.assertIsNone(self.pipe._viewer_label)
+        self.step(text="")
+        for i in range(10):
+            self.clock.t += 0.5
+            self.step(i, text="")
+        self.assertEqual(self.pipe.smart.status, "locked")
+        self.assertIn("grapefruit", self.pipe._viewer_label)
+
+    def test_no_artwork_cannot_lock_just_the_enrolled_body(self):
+        self.frame = receiver.FrameScore("kirkland_lime_can", 0.95)
+        self.pipe._citrus = citrus_classifier.color_evidence(np.full((80, 80, 3), 225, np.uint8))
+        self.step(text="")
+        for i in range(10):
+            self.clock.t += 0.5
+            self.step(i, text="")
+        self.assertEqual(self.pipe.smart.status, "inconclusive")
+        self.assertIsNone(self.pipe._viewer_label)
+
+
+@unittest.skipIf(receiver.torch is None, "PyTorch not installed")
+class KirklandOutputTests(unittest.TestCase):
+    def setUp(self):
+        self.extractor = FakeExtractor()
+        self.extractor.vec = receiver.torch.ones(16) / 4
+        bank = receiver.EmbeddingBank(None)
+        self.lime = "kirkland_sparkling_water_lime_can"
+        bank.add_multiview(self.lime, {"front": [self.extractor.vec]}, {
+            "brand": "Kirkland", "raw_name": "Kirkland Sparkling Water Lime", "category": "beverage_can",
+            "variant": "sparkling water lime", "package_type": "can", "container_volume": "355ml"})
+        self.pipe = receiver.Pipeline(self.extractor, bank, mock.Mock(), FakeAssets(), detector=mock.Mock())
+        self.pipe.view = "debug"
+        self.pipe.devices = None
+        self.pipe._detection = {"target": {"label": "beverage can", "score": 0.9, "box": [0, 0, 1, 1]},
+                                "crop": None}
+        self.pipe._locate = mock.Mock(return_value=(None, 0))
+
+    def frame(self, rgb):
+        buf = io.BytesIO()
+        Image.fromarray(can(rgb, print_frac=0.5)).save(buf, format="JPEG")
+        with mock.patch.object(receiver, "SCENE_GATE", False), mock.patch.object(receiver, "LOG_FRAMES", False), \
+                mock.patch.object(self.pipe, "_announce"):
+            return self.pipe.process_jpeg(buf.getvalue())
+
+    def test_only_lime_enrolled_corrects_debug_label_confirmed_label_and_asset(self):
+        for rgb, flavor in (((244, 212, 225), "grapefruit"), ((242, 239, 209), "lemon"),
+                            ((216, 241, 212), "lime"), ((230, 40, 50), "grapefruit")):
+            with self.subTest(flavor=flavor):
+                for _ in range(receiver.IDENT_FRAMES + 1):
+                    result = self.frame(rgb)
+                snap = self.pipe.snapshot()
+                self.assertEqual(result["state"], receiver.IDENTIFIED)
+                for key in ("label", "confirmed_label", "viewer_label", "glb_url"):
+                    self.assertIn(flavor, snap[key], (key, snap[key]))
+                self.assertEqual(snap["category"], "beverage_can")
+                self.assertEqual(self.pipe.bank.labels(), [self.lime])
+
+    def test_family_evidence_is_required_not_just_color(self):
+        self.pipe._citrus = citrus_classifier.color_evidence(can((244, 212, 225)))
+        ranked = [(self.lime, 0.5, "front")]
+        self.assertEqual(self.pipe._kirkland_candidate(ranked, {})["action"], "awaiting_brand")
+        self.pipe._ocr_tokens = ({"pepsi"}, {})
+        self.assertEqual(self.pipe._kirkland_candidate([(self.lime, 0.95, "front")], {})["action"], "awaiting_brand")
+        self.pipe._ocr_tokens = ({"kirkland", "juice"}, {})
+        self.assertEqual(self.pipe._kirkland_candidate([(self.lime, 0.95, "front")], {})["action"], "awaiting_brand")
+
+    def test_unreadable_artwork_does_not_return_lime_label(self):
+        for _ in range(receiver.GUIDE_FRAMES + 1):
+            result = self.frame((225, 225, 225))
+        self.assertIsNone(result["label"])
+        self.assertIsNone(self.pipe.snapshot()["confirmed_label"])
+
+    def test_stale_lime_model_clears_when_pink_family_match_is_uncertain(self):
+        for _ in range(receiver.IDENT_FRAMES + 1):
+            self.frame((110, 200, 40))
+        self.assertEqual(self.pipe._viewer_label, self.lime)
+        with mock.patch.object(self.pipe.bank, "rank", return_value=[(self.lime, 0.6, "front")]):
+            for _ in range(receiver.GUIDE_FRAMES + 1):
+                self.frame((244, 212, 225))
+        snap = self.pipe.snapshot()
+        self.assertIsNone(snap["viewer_label"])
+        self.assertIsNone(snap["confirmed_label"])
+        self.assertIsNone(snap["label"])
 
 
 class ProvenanceUpgradeTests(unittest.TestCase):

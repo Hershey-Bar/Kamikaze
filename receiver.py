@@ -2393,6 +2393,45 @@ class Pipeline:
     def _metadata(self, label: str) -> dict | None:
         return self._discovered.get(label) or self.bank.metadata(label)
 
+    def _remember_identity(self, label: str, metadata: dict) -> None:
+        if label not in self._discovered and len(self._discovered) >= 128:
+            self._discovered.pop(next(iter(self._discovered)))
+        self._discovered[label] = metadata
+
+    def _kirkland_candidate(self, ranked: list, fused: dict) -> dict | None:
+        target = self._detection.get("target")
+        if not ranked or smart_identity.detected_category(target) != "beverage_can":
+            return None
+        original, similarity, view = ranked[0]
+        meta = self._metadata(original) or {}
+        if not citrus_classifier.is_kirkland_citrus_can(original, meta):
+            return None
+        # OCR can veto the family, but cannot turn its pink artwork into lime.
+        tokens = self._ocr_tokens[0]
+        if (ocr_fusion.text_score(ocr_fusion.class_words(meta, original), tokens) == 0.0
+                or citrus_classifier.KIRKLAND_OTHER_TYPES.intersection(tokens)
+                or max(calibrate(similarity), fused.get(original, 0.0)) < C_IDENT):
+            return {"action": "awaiting_brand", "flavor": None}
+        flavor = citrus_classifier.kirkland_flavor(self._citrus)
+        if not flavor:
+            return {"action": "awaiting_color", "flavor": None}
+        winner = next((lab for lab, _, _ in ranked if
+                       citrus_classifier.is_kirkland_citrus_can(lab, self._metadata(lab)) and
+                       self._flavor_of(lab) == flavor), None)
+        if winner is None:
+            volume = meta.get("container_volume", "")
+            product = entity_resolver.resolve(f"Kirkland {flavor} sparkling water {volume} can", "beverage_can")
+            winner = product.class_id
+            self._remember_identity(winner, {**product.metadata(), "display_name": product.canonical_name,
+                                             "autonomous": True, "identity_source": "vision_color"})
+            ranked.append((winner, similarity, view))
+        fused[winner] = max(fused.get(winner, 0.0), calibrate(similarity), fused.get(original, 0.0))
+        for lab, score, _ in ranked:
+            if lab != winner and citrus_classifier.is_kirkland_citrus_can(lab, self._metadata(lab)):
+                fused[lab] = min(fused.get(lab, calibrate(score)), C_IDENT - 0.25)
+        ranked.sort(key=lambda row: -fused.get(row[0], calibrate(row[1])))
+        return {"action": "family_color", "flavor": flavor, "winner": winner}
+
     def _mv_complete(self, label: str) -> None:
         self.sm.reset()
         self.pose_est.reset()
@@ -2504,6 +2543,11 @@ class Pipeline:
             if state == IDENTIFIED and self.view != "smart":
                 self._viewer_label = label
                 self.assets.get(label)
+            if (self.view != "smart" and self._viewer_label and
+                    citrus_classifier.is_kirkland_citrus_can(self._viewer_label, self._metadata(self._viewer_label))):
+                fixed = citrus_classifier.kirkland_flavor(self._citrus)
+                if fixed and fixed != self._flavor_of(self._viewer_label):
+                    self._viewer_label = None
             pose = self._pose
             if self.pose_worker is not None and arr is not None:
                 # One DINOv2 pass serves both the pose of the current label and the smartphone identity route.
@@ -2591,12 +2635,21 @@ class Pipeline:
                 "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None,
                 "ocr": None, "route": None}
         ranked, fused, info["ocr"] = self._fuse(ranked, live_color, domain)
+        family = self._kirkland_candidate(ranked, fused)
+        if family and family["action"].startswith("awaiting_"):
+            if self._route is not None:
+                self._route["citrus"] = {**family, "surface": (self._citrus or {}).get("kirkland")}
+            info["route"] = self._route
+            return FrameScore(None, 0.0, hint="verify",
+                              prompt="Show the brand and coloured flavour artwork clearly."), {}, None, "beverage_can", info
         lex_label = (self._route.get("lexicon") or {}).get("label") if self._route else None
         recent_tokens, roll_tokens = self._ocr_tokens
         citrus = citrus_classifier.arbitrate(ranked, fused, self._flavor_of, self._citrus, recent_tokens, roll_tokens,
                                              lex_label, calibrate, margin=MIN_MARGIN, demote_to=C_IDENT - 0.25,
                                              metadata_of_label=self._metadata)
         if citrus is not None and self._route is not None:
+            citrus["family_color"] = family
+            citrus["surface"] = (self._citrus or {}).get("kirkland")
             self._route["citrus"] = citrus
         info["route"] = self._route
         lead = ranked_all[0] if ranked_all else None
@@ -2607,7 +2660,9 @@ class Pipeline:
             return FrameScore(None, 0.0, hint="verify" if conflict else None), {}, None, None, info
         label, s1, best_view = ranked[0]
         top2, s2 = (ranked[1][0], ranked[1][1]) if len(ranked) > 1 else (None, 0.0)
-        category = self.bank.category(label)
+        category = (self._metadata(label) or {}).get("category") or self.bank.category(label)
+        if family and info["ocr"] is not None:
+            info["ocr"] = {**info["ocr"], "label": label, "fused": fused.get(label)}
         views = self.bank.view_sims(label, vec)
         if best_view is None and views:
             best_view = max(views, key=views.get)
@@ -2729,6 +2784,12 @@ class Pipeline:
             confidence = self.smart.confidence if label else 0.0
         elif self.detector is not None and not detected:
             label, confidence = None, 0.0
+        if (self.smart.status == smart_scan.LOCKED and detected == "beverage_can" and not blank
+                and citrus_classifier.is_kirkland_citrus_can(self.smart.label or "", self._metadata(self.smart.label))):
+            fixed = citrus_classifier.kirkland_flavor(self._citrus)
+            if fixed and fixed != self._flavor_of(self.smart.label):
+                product = entity_resolver.resolve(f"Kirkland {fixed} sparkling water can", "beverage_can")
+                label, confidence = product.class_id, max(self.smart.confidence, 0.8)
         if self.smart.status == smart_scan.SCANNING and not blank and (detected or self.detector is None):
             if self.ocr.enabled:
                 ocr = self.ocr.recent(since=self.smart.started)
@@ -2742,16 +2803,16 @@ class Pipeline:
                 self.devices is not None and scan_category == "smartphone") else None
             visual = arb.get("raw_top1") or {"label": frame.label, "score": frame.s1}
             visual_label = visual.get("label") or ""
-            known_brand = "Kirkland" if (scan_category == "beverage_can" and
+            known_line = (scan_category == "beverage_can" and
                 calibrate(visual.get("score", 0.0)) >= C_IDENT and
-                citrus_classifier.is_kirkland(visual_label, self._metadata(visual_label))) else None
-            identity = self.evidence.resolve(scan_category, match, known_brand=known_brand)
+                citrus_classifier.is_kirkland_citrus_can(visual_label, self._metadata(visual_label)))
+            identity = self.evidence.resolve(scan_category, match, known_kirkland_line=known_line)
             if identity:
                 label, confidence = identity["label"], identity["confidence"]
-                if label not in self._discovered and len(self._discovered) >= 128:
-                    self._discovered.pop(next(iter(self._discovered)))
-                self._discovered[label] = identity["metadata"]
+                self._remember_identity(label, identity["metadata"])
                 self.assets.get(label)  # prefetch during the scan, never block on network or model conversion
+            elif known_line:
+                label, confidence = None, 0.0
             elif label and scan_category and self.bank.category(label) not in (None, scan_category):
                 label, confidence = None, 0.0
             elif match and match.get("conflicts"):
@@ -2910,7 +2971,7 @@ class Pipeline:
         return ocr_fusion.citrus_flavor(self.bank.metadata(label), label)
 
     def _flavor_of(self, label: str) -> str | None:
-        return citrus_classifier.flavor_of(self.bank.metadata(label), label)
+        return citrus_classifier.flavor_of(self._metadata(label), label)
 
     def _dino_identity(self) -> dict[str, float]:
         """Smartphone branch: {phone label: calibrated DINOv2 view-centric confidence} from the latest NPU descriptor."""

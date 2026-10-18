@@ -38,6 +38,8 @@ WORDS = {
 }
 W_COLOR, W_OCR = 0.60, 0.40
 KIRKLAND_COLOR_FLAVORS = {"yellow": "lemon", "pink": "grapefruit", "green": "lime"}
+KIRKLAND_OTHER_TYPES = frozenset(("bottle", "juice", "lemonade", "seltzer", "vodka", "cocktail", "energy"))
+KIRKLAND_MIN, KIRKLAND_MARGIN = 0.55, 0.20
 S_OCR_RECENT, S_OCR_ROLLING = 1.0, 0.6
 
 SIDE = int(os.environ.get("KAMIKAZE_CITRUS_SIDE", "96"))  # crop is downsampled to this longer side
@@ -114,8 +116,7 @@ def to_pixel_box(bbox, width: int, height: int) -> tuple[int, int, int, int]:
     return max(0, x0), max(0, y0), min(width, x1), min(height, y1)
 
 
-def surface_pixels(rgb: np.ndarray, bbox=None) -> tuple[np.ndarray, np.ndarray, int]:
-    """(HSV, LAB) uint8 pixels of the masked can surface (inner ellipse, no glare / ink), plus the masked area."""
+def _surface_image(rgb: np.ndarray, bbox=None) -> np.ndarray:
     arr = np.asarray(rgb)
     if arr.ndim != 3 or arr.shape[2] < 3 or arr.size == 0:
         raise ValueError("expected an (H, W, 3) RGB image")
@@ -132,7 +133,13 @@ def surface_pixels(rgb: np.ndarray, bbox=None) -> tuple[np.ndarray, np.ndarray, 
         s = SIDE / max(h, w)
         arr = cv2.resize(arr, (max(4, int(round(w * s))), max(4, int(round(h * s)))), interpolation=cv2.INTER_AREA)
         h, w = arr.shape[:2]
-    arr = np.ascontiguousarray(arr)
+    return np.ascontiguousarray(arr)
+
+
+def surface_pixels(rgb: np.ndarray, bbox=None) -> tuple[np.ndarray, np.ndarray, int]:
+    """(HSV, LAB) uint8 pixels of the masked can surface (inner ellipse, no glare / ink), plus the masked area."""
+    arr = _surface_image(rgb, bbox)
+    h, w = arr.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
     ry, rx = max(1.0, ELLIPSE * h / 2.0), max(1.0, ELLIPSE * w / 2.0)
@@ -142,6 +149,42 @@ def surface_pixels(rgb: np.ndarray, bbox=None) -> tuple[np.ndarray, np.ndarray, 
     s, v = hsv[..., 1], hsv[..., 2]
     keep = ellipse & ~((v > GLARE_V) & (s < GLARE_S)) & ~(v < INK_V)
     return hsv[keep], lab[keep], int(keep.sum())
+
+
+def kirkland_color_evidence(rgb: np.ndarray, bbox=None) -> dict:
+    """Count pale and saturated flavour artwork, not the shared white body or small red brand logo."""
+    arr = _surface_image(rgb, bbox)
+    h, w = arr.shape[:2]
+    # The old ellipse missed artwork above/below the centre. Keep the cylindrical middle, excluding the lid/base.
+    surface = arr[max(0, round(h * 0.18)):max(1, round(h * 0.90)),
+                  max(0, round(w * 0.20)):max(1, round(w * 0.80))]
+    hsv = cv2.cvtColor(surface, cv2.COLOR_RGB2HSV).astype(np.float32)
+    lab = cv2.cvtColor(surface, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hue, sat, value = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    a, b = lab[..., 1] - 128.0, lab[..., 2] - 128.0
+    chroma = (sat >= 22) & (value >= 55) & (np.hypot(a, b) >= 6)
+    red_excess = surface[..., 0].astype(np.int16) - surface[..., 1].astype(np.int16)
+    masks = {
+        "grapefruit": chroma & ((hue >= 150) | (hue <= 13)) & (a >= 4) & (red_excess >= 10),
+        "lemon": chroma & (hue >= 19) & (hue < 36) & (b >= 8),
+        "lime": chroma & (hue >= 36) & (hue <= 85) & (a <= -6),
+    }
+    area = max(1, hue.size)
+    counts = {}
+    coverage = {}
+    for flavor, mask in masks.items():
+        count = int(mask.sum())
+        rows = np.count_nonzero(mask.sum(axis=1) >= max(2, mask.shape[1] * 0.15))
+        coverage[flavor] = round(count / area, 4)
+        # A tiny logo, isolated noisy pixels or a single glare fringe cannot name the flavour.
+        counts[flavor] = count if count >= max(12, area * 0.035) and rows >= max(3, len(mask) * 0.12) else 0
+    total = max(1, int(chroma.sum()))
+    scores = {f: round(counts.get(f, 0) / total, 4) for f in FLAVORS}
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    best = ranked[0]
+    verdict = best if scores[best] >= KIRKLAND_MIN and scores[best] - scores[ranked[1]] >= KIRKLAND_MARGIN else None
+    return {"scores": scores, "verdict": verdict, "strong": bool(verdict and scores[best] >= STRONG),
+            "coverage": coverage, "fraction": round(int(chroma.sum()) / area, 4)}
 
 
 def _circular_mean_hue(h: np.ndarray) -> float:
@@ -158,7 +201,8 @@ def color_evidence(rgb: np.ndarray, bbox=None) -> dict:
     chroma = hsv[:, 1] >= CHROMA_S
     n = int(chroma.sum())
     frac = n / area if area else 0.0
-    out = {"scores": dict(zero), "verdict": None, "strong": False, "fraction": round(frac, 4), "clusters": []}
+    out = {"scores": dict(zero), "verdict": None, "strong": False, "fraction": round(frac, 4), "clusters": [],
+           "kirkland": kirkland_color_evidence(rgb, bbox)}
     if area == 0 or frac < MIN_FRACTION or n < 12:
         return out
     hsv_c, lab_c = hsv[chroma], lab[chroma].astype(np.float32)
@@ -261,9 +305,31 @@ def is_kirkland(label: str = "", meta: dict | None = None) -> bool:
     return bool(re.search(r"\bkirkland\b", text, re.I))
 
 
+def is_kirkland_citrus_can(label: str = "", meta: dict | None = None) -> bool:
+    """Only the lime/lemon/grapefruit sparkling-water cans, including their existing short class aliases."""
+    meta = meta or {}
+    if not is_kirkland(label, meta) or meta.get("category") not in (None, "", "beverage_can"):
+        return False
+    if meta.get("package_type") not in (None, "", "can"):
+        return False
+    text = " ".join(str(meta.get(k, "")) for k in
+                    ("raw_name", "name", "display_name", "variant", "drink_type")) + " " + label.replace("_", " ")
+    text = text.lower()
+    if KIRKLAND_OTHER_TYPES.intersection(re.findall(r"[a-z]+", text)):
+        return False
+    flavor = flavor_of(meta, label)
+    if flavor not in (None, *KIRKLAND_COLOR_FLAVORS.values()):
+        return False
+    if re.search(r"\bsparkling\s+water\b", text):
+        return True
+    return bool(re.fullmatch(r"kirkland_(?:signature_)?(?:lime|lemon|grapefruit)(?:_355ml)?_can", label.lower())
+                and not any(meta.get(k) for k in ("raw_name", "name", "drink_type")))
+
+
 def kirkland_flavor(evidence: dict | None) -> str | None:
     """A clear surface colour is authoritative for the three Kirkland citrus variants."""
     evidence = evidence or {}
+    evidence = evidence.get("kirkland", evidence)
     flavor = evidence.get("verdict")
     scores = evidence.get("scores") or {}
     if flavor not in KIRKLAND_COLOR_FLAVORS.values():
@@ -297,7 +363,7 @@ def arbitrate(ranked: list, fused: dict, flavor_of_label, evidence: dict | None,
     info = {"top": top, "top_flavor": ftop, "flavor": dec["flavor"], "p": dec["p"],
             "verdict": (evidence or {}).get("verdict"), "strong": bool((evidence or {}).get("strong")),
             "suppressed": dec["suppressed"], "action": None}
-    kirkland = lambda lab: is_kirkland(lab, metadata_of_label(lab) if metadata_of_label else None)
+    kirkland = lambda lab: is_kirkland_citrus_can(lab, metadata_of_label(lab) if metadata_of_label else None)
     fixed = kirkland_flavor(evidence) if kirkland(top) else None
     if fixed is not None:
         info["flavor"] = fixed

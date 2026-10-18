@@ -194,7 +194,8 @@ class KirklandFixedColorTests(unittest.TestCase):
     def test_metadata_brand_works_for_custom_class_ids(self):
         ranked = [("first", 0.9, "front"), ("second", 0.2, "back")]
         fused = {}
-        metadata = {"first": {"brand": "Kirkland Signature"}, "second": {"brand": "Kirkland"}}
+        metadata = {"first": {"brand": "Kirkland Signature", "raw_name": "Kirkland Sparkling Water Lemon"},
+                    "second": {"brand": "Kirkland", "raw_name": "Kirkland Sparkling Water Lime"}}
         cc.arbitrate(ranked, fused, lambda lab: {"first": "lemon", "second": "lime"}[lab],
                      cc.color_evidence(can(GREENS[4])), metadata_of_label=metadata.get)
         self.assertEqual(ranked[0][0], "second")
@@ -218,6 +219,55 @@ class KirklandFixedColorTests(unittest.TestCase):
                    {"verdict": None, "scores": {"lime": 0.5, "lemon": 0.49}},
                    cc.color_evidence(can(hsv_rgb(17, 240, 245)))):
             self.assertIsNone(cc.kirkland_flavor(ev))
+
+    def test_specific_product_line_only(self):
+        for label in ("kirkland_lime_can", "kirkland_signature_sparkling_water_lemon_can",
+                      "kirkland_grapefruit_sparkling_water_355ml_can"):
+            self.assertTrue(cc.is_kirkland_citrus_can(label))
+        for name in ("Kirkland lime juice bottle", "Kirkland lemonade can", "Kirkland hard seltzer lime can",
+                     "Kirkland sparkling water orange can", "La Croix sparkling water lime can"):
+            self.assertFalse(cc.is_kirkland_citrus_can(meta={"raw_name": name}))
+        self.assertFalse(cc.is_kirkland_citrus_can("kirkland_lime_can", {"category": "beverage_bottle"}))
+        self.assertFalse(cc.is_kirkland_citrus_can(meta={"brand": "Kirkland", "flavor": "lime"}))
+
+    def test_pastel_and_saturated_artwork_with_logo_glare_and_exposure(self):
+        colors = {
+            "grapefruit": [(244, 212, 225), (239, 215, 208), (230, 40, 50), (210, 45, 135)],
+            "lemon": [(242, 239, 209), (248, 243, 193), (245, 221, 40)],
+            "lime": [(216, 241, 212), (201, 228, 186), (120, 200, 40)],
+        }
+        for flavor, patches in colors.items():
+            for rgb in patches:
+                for exposure in (0.65, 0.85, 1.0, 1.1):
+                    with self.subTest(flavor=flavor, rgb=rgb, exposure=exposure):
+                        image = can(rgb, print_frac=0.50, noise=3.0)
+                        image[25:32, 22:58] = (200, 35, 40)  # shared red Kirkland lettering
+                        image = np.clip(image.astype(float) * exposure, 0, 255).astype(np.uint8)
+                        ok, jpeg = cv2.imencode(".jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+                                               [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        self.assertTrue(ok)
+                        image = cv2.cvtColor(cv2.imdecode(jpeg, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+                        self.assertEqual(cc.kirkland_flavor(cc.color_evidence(image)), flavor)
+
+    def test_pale_artwork_not_just_saturated_green_details(self):
+        image = can((244, 212, 225), print_frac=0.6, noise=2)
+        image[65:74, 24:55] = (90, 160, 30)  # green leaf on a grapefruit illustration
+        ev = cc.color_evidence(image)
+        self.assertEqual(cc.kirkland_flavor(ev), "grapefruit")
+        self.assertNotEqual(ev["kirkland"]["verdict"], "lime")
+
+    def test_artwork_outside_old_ellipse_and_green_background(self):
+        image = np.full((160, 80, 3), 225, np.uint8)
+        image[116:139, :] = (244, 212, 225)
+        scene = np.full((240, 320, 3), (80, 200, 40), np.uint8)
+        scene[40:200, 120:200] = image
+        self.assertEqual(cc.kirkland_flavor(cc.color_evidence(scene, (112, 35, 208, 205))), "grapefruit")
+
+    def test_shared_logo_or_white_body_never_picks_a_flavor(self):
+        for rgb in ((225, 225, 225), (235, 233, 223), (228, 234, 226)):
+            image = np.full((160, 80, 3), rgb, np.uint8)
+            image[28:32, 24:56] = (220, 25, 40)
+            self.assertIsNone(cc.kirkland_flavor(cc.color_evidence(image)))
 
 
 if __name__ == "__main__":

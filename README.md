@@ -49,8 +49,14 @@ asset is ready; amber remains on while retrieving or guiding. Idle LEDs breathe 
 Citrus fusion is 60% colour / 40% OCR with conflicting flavour tokens suppressed. Hue bands are in **OpenCV's 0-180
 scale**, not physical degrees. Can volumes use the existing cited Crown table, not a shared assumed size for 250 and
 330 ml. A volume alone does not prove the package profile; inferred profiles remain labelled as assumptions.
-For recognised Kirkland cans, clear surface colour takes priority over conflicting OCR and inter-flavour visual
-scores. This is internal classification logic, not an additional kiosk control or message.
+Only the Kirkland Signature **sparkling-water can trio** uses a dedicated artwork classifier: pink/red -> grapefruit,
+yellow/cream -> lemon, green/pale green -> lime. It counts both pale and saturated print across the central cylindrical
+surface, excludes neutral white/silver, and rejects tiny logo/noise patches. White alone never identifies a flavour.
+Clear artwork overrides conflicting flavour OCR and same-body visual matches; the correct sibling can be resolved
+even when only lime was enrolled, in both Debug and Smart views. Unreadable artwork requests a clearer view rather
+than trusting the shared chassis. Smart mode continues checking after lock and re-scans a sustained flavour change.
+Other brands, Kirkland bottles, juices and other product lines do not receive this override. This is internal
+classification logic, not an additional kiosk control.
 
 Auto-Orient and Snap to Live Pose use the existing SSE stream (`/api/scan_stream`). Enrolled cardinal views supply
 DINOv2/MobileNet pose; new objects use relative surface-flow yaw plus geometric pitch/roll, explicitly reported as

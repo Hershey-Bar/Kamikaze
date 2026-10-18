@@ -66,7 +66,7 @@ class ScanEvidence:
                 self.ocr_passes += 1
                 self.tokens.update(set(ocr.get("tokens") or ()))
                 self.texts.extend(str(t)[:256] for t in texts[:8])
-        if color and color.get("verdict"):
+        if color:
             self.colors.append(color)
         if crop is not None and np.asarray(crop).size:
             rgb = np.asarray(crop)
@@ -86,9 +86,19 @@ class ScanEvidence:
         best = ranked[0]
         verdict = best if scores[best] >= citrus.VERDICT_MIN and (
             scores[best] - scores[ranked[1]] >= citrus.VERDICT_MARGIN) else None
-        return {"scores": scores, "verdict": verdict, "strong": bool(verdict and scores[best] >= citrus.STRONG)}
+        out = {"scores": scores, "verdict": verdict, "strong": bool(verdict and scores[best] >= citrus.STRONG)}
+        samples = [c["kirkland"] for c in list(self.colors)[-12:] if "kirkland" in c]
+        if samples:
+            sc = {f: sum(c["scores"].get(f, 0) for c in samples) / len(samples) for f in citrus.FLAVORS}
+            order = sorted(sc, key=sc.get, reverse=True)
+            winner = order[0] if sc[order[0]] >= citrus.KIRKLAND_MIN and (
+                sc[order[0]] - sc[order[1]] >= citrus.KIRKLAND_MARGIN) else None
+            out["kirkland"] = {"scores": sc, "verdict": winner,
+                               "strong": bool(winner and sc[winner] >= citrus.STRONG)}
+        return out
 
-    def resolve(self, category: str | None, phone: dict | None = None, known_brand: str | None = None) -> dict | None:
+    def resolve(self, category: str | None, phone: dict | None = None,
+                known_kirkland_line: bool = False) -> dict | None:
         self.identity = None
         self.category = category
         self.message = "Rotate slowly to show the brand, flavour and volume."
@@ -98,10 +108,12 @@ class ScanEvidence:
             self.message = "Present a phone, beverage can or bottle inside the reticle."
             return None
         text = " ".join(self.texts).lower()
+        known_kirkland_line = known_kirkland_line and not citrus.KIRKLAND_OTHER_TYPES.intersection(
+            re.findall(r"[a-z]+", text))
         brands = [brand for brand, pattern in _BRANDS.items() if re.search(pattern, text)]
         color = self.color()
         fixed = citrus.kirkland_flavor(color)
-        visual_brand = known_brand == "Kirkland" and fixed and not brands
+        visual_brand = known_kirkland_line and category == "beverage_can" and fixed and not brands
         if visual_brand:
             brands = ["Kirkland"]
         if len(brands) != 1 or (self.ocr_passes < 2 and not visual_brand):
@@ -110,7 +122,14 @@ class ScanEvidence:
         brand = brands[0]
         fused = citrus.fuse(color, citrus.ocr_scores(recent=self.tokens))
         flavor = fused["flavor"] or taxonomy.find_flavor(text)
-        if brand == "Kirkland" and fixed:
+        kirkland_line = brand == "Kirkland" and category == "beverage_can" and (
+            known_kirkland_line or citrus.is_kirkland_citrus_can(meta={"raw_name": text, "brand": brand,
+                                                                     "category": category}))
+        if kirkland_line:
+            # Identical bodies and stale/misread flavour text must not substitute for visible artwork.
+            if not fixed:
+                self.message = "Rotate to show the coloured flavour artwork clearly."
+                return None
             flavor = fixed
         # A green Sprite or a blue/silver energy drink is not a citrus-flavour declaration.
         if brand not in ("Kirkland", "La Croix"):
@@ -127,7 +146,7 @@ class ScanEvidence:
         volume = f"{next(iter(volumes))}ml" if volumes else ""
         tier = "diet" if re.search(r"\bdiet\b", text) else "zero" if re.search(
             r"\b(?:zero|sugarfree|sugar\s*free)\b", text) else ""
-        kind = "sparkling water" if brand in ("Kirkland", "La Croix") else ""
+        kind = "sparkling water" if kirkland_line or brand == "La Croix" or "sparkling water" in text else ""
         package = "bottle" if category == "beverage_bottle" else "can"
         product = entity_resolver.resolve(" ".join(filter(None, (brand, tier, flavor, kind, volume, package))), category)
         return self._result(product, 0.88, "vision_color" if visual_brand else "ocr_color" if color else "ocr", volume)
