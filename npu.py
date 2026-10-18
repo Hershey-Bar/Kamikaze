@@ -249,10 +249,29 @@ class Runtime:
 
     def run(self, x: np.ndarray, output_indices: list[int]) -> list[np.ndarray]:
         with self.lock:
-            self.interpreter.set_tensor(self.input["index"], x)
-            self.interpreter.invoke()
+            try:
+                self.interpreter.set_tensor(self.input["index"], x)
+                self.interpreter.invoke()
+            except RuntimeError as exc:
+                # A failed QNN graph (e.g. HTP error 1003) never recovers and its error text grows on every
+                # invoke; rebuild once on the NPU, then fall back to the CPU so the pipeline keeps running.
+                self._recover(str(exc)[:160])
+                self.interpreter.set_tensor(self.input["index"], x)
+                self.interpreter.invoke()
             return [_dequantize(self.interpreter.get_tensor(i), d) for i, d in
                     ((i, next(o for o in self.outputs() if o["index"] == i)) for i in output_indices)]
+
+    def _recover(self, why: str) -> None:
+        self.failures = getattr(self, "failures", 0) + 1
+        old_device = self.device
+        log.error("%s invoke failed on %s (%s); rebuilding (%s)", self.path.name, old_device, why,
+                  "NPU" if self.failures == 1 and self.prefer_npu else "CPU")
+        self.interpreter = None
+        if self.failures > 1:
+            self.prefer_npu = False
+        lock = self.lock
+        self.__post_init__()
+        self.lock = lock
 
 
 def _dequantize(arr: np.ndarray, detail: dict) -> np.ndarray:
