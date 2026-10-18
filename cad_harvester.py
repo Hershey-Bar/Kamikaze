@@ -89,6 +89,30 @@ SPEC_BADGE = "Estimated Model: Dimensionally Calibrated via Spec Search"
 DUMMY_BADGE = "1:1 CAD dummy - dimensions verified against GSMArena"
 PACKAGING_BADGE = "Real packaging photo on manufacturer can dimensions"
 LABEL_SCAN_BADGE = "Live 360 degree label scan on manufacturer can dimensions"
+# source_key -> (provenance tier, short dashboard badge). Only spec-generated geometry is "estimated".
+PROVENANCE = {
+    "library": ("verified", "VERIFIED \u00b7 Hand-scanned 3D capture"),
+    "upload": ("verified", "VERIFIED \u00b7 Custom uploaded model"),
+    "printables": ("cad", "CAD 1:1 \u00b7 Community dummy (Printables)"),
+    "thingiverse": ("cad", "CAD 1:1 \u00b7 Community dummy (Thingiverse)"),
+    "packaging": ("packaging", "PACKAGING \u00b7 Real label photo on verified can dimensions"),
+    "label_scan": ("scan", "LIVE SCAN \u00b7 360\u00b0 label on verified can dimensions"),
+    "sketchfab": ("online", "ONLINE \u00b7 Attributed Sketchfab model"),
+    "polypizza": ("online", "ONLINE \u00b7 Attributed Poly Pizza model"),
+    "spec_generated": ("estimated", "ESTIMATED \u00b7 Spec-generated geometry"),
+}
+
+
+def provenance(attr: dict | None) -> dict:
+    """{"type": verified|cad|packaging|scan|online|estimated|"", "text": badge} for an attribution record."""
+    attr = attr or {}
+    key = str(attr.get("source_key") or "")
+    if key not in PROVENANCE and attr.get("match") == "library":
+        key = "library"
+    kind, text = PROVENANCE.get(key, ("", ""))
+    if kind == "cad" and attr.get("author"):
+        text = f"CAD 1:1 \u00b7 {attr['author']} ({key.capitalize()})"
+    return {"type": kind, "text": text}
 
 PHONE_TIERS = {"pro", "max", "plus", "ultra", "mini", "fe", "edge", "air", "lite"}
 CAN_TIER_SYNONYMS = {"zero": "zero", "max": "zero", "diet": "diet", "light": "diet", "lite": "diet"}

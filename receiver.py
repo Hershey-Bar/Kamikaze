@@ -63,6 +63,10 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
                                      360-degree label capture while the can is turned (amber LED bar = coverage, green =
                                      complete); finish wraps the stitched label on the verified Crown can dimensions
   GET  /api/label_scan | /api/label_scan/texture.jpg   scan progress / the partial label (RAM only)
+  GET|POST /api/settings/view        {"view": "smart"|"debug"}: SMART kiosk (5 s autonomous scan, locked identity, auto
+                                     label scan of unlabelled cans) or enrollment & debug (default KAMIKAZE_VIEW=smart)
+  GET  /api/scan                     SMART scan state (status idle|scanning|locked|inconclusive, progress, votes, tokens)
+  GET  /api/scan_stream              alias of /api/events (SSE live state incl. smart_scan)
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
 Pipeline per frame: Ultralytics YOLO-World v2 (open vocabulary: beverage can / soda can / smartphone / bottle; YOLO26n
@@ -150,6 +154,7 @@ import npu as npu_mod
 import onboard_camera
 import packaging
 import pose as pose_mod
+import smart_scan
 import ocr_fusion
 import taxonomy
 import telemetry
@@ -175,6 +180,12 @@ TORCH_THREADS = int(os.environ.get("KAMIKAZE_TORCH_THREADS", "1"))
 LOG_FRAMES = os.environ.get("KAMIKAZE_LOG_FRAMES", "1") != "0"
 LED_HEARTBEAT_S = float(os.environ.get("KAMIKAZE_LED_HEARTBEAT", "5"))
 MODE = os.environ.get("KAMIKAZE_MODE", "training").strip().lower()  # training | deployment
+VIEWS = ("smart", "debug")  # dashboard view: SMART kiosk (5 s autonomous scan) | enrollment & debug console
+VIEW = os.environ.get("KAMIKAZE_VIEW", "smart").strip().lower()
+VIEW = VIEW if VIEW in VIEWS else "smart"
+# asset provenances that already carry the can's real upright label (no automatic 360 degree label scan needed)
+LABELLED_SOURCES = {"library", "upload", "label_scan", "packaging"}
+AUTO_SCAN_RESOLVE_S = float(os.environ.get("KAMIKAZE_AUTO_SCAN_RESOLVE", "4.0"))
 PREVIEW_FRAME = os.environ.get("KAMIKAZE_PREVIEW", "1" if MODE == "training" else "0") != "0"
 
 INPUT_SIZE = 224
@@ -279,12 +290,49 @@ def center_crop_box(width: int, height: int) -> tuple[int, int, int]:
     return size, (width - size) // 2, (height - size) // 2
 
 
-def color_signature(image: Image.Image, box: tuple[int, int, int]) -> np.ndarray:
-    """Colour-modality signature of the object: the inner 60% x 80% of the square crop (where the can / phone body
-    is, leaving most of the background at the sides), reduced to 64x64 before the HSV histogram."""
+def object_pixels(image: Image.Image, box: tuple[int, int, int]) -> np.ndarray:
+    """The inner 60% x 80% of the square crop (where the can / phone body is, leaving most of the background at the
+    sides), reduced to 64x64 RGB in RAM."""
     size, left, top = box
     inner = (left + int(0.2 * size), top + int(0.1 * size), left + int(0.8 * size), top + int(0.9 * size))
-    return color_sig.signature(np.asarray(image.crop(inner).resize((color_sig.SIDE, color_sig.SIDE), Image.BILINEAR)))
+    return np.asarray(image.crop(inner).resize((color_sig.SIDE, color_sig.SIDE), Image.BILINEAR))
+
+
+def color_signature(image: Image.Image, box: tuple[int, int, int]) -> np.ndarray:
+    """Colour-modality signature of the object (HSV histogram of object_pixels)."""
+    return color_sig.signature(object_pixels(image, box))
+
+
+def citrus_tiebreak(ranked: list, fused: dict, flavor_of, hue: dict | None, lexicon_label: str | None,
+                    max_gap: float = 0.25) -> dict | None:
+    """Lime vs lemon: identical Kirkland cans whose embeddings sit within `max_gap` calibrated confidence of each other.
+    When the top two candidates are a lime and a lemon class, OCR did not already confirm one of them (lexicon route),
+    and the object's median print hue gives a verdict (color_sig.citrus_verdict: hue > 38 lime, else lemon), the hue
+    picks the winner: it takes the higher fused confidence and the loser drops MIN_MARGIN + 0.05 below it.
+    Mutates ranked / fused in place; returns diagnostics or None when the rule does not apply."""
+    if len(ranked) < 2:
+        return None
+    a, b = ranked[0][0], ranked[1][0]
+    fa, fb = flavor_of(a), flavor_of(b)
+    if not fa or not fb or fa == fb or lexicon_label in (a, b):
+        return None
+    ca, cb = fused.get(a, calibrate(ranked[0][1])), fused.get(b, calibrate(ranked[1][1]))
+    if abs(ca - cb) > max_gap:
+        return None
+    verdict = color_sig.citrus_verdict(hue)
+    info = {"pair": [a, b], "median_hue": (hue or {}).get("median_hue"), "verdict": verdict, "swapped": False}
+    if verdict is None:
+        return info
+    hi = max(ca, cb)
+    lo = max(0.0, hi - MIN_MARGIN - 0.05)
+    if verdict == fb:
+        ranked[0], ranked[1] = ranked[1], ranked[0]
+        fused[b], fused[a] = hi, min(ca, cb, lo)
+        info["swapped"] = True
+    else:
+        fused[a], fused[b] = hi, min(ca, cb, lo)
+    info["winner"] = ranked[0][0]
+    return info
 
 def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> np.ndarray:
     """Square crop (detector box, else the center 75%) -> 224x224 -> ImageNet normalisation. float32 (1,3,224,224)."""
@@ -1629,7 +1677,7 @@ class AssetManager:
                 return {"glb_url": f"/static/models/{slug}.glb?v={version}", "status": "ready",
                         "title": attr.get("title") or info.get("title", label), "attribution": attr,
                         "credit": cad_harvester.attribution_line(attr), "badge": attr.get("badge", ""),
-                        "source_key": attr.get("source_key", ""), "spec": attr.get("spec"),
+                        "provenance": cad_harvester.provenance(attr), "source_key": attr.get("source_key", ""), "spec": attr.get("spec"),
                         "orientation": attr.get("orientation_fix")}
         if busy:
             status = "resolving"
@@ -1638,7 +1686,8 @@ class AssetManager:
         else:
             status = "pending"
         return {"glb_url": "", "status": status, "title": info.get("title", label), "attribution": None, "credit": "",
-                "badge": "", "reason": missing.get("reason", ""), "offline": self.offline}
+                "badge": "", "provenance": {"type": "", "text": ""}, "reason": missing.get("reason", ""),
+                "offline": self.offline}
 
     def _start(self, label: str, force: bool) -> bool:
         with self._lock:
@@ -2080,6 +2129,7 @@ class Pipeline:
         self.ocr = ocr if ocr is not None else ocr_fusion.OcrWorker(None)
         self._vocab_key: tuple | None = None
         self._route: dict | None = None  # bifurcated-routing diagnostics of the last frame (telemetry)
+        self._hue: dict | None = None  # median print hue of the object (lime vs lemon tiebreak), RAM only
         self._ocr_cursor = 0  # last OCR pass handed to the enrollment lexicon
         self._lighting: dict = {"ok": True, "issue": None, "message": "", "mean_luma": None, "glare_fraction": None,
                                 "gate": LIGHT_GATE}
@@ -2106,6 +2156,11 @@ class Pipeline:
         self._snap_lock = threading.Lock()
         self._scan_lock = threading.Lock()
         self._label_scan: label_stitch.LabelStitcher | None = None
+        self.view = VIEW
+        self.smart = smart_scan.SmartScan()
+        self._auto_scan = False  # the running label scan was started by the SMART scan (not the dashboard button)
+        self._auto_scan_tried: set[str] = set()  # labels whose automatic label scan already ran / was refused
+        self._auto_finishing = False
         packaging.set_detector(self._packaging_detector)
         self._latest_jpeg: bytes | None = None  # single most-recent preview frame, in RAM only, overwritten each frame
         self._frame_cv = threading.Condition(self._frame_lock)
@@ -2336,19 +2391,21 @@ class Pipeline:
                 frame, views, best_view, category = FrameScore(None, 0.0, empty=empty), {}, None, None
                 arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None, "ocr": None,
                        "route": None}
-                arr = None
+                arr, self._hue = None, None
             else:
                 box, detect_ms = self._locate(image)
                 crop_box = box or center_crop_box(*image.size)
                 if self.ocr.enabled:
                     size, left, top = crop_box
                     self.ocr.submit(np.asarray(image.crop((left, top, left + size, top + size))))
-                live_color = None
-                if self.mv.capturing or self.bank.has_color():
-                    try:
-                        live_color = color_signature(image, crop_box)
-                    except Exception:
-                        log.exception("colour signature failed")
+                live_color, self._hue = None, None
+                try:
+                    pixels = object_pixels(image, crop_box)
+                    self._hue = color_sig.hue_stats(pixels)
+                    if self.mv.capturing or self.bank.has_color():
+                        live_color = color_sig.signature(pixels)
+                except Exception:
+                    log.exception("colour signature failed")
                 arr = preprocess(image, box)
                 t1 = time.perf_counter()
                 vec = self.extractor.embed_array(arr)
@@ -2381,12 +2438,18 @@ class Pipeline:
             if self.mv.active:
                 mv = self.mv.status()
                 self.leds.set(capture_led_params(mv["collected"], mv["frames_per_view"]) if capturing else led_params(SEARCHING, 0.0))
-            elif scan is not None and not dark:
-                st = self._feed_label_scan(scan, image)
-                self.leds.set(scan_led_params(st["coverage"], st["complete"]))
             else:
-                self.leds.set(led_params(state, score))
-            if state == IDENTIFIED:
+                st = self._feed_label_scan(scan, image) if scan is not None and not dark else None
+                smart_led = self._smart_step(frame, category, best_view, saliency, arb, st, dark)
+                if st is not None and self._auto_scan and self.smart.status == smart_scan.LOCKED:
+                    self.leds.set(scan_led_params(st["coverage"], st["complete"]))  # locked: keep turning for the label
+                elif smart_led is not None:
+                    self.leds.set(smart_led)
+                elif st is not None:
+                    self.leds.set(scan_led_params(st["coverage"], st["complete"]))
+                else:
+                    self.leds.set(led_params(state, score))
+            if state == IDENTIFIED and not (self.view == "smart" and self.smart.status == smart_scan.LOCKED):
                 self._viewer_label = label
                 self.assets.get(label)
             pose = self._pose
@@ -2459,6 +2522,10 @@ class Pipeline:
                 "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None,
                 "ocr": None, "route": None}
         ranked, fused, info["ocr"] = self._fuse(ranked, live_color, domain)
+        lex_label = (self._route.get("lexicon") or {}).get("label") if self._route else None
+        citrus = citrus_tiebreak(ranked, fused, self._citrus_of, self._hue, lex_label)
+        if citrus is not None and self._route is not None:
+            self._route["citrus"] = citrus
         info["route"] = self._route
         lead = ranked_all[0] if ranked_all else None
         lead_cat = self.bank.category(lead[0]) if lead else None
@@ -2531,6 +2598,8 @@ class Pipeline:
             if lab in dino:
                 cv = (1.0 - DINO_WEIGHT) * cv + DINO_WEIGHT * dino[lab]
             ct = ocr_fusion.text_score(ocr_fusion.class_words(self.bank.metadata(lab), lab), seen) if seen else None
+            if ct is not None and ocr_fusion.citrus_conflict(self._citrus_of(lab), seen):
+                ct = 0.0
             cc = color_sig.score(live_color, self.bank.color_refs(lab)) if live_color is not None else None
             f = ocr_fusion.fuse_calibrated(cv, ct, cc, gate=C_SEARCH)
             if lex and lab == lex[0]:
@@ -2542,6 +2611,144 @@ class Pipeline:
         merged = sorted([(lab, s, view) for lab, s, view, *_ in scored] + list(tail),
                         key=lambda r: -fused.get(r[0], calibrate(r[1])))
         return merged, fused, self._ocr_info(recent, scored[0] if scored else None, live_color)
+
+    # -- SMART kiosk: 5 s autonomous scan (smart_scan.py) -----------------------------------------------------------
+
+    def set_view(self, view: str) -> dict:
+        view = str(view or "").strip().lower()
+        if view not in VIEWS:
+            raise ValueError(f"view must be one of {', '.join(VIEWS)}")
+        if view != self.view:
+            self.view = view
+            self.smart.reset()
+            self._cancel_auto_scan()
+            log.info("dashboard view: %s", view)
+            self._bump()
+        return {"ok": True, "view": self.view, "views": list(VIEWS)}
+
+    def _smart_step(self, frame: "FrameScore", category: str | None, best_view: str | None, saliency: dict,
+                    arb: dict, st: dict | None, dark: bool) -> tuple[int, int, int, int, int] | None:
+        """Feed the SMART scan one frame; returns the LED tuple it wants (None = regular state machine LEDs)."""
+        manual_scan = self._label_scan is not None and not self._auto_scan
+        if self.view != "smart" or manual_scan or self.enroller.active or not self.bank.labels():
+            if self.smart.status != smart_scan.IDLE:
+                self.smart.reset()
+            return None
+        target = self._detection.get("target") or {}
+        det = target.get("score") if target else None
+        if self.detector is None and frame.label:
+            det = frame.c1  # no NPU detector: the identity confidence itself arms the scan
+        blank = dark or bool((saliency or {}).get("empty"))  # an empty / unlit reticle is never evidence of the object
+        ocr = arb.get("ocr") or {}
+        event = self.smart.update(det_score=None if blank else det, label=None if blank else frame.label,
+                                  confidence=0.0 if blank else frame.c1,
+                                  category=category, tokens=ocr.get("tokens") or (),
+                                  sharpness=(saliency or {}).get("laplacian_var"),
+                                  view=best_view if category == "smartphone" else None)
+        if event == "started":
+            log.info("SMART scan #%d started (%.0f s window)", self.smart.scans, self.smart.window_s)
+            self._bump()
+        elif event == "locked":
+            lab = self.smart.label
+            log.info("SMART scan locked %s (%.0f%%, share %.0f%%)", lab, self.smart.confidence * 100, self.smart.share * 100)
+            self._viewer_label = lab
+            self.assets.get(lab)
+            self._bump()
+        elif event in ("inconclusive", "lost", "released"):
+            log.info("SMART scan %s", event)
+            if event != "inconclusive":
+                self._cancel_auto_scan()
+                self._auto_scan_tried.clear()
+            self._bump()
+        if self.smart.status == smart_scan.SCANNING:
+            self._maybe_auto_label_scan(self.smart.label)
+        if self._auto_scan and st is not None and st.get("complete") and not self._auto_finishing:
+            self._auto_finishing = True
+            threading.Thread(target=self._finish_auto_scan, name="auto-label-scan", daemon=True).start()
+        return self.smart.led()
+
+    def _maybe_auto_label_scan(self, label: str | None) -> None:
+        """Cans whose model has no real upright label yet (no hand scan / upload / OFF packaging photo / earlier scan):
+        start the 360 degree label stitcher automatically while the user turns the can during the 5 s scan."""
+        if not label or self._label_scan is not None or label in self._auto_scan_tried:
+            return
+        if self._class_category(label) != "beverage_can" or getattr(self.assets, "offline", False):
+            return
+        self._auto_scan_tried.add(label)
+        if self.assets.peek(label).get("source_key") in LABELLED_SOURCES:
+            return
+        # model resolution and the verified-dimensions check may hit the disk / network: never on the frame path
+        threading.Thread(target=self._start_auto_scan, args=(label,), name="auto-label-scan", daemon=True).start()
+
+    def _labelled_model(self, label: str, wait_s: float = AUTO_SCAN_RESOLVE_S) -> bool:
+        """True once the class's model is a real-label source (hand scan / upload / packaging / earlier scan). A class
+        whose model is not resolved yet is resolved first (library match before any download), up to wait_s."""
+        info = self.assets.peek(label)
+        if info.get("status") != "ready":
+            self.assets.get(label)
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                info = self.assets.peek(label)
+                if info.get("status") not in ("resolving", "pending", None):
+                    break
+                time.sleep(0.1)
+        return info.get("source_key") in LABELLED_SOURCES
+
+    def _start_auto_scan(self, label: str) -> None:
+        if self._labelled_model(label):
+            return
+        try:
+            self.assets.check_label_scan(label)
+        except Exception as exc:
+            log.info("automatic label scan for %s not possible: %s", label, exc)
+            return
+        if self.smart.status not in (smart_scan.SCANNING, smart_scan.LOCKED) or self.smart.label != label:
+            return
+        with self._scan_lock:
+            if self._label_scan is not None:
+                return
+            self._label_scan = label_stitch.LabelStitcher(label)
+            self._auto_scan = True
+        log.info("automatic 360 degree label scan started for %s (model has no real label)", label)
+        self._bump()
+
+    def _cancel_auto_scan(self) -> None:
+        if self._auto_scan and not self._auto_finishing:
+            self._auto_scan = False
+            self.label_scan("cancel")
+
+    def _finish_auto_scan(self) -> None:
+        try:
+            res = self.label_scan("finish")
+            log.info("automatic label scan installed for %s: %s", res.get("label"), (res.get("asset") or {}).get("glb_url"))
+        except Exception:
+            log.exception("automatic label scan finish failed")
+            with self._scan_lock:
+                self._label_scan = None
+        finally:
+            self._auto_scan = self._auto_finishing = False
+            self._bump()
+
+    def smart_status(self) -> dict:
+        snap = self.smart.snapshot()
+        scan = self._label_scan
+        snap["auto_label_scan"] = scan.status() if scan is not None and self._auto_scan else None
+        if snap["label"]:
+            snap["display_name"] = self._display_name(snap["label"])
+        return snap
+
+    def _display_name(self, label: str) -> str:
+        meta = self.bank.metadata(label) or {}
+        name = meta.get("display_name") or meta.get("raw_name")
+        if name:
+            return str(name)
+        try:
+            return cad_harvester.product_for(label).canonical_name
+        except Exception:
+            return label.replace("_", " ")
+
+    def _citrus_of(self, label: str) -> str | None:
+        return ocr_fusion.citrus_flavor(self.bank.metadata(label), label)
 
     def _dino_identity(self) -> dict[str, float]:
         """Smartphone branch: {phone label: calibrated DINOv2 view-centric confidence} from the latest NPU descriptor."""
@@ -2569,6 +2776,8 @@ class Pipeline:
                 continue
             words = ocr_fusion.class_words(self.bank.metadata(lab), lab)
             if ocr_fusion.text_score(words, seen) == 0.0:  # a competing brand was read and this one was not: veto
+                continue
+            if ocr_fusion.citrus_conflict(self._citrus_of(lab), seen):  # read "lemon" but never "lime" (or vice versa)
                 continue
             others = set().union(*(lx for other, lx in lexicons.items() if other != lab))
             m = ocr_fusion.lexicon_match(lexicons[lab], words["brand"], others, seen)
@@ -2888,6 +3097,7 @@ class Pipeline:
             "asset_credit": viewer.get("credit", ""),
             "asset_attribution": viewer.get("attribution"),
             "asset_badge": viewer.get("badge", ""),
+            "asset_provenance": viewer.get("provenance") or {"type": "", "text": ""},
             "asset_reason": viewer.get("reason", ""),
             "asset_spec": viewer.get("spec"),
             "asset_orientation": viewer.get("orientation"),
@@ -2908,6 +3118,9 @@ class Pipeline:
             "enrollment": self.enroller.status(),
             "multiview": self.mv.status(),
             "label_scan": self._label_scan.status() if self._label_scan is not None else None,
+            "label_scan_auto": self._auto_scan,
+            "view": self.view,
+            "smart_scan": self.smart_status(),
             "pose": self._pose,
             "category": self._category,
             "best_view": self._best_view,
@@ -3019,6 +3232,7 @@ class Pipeline:
             "credit": snap["asset_credit"],
             "attribution": snap["asset_attribution"],
             "badge": snap["asset_badge"],
+            "provenance": snap["asset_provenance"],
             "reason": snap["asset_reason"],
             "spec": snap["asset_spec"],
             "cad_mode": snap["cad_mode"],
@@ -3084,6 +3298,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, p.telemetry_snapshot())
         if path == "/api/settings/mode":
             return self._json(200, {"ok": True, **p.assets.mode()})
+        if path == "/api/settings/view":
+            return self._json(200, {"ok": True, "view": p.view, "views": list(VIEWS)})
+        if path == "/api/scan":
+            return self._json(200, {"ok": True, "view": p.view, **p.smart_status()})
         if path == "/api/camera/focus":
             try:
                 return self._json(200, p.camera_focus())
@@ -3133,7 +3351,7 @@ class Handler(BaseHTTPRequestHandler):
             if tex is None:
                 return self._json(404, {"ok": False, "error": "no label scan in progress"})
             return self._send(200, tex, "image/jpeg")
-        if path == "/api/events":
+        if path in ("/api/events", "/api/scan_stream"):
             return self._sse("telemetry=1" in urllib.parse.urlsplit(self.path).query)
         if path in INGEST_ROUTES[:2] or path in SYNC_FRAME_ROUTES:
             return self._json(200, {"ok": True, "hint": "POST camera frames here (raw image/jpeg, multipart/form-data, or "
@@ -3310,6 +3528,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 log.exception("label scan failed")
                 self._json(502, {"ok": False, "error": str(exc)})
+            return True
+        if path == "/api/settings/view":
+            try:
+                req = self._json_body(body)
+                self._json(200, p.set_view(req.get("view")))
+            except (TypeError, ValueError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
             return True
         if path == "/api/settings/mode":
             try:

@@ -263,6 +263,7 @@ class MultiViewFlowTests(unittest.TestCase):
         self.log = []
         self.leds = receiver.LedDriver(lambda *p: self.log.append(p) or True)
         self.pipe = receiver.Pipeline(self.ext, self.bank, self.leds, FakeAssets())
+        self.pipe.view = "debug"  # classic state-machine LEDs; the SMART kiosk scan is covered by test_smart_citrus
         self.server = receiver.make_server(self.pipe, "127.0.0.1", 0)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.conn = HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)

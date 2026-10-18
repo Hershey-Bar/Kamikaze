@@ -91,6 +91,11 @@ FUZZY_CUTOFF = float(os.environ.get("KAMIKAZE_OCR_FUZZY", "0.8"))
 # classic OCR glyph confusions, tried in both directions; a substitution is kept only if it lands on a vocabulary word
 _TO_LETTER = str.maketrans({"0": "o", "1": "l", "5": "s", "8": "b", "2": "z", "6": "g", "4": "a"})
 _TO_DIGIT = str.maketrans({"o": "0", "l": "1", "i": "1", "s": "5", "z": "2", "b": "8"})
+# Strict flavour tokens: one letter apart in print, so a fuzzy (difflib) correction must never land on them - "limon"
+# (Spanish lemon, also a common OCR misread of either) is kept as-is instead of becoming "lemon". Exact reads and pure
+# glyph swaps (l1me -> lime) still count.
+STRICT_FLAVOR = frozenset({"lime", "lemon", "limes", "lemons", "limon", "lima"})
+CITRUS_WORDS = {"lime": {"lime", "limes"}, "lemon": {"lemon", "lemons"}}
 
 
 def _vocab_words(phrases) -> set[str]:
@@ -150,7 +155,7 @@ class Corrector:
                 close = difflib.get_close_matches(w, long_words, n=1, cutoff=FUZZY_CUTOFF)
                 if not close and any(ch.isdigit() for ch in w):
                     close = difflib.get_close_matches(w.translate(_TO_LETTER), long_words, n=1, cutoff=FUZZY_CUTOFF)
-                if close:
+                if close and close[0] not in STRICT_FLAVOR:
                     out = close[0]
         with self._lock:
             if len(self._cache) > 4096:
@@ -207,6 +212,16 @@ def class_words(meta: dict | None, label: str = "") -> dict:
     return {"brand": brand, "detail": detail, "brand_key": key}
 
 
+def citrus_flavor(meta: dict | None, label: str = "") -> str | None:
+    """"lime" / "lemon" when a class is that citrus flavour (exact word match on flavour / variant / name), else None.
+    A class naming both (e.g. "lemon-lime") is None: it is neither side of the lime-vs-lemon tiebreak."""
+    meta = meta or {}
+    text = " ".join(str(meta.get(f, "")) for f in ("flavor", "variant", "raw_name")) + " " + (label or "").replace("_", " ")
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    hits = [name for name, ws in CITRUS_WORDS.items() if ws & words]
+    return hits[0] if len(hits) == 1 else None
+
+
 def text_score(words: dict, seen: set[str]) -> float | None:
     """S_text for one class given the recently read tokens; None when the text is uninformative for this class."""
     if not seen:
@@ -240,11 +255,21 @@ def build_lexicon(meta: dict | None, label: str, run_counts: dict[str, int] | No
     words = class_words(meta, label)
     own = words.get("brand_key")
     foreign = {w for key, ws in BRAND_WORDS.items() if key != own for w in ws - _WEAK}
+    citrus = citrus_flavor(meta, label)
+    foreign |= {w for name, ws in CITRUS_WORDS.items() if citrus and name != citrus for w in ws}
     lex = {w for w in words["brand"] | words["detail"] if lexicon_word_ok(w)}
     for word, n in (run_counts or {}).items():
         if n >= min_runs and lexicon_word_ok(word) and word not in foreign:
             lex.add(word)
     return sorted(lex)[:LEXICON_MAX]
+
+
+def citrus_conflict(flavor: str | None, seen: set[str]) -> bool:
+    """The OCR read the *other* citrus word (lemon for a lime class or vice versa) and not this class's own one."""
+    if flavor not in CITRUS_WORDS:
+        return False
+    other = {w for name, ws in CITRUS_WORDS.items() if name != flavor for w in ws}
+    return bool(other & seen) and not (CITRUS_WORDS[flavor] & seen)
 
 
 def lexicon_match(lexicon: set[str], brand: set[str], others: set[str], seen: set[str]) -> dict:

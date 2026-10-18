@@ -250,6 +250,44 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
      *lime* vs *lemon* vs *grapefruit* on otherwise identical Kirkland cans) plus a brand word or a second lexicon word
      were read; it then gets `C_fused ≥ 0.85` (+0.03 per extra word, cap 0.95). A competitor brand read vetoes, two
      flavours read is a tie (no override), and the route needs a detected can or vision ≥ the SEARCHING floor.
+   - **Lime vs lemon.** The Kirkland lime and lemon cans share one silver design, so their embeddings sit close. Three
+     guards stop a lime can from reading as lemon: (1) OCR fuzzy correction can never *produce* a citrus word
+     (`limon`, a common misread and the Spanish word for lemon, stays `limon` instead of becoming `lemon`); exact reads
+     still count; (2) a class's learned lexicon never contains the other citrus word, and reading the other word without
+     the own one zeroes that class's text score and vetoes its lexicon route; (3) when the top two candidates are a
+     lime / lemon pair within 0.25 calibrated confidence and OCR has not decided, the median hue of the strongly
+     coloured print (`color_sig.hue_stats`, OpenCV hue: lemon yellow ~22-34, lime green ~40-75) breaks the tie at
+     `KAMIKAZE_CITRUS_SPLIT` = 38 and the loser drops below the IDENTIFIED margin. Grapefruit pink and silver give no
+     verdict and leave the ranking alone. The decision is in the telemetry `route.citrus` field.
+
+## SMART kiosk mode
+
+The header toggle switches between **SMART KIOSK** (default, `KAMIKAZE_VIEW=smart`) and **ENROLLMENT & DEBUG**
+(`POST /api/settings/view {"view": "smart"|"debug"}`; the choice is also kept in the browser). The kiosk hides the
+training console, CAD tools, classes and library panels and the detailed telemetry. It shows the camera, a compact HUD
+(FPS, NPU, RAM, SoC temperature), the scan bar, the 3D stage, the product name, the provenance badge and the
+dimensions (measured CAD dummy, Crown can table, GSMArena body, or "true geometry" for hand scans).
+
+**5-second autonomous scan** (`smart_scan.py`). When the detector sees a target at ≥ 0.70 (or, without a detector, the
+identity confidence is ≥ 0.70) a 5 s window opens. Every frame votes for its top label with its fused confidence; OCR
+tokens and per-view sharpness are accumulated as words and numbers only. The reticle pulses amber and the LEDs fill
+amber 1 to 8 with the window. At the end the leader **locks** if it has ≥ 3 frames, ≥ 60 % of the votes and ≥ 50 %
+mean confidence: solid green x8, its model on the stage. Otherwise the scan is **inconclusive** (amber x4, a hint) and
+re-arms after 2 s. A scan in progress is cancelled when the object leaves for 1 s; a lock is released after 2 s without
+the object or after 15 confident frames of another class. Empty or unlit reticles never count as the object, and
+enrollment frames never start a scan. Tune with `KAMIKAZE_SMART_WINDOW`, `_DETECT`, `_LOCK`, `_SHARE`, `_LOST`,
+`_RELEASE`, `_HOLD`, `_SWAP`.
+
+**Automatic label scan.** During the scan, a can whose model has no real label yet (no hand scan, upload, packaging
+photo or earlier scan) starts the 360° label scan by itself (online mode, once per class per scan). The class's model is
+resolved first, up to `KAMIKAZE_AUTO_SCAN_RESOLVE` = 4 s, so a library hand scan is never overwritten. After the lock,
+the LEDs show label coverage (amber eighths, green at 98.5 %) while you keep turning the can, and the scan finishes and
+installs itself when complete. Moving the can away cancels it.
+
+**Provenance badge.** The 3D stage badge states where the model came from instead of a fixed "ESTIMATED":
+VERIFIED (green, hand scan or upload), CAD 1:1 (blue, Printables / Thingiverse dummy with its author), PACKAGING
+(violet, Open Food Facts photo on Crown dimensions), LIVE SCAN (teal, 360° label), ONLINE (grey, Sketchfab / Poly
+Pizza) and ESTIMATED (amber, only for spec-generated geometry). It is in `asset_provenance` of `/api/state`.
 
 ## Dashboard
 
@@ -412,6 +450,9 @@ per-class copies made from it). Scans keep their scanned scale; model-viewer fra
 | POST | `/api/classes/<id>/generate_spec` | dimension-calibrated GLB from verified specs, optional cited `{"layout": ...}` for phones (404 + reason when no spec is found) |
 | GET, POST | `/api/label_scan` `{"action": "start"\|"status"\|"cancel"\|"finish", "label": ...}` | 360° can label scan (400 not a can / no verified volume, 404 not enrolled, 409 incomplete / offline / no scan) |
 | GET | `/api/label_scan/texture.jpg` | stitched label preview (404 when no scan is running) |
+| GET, POST | `/api/settings/view` `{"view": "smart"\|"debug"}` | dashboard view (400 for another value) |
+| GET | `/api/scan` | SMART scan state: status, progress, leader, votes, tokens, automatic label scan |
+| GET | `/api/scan_stream` | alias of `/api/events` (SSE live state including `smart_scan`) |
 | GET | `/api/credits`, `/api/db/export`; POST `/api/db/save` | attribution, database export/save |
 | GET | `/api/models` | local model library + per-class cached models |
 | POST | `/api/models/library?name=&category=&filename=&replace=1` | raw GLB body → quality gate → library (201; 409 exists; 422 rejected) |
@@ -429,7 +470,7 @@ cited `layout_json`).
 ## Tests
 
 ```bash
-.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite test_cad_sources
+.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite test_cad_sources test_smart_citrus
 ```
 
 Hardware tests (LED RPC, Hexagon NPU, online CAD) skip themselves when the router socket, the NPU or credentials are absent.

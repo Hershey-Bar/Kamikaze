@@ -100,3 +100,42 @@ def dominant(sig: np.ndarray) -> str:
     if i < HUE_BINS:
         return names[i]
     return ("black", "silver/grey", "white")[i - HUE_BINS]
+
+# Lime vs lemon hue tiebreaker (OpenCV hue scale 0-180; saturation / value on 0-255). Kirkland lime / lemon cans share
+# one silver-white design and differ only in print, so the median hue of the strongly coloured pixels decides:
+# yellow lemon print sits at ~22-34, green lime print at ~40-75. Reds / pinks (grapefruit) fall outside both bands.
+CITRUS_S_MIN = float(os.environ.get("KAMIKAZE_CITRUS_S_MIN", "60"))
+CITRUS_V_MIN = float(os.environ.get("KAMIKAZE_CITRUS_V_MIN", "60"))
+CITRUS_SPLIT = float(os.environ.get("KAMIKAZE_CITRUS_SPLIT", "38"))
+CITRUS_BAND = (15.0, 90.0)  # outside this the colour says neither lemon nor lime
+CITRUS_MIN_FRAC = float(os.environ.get("KAMIKAZE_CITRUS_MIN_FRAC", "0.03"))
+
+
+def hue_stats(rgb: np.ndarray) -> dict:
+    """{"median_hue": OpenCV-scale median hue of pixels with S > CITRUS_S_MIN and V > CITRUS_V_MIN (None if too few),
+    "fraction": share of such pixels} of an RGB image (downsampled to SIDE px first)."""
+    arr = np.asarray(rgb)
+    if arr.ndim != 3 or arr.shape[2] < 3 or arr.size == 0:
+        raise ValueError("expected an (H, W, 3) image")
+    h, w = arr.shape[:2]
+    if max(h, w) > SIDE:
+        ys = np.linspace(0, h - 1, min(h, SIDE)).astype(int)
+        xs = np.linspace(0, w - 1, min(w, SIDE)).astype(int)
+        arr = arr[ys][:, xs]
+    x = arr[..., :3].astype(np.float32)
+    if x.max() > 1.0:
+        x /= 255.0
+    hue, sat, val = (a.ravel() for a in _rgb_to_hsv(x))
+    mask = (sat * 255.0 > CITRUS_S_MIN) & (val * 255.0 > CITRUS_V_MIN)
+    frac = float(mask.mean()) if mask.size else 0.0
+    if frac < CITRUS_MIN_FRAC:
+        return {"median_hue": None, "fraction": round(frac, 4)}
+    return {"median_hue": round(float(np.median(hue[mask])) * 180.0, 2), "fraction": round(frac, 4)}
+
+
+def citrus_verdict(stats: dict | None) -> str | None:
+    """"lime" (median hue > CITRUS_SPLIT), "lemon" (inside the citrus band, <= CITRUS_SPLIT) or None (no evidence)."""
+    hue = (stats or {}).get("median_hue")
+    if hue is None or not CITRUS_BAND[0] <= hue <= CITRUS_BAND[1]:
+        return None
+    return "lime" if hue > CITRUS_SPLIT else "lemon"

@@ -142,8 +142,39 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
 .lumabar { position:relative; height:6px; border-radius:3px; background:var(--panel2); overflow:hidden; margin-top:4px; }
 .lumabar > div { height:100%; background:var(--blue); }
 .lumabar > i { position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--amber); }
-  #estBadge { position:absolute; right:10px; top:10px; padding:4px 10px; border-radius:999px; background:rgba(245,158,11,.18); border:1px solid var(--amber); color:#ffe7bf; font-size:11px; font-weight:600; display:none; }
+  #estBadge { position:absolute; right:10px; top:10px; padding:4px 10px; border-radius:999px; font-size:11px; font-weight:700; letter-spacing:.04em; display:none; }
   #estBadge.show { display:block; }
+  .prov { background:rgba(148,163,184,.16); border:1px solid #64748b; color:#e2e8f0; }
+  .prov.verified { background:rgba(16,185,129,.18); border-color:var(--green); color:#c9f7e4; }
+  .prov.cad { background:rgba(56,189,248,.18); border-color:var(--blue); color:#d6f1ff; }
+  .prov.packaging { background:rgba(232,121,249,.16); border-color:var(--violet); color:#fbe3ff; }
+  .prov.scan { background:rgba(20,184,166,.18); border-color:#14b8a6; color:#ccfbf1; }
+  .prov.estimated { background:rgba(245,158,11,.18); border-color:var(--amber); color:#ffe7bf; }
+  /* SMART kiosk vs enrollment & debug */
+  .viewseg button { padding:6px 12px; font-size:11px; letter-spacing:.06em; }
+  .kz { display:none !important; }
+  body.kiosk .kz { display:block !important; }
+  body.kiosk .khud.kz { display:grid !important; }
+  body.kiosk .dbg { display:none !important; }
+  body.kiosk .wrap { grid-template-columns:minmax(0,46fr) minmax(0,54fr); }
+  .khud { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin-bottom:10px; }
+  .khud .stat span { font-size:18px; font-weight:700; }
+  .smart { margin-top:10px; padding:12px 14px; border-radius:10px; border:1px solid var(--line); background:var(--panel2); }
+  .smart .smhead { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:8px; }
+  .smart .smhead b { font-size:13px; letter-spacing:.06em; }
+  .smart .meter { height:10px; border-radius:999px; background:rgba(255,255,255,.07); overflow:hidden; }
+  .smart .meter i { display:block; height:100%; width:0; background:var(--amber); transition:width .12s linear; }
+  .smart.scanning { border-color:var(--amber); animation:pulse 1.2s ease-in-out infinite; }
+  .smart.locked { border-color:var(--green); background:rgba(16,185,129,.08); }
+  .smart.locked .meter i { background:var(--green); }
+  .smart.inconclusive { border-color:var(--red); }
+  .smart #smMsg { margin-top:8px; }
+  .kinfo { margin-top:12px; padding:12px 14px; border-radius:10px; background:var(--panel2); border:1px solid var(--line); }
+  .kinfo #kName { font-size:22px; font-weight:700; overflow-wrap:anywhere; }
+  .kinfo .krow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:6px; font-size:12px; color:var(--mute); }
+  .kinfo .krow a { color:#7dd3fc; }
+  .kinfo #kBadge { padding:3px 10px; border-radius:999px; font-size:11px; font-weight:700; letter-spacing:.04em; }
+  .kinfo #kBadge:empty { display:none; }
   .modal { position:fixed; inset:0; background:rgba(2,4,10,.72); display:none; align-items:center; justify-content:center; z-index:50; padding:20px; }
   .modal.show { display:flex; }
   .mbox { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; width:min(920px,100%); max-height:88vh; overflow:auto; }
@@ -165,12 +196,15 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
 <header>
   <h1>KAMIKAZE <small>edge visual → 3D retrieval · VENTUNO Q</small> <span class="pill hwchip">QCS8275 + STM32H5F5</span></h1>
   <span class="hdr">
+    <span class="seg viewseg" title="SMART kiosk: 5-second autonomous scan, clean demo view. Enrollment &amp; debug: training console, CAD tools, full telemetry">
+      <button type="button" id="viewSmart">SMART KIOSK</button><button type="button" id="viewDebug">ENROLLMENT &amp; DEBUG</button>
+    </span>
     <span class="ledhud" id="ledHud" title="Modulino Pixels as last commanded over the arduino-router socket (set_pixels RPC)">
       <span class="lh">Modulino Pixels (Wire1)</span>
       <span class="leds" id="leds"></span>
       <b id="ledMode">—</b>
     </span>
-    <span class="pill" id="lightPill" title="Lighting gate on the reticle crop">light: —</span> <span class="pill" id="modePill">mode: —</span> <span id="conn">connecting…</span>
+    <span class="pill dbg" id="lightPill" title="Lighting gate on the reticle crop">light: —</span> <span class="pill dbg" id="modePill">mode: —</span> <span id="conn">connecting…</span>
   </span>
 </header>
 
@@ -178,19 +212,31 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   <!-- LEFT: live camera -> guided enrollment -> hardware telemetry -->
   <div class="col left">
       <section class="panel">
-        <h2>Live camera · 75% reticle <span class="pill" id="camPill">camera: —</span> <span class="pill" id="viewPill">view: —</span></h2>
+        <h2>Live camera · 75% reticle <span class="pill" id="camPill">camera: —</span> <span class="pill dbg" id="viewPill">view: —</span></h2>
+        <div class="khud kz" id="kHud">
+          <div class="stat"><b>FPS (NPU)</b><span id="kFps">—</span></div>
+          <div class="stat"><b>NPU</b><span id="kNpu">—</span></div>
+          <div class="stat"><b>RAM</b><span id="kRam">—</span></div>
+          <div class="stat"><b>SoC temp</b><span id="kTemp">—</span></div>
+        </div>
         <div class="stage" id="stage">
           <canvas id="cam" width="960" height="540"></canvas>
           <span id="statusPill" class="SEARCHING">SEARCHING</span>
         </div>
         <div id="banner" class="SEARCHING"><span id="hudIcon"></span><span id="hudText">Awaiting object inside center reticle...</span></div>
-        <div class="mini">
+        <div class="smart kz" id="smartBar">
+          <div class="smhead"><b id="smTitle">SMART SCAN · READY</b><span class="pill" id="smPill">idle</span></div>
+          <div class="meter"><i id="smMeter"></i></div>
+          <div class="mute" id="smMsg">Hold a can or phone inside the reticle: a 5-second scan starts automatically (LEDs amber 1-8, then solid green when locked).</div>
+          <div class="chips" id="smChips"></div>
+        </div>
+        <div class="mini dbg">
           <div class="stat"><b>Top-1 match</b><span id="tLabel">—</span></div>
           <div class="stat"><b>Confidence</b><span id="tSim">0.0%</span><div class="bar"><div id="confBar"></div></div></div>
           <div class="stat"><b>Margin Δ (top-1 − top-2)</b><span id="tMargin">0.0%</span><div class="bar m"><div id="marginBar"></div></div></div>
         </div>
-        <div class="chips" id="ocrChips" title="Tri-modal fusion: 0.60 vision + 0.25 OCR text + 0.15 colour (OCR glyph-corrected against the enrolled vocabulary)"></div>
-        <div class="focusrow" id="focusRow" title="On-board camera focus (V4L2): pin a manual focal distance to stop autofocus hunting">
+        <div class="chips dbg" id="ocrChips" title="Tri-modal fusion: 0.60 vision + 0.25 OCR text + 0.15 colour (OCR glyph-corrected against the enrolled vocabulary)"></div>
+        <div class="focusrow dbg" id="focusRow" title="On-board camera focus (V4L2): pin a manual focal distance to stop autofocus hunting">
           <span class="mute">Focus</span>
           <span class="seg"><button type="button" id="focusAuto">Auto Focus</button><button type="button" id="focusMan">Manual Focus</button></span>
           <input type="range" id="focusVal" min="0" max="255" step="5" value="120" disabled>
@@ -199,7 +245,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel dbg">
         <h2>Training console · guided 360° enrollment <span class="pill" id="wizSteps">phone: 5 views · can: 4 views</span></h2>
         <div class="frow">
           <input type="text" id="mName" placeholder="Object name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
@@ -233,7 +279,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         <div id="resolved"></div>
       </section>
 
-    <div class="tele">
+    <div class="tele dbg">
       <section class="panel card">
         <h3>Host · Qualcomm Dragonwing QCS8275</h3>
         <div class="sub" id="socSub">aarch64 · 8 cores · Ubuntu</div>
@@ -299,11 +345,13 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         <h2>Interactive 3D CAD
           <span class="tools">
             <button class="ghost on" id="rotBtn" type="button">Auto Rotate</button>
+            <span class="tools dbg">
             <button class="ghost" id="syncBtn" type="button" title="Drive the viewer camera-orbit from the live yaw/pitch estimate">Sync Physical Pose</button>
             <button class="ghost" id="refetchActiveBtn" type="button">Re-Fetch CAD for Active</button>
             <span class="pill" id="syncPill">pose: off</span>
+            </span>
           </span></h2>
-        <div class="cadbar">
+        <div class="cadbar dbg">
           <span class="seg" title="Offline: local verified cache only. Online: 1:1 CAD dummies (Printables / Thingiverse) for phones, Sketchfab / Poly Pizza game art, Open Food Facts packaging photos for cans">
             <button type="button" id="modeOff">Offline</button><button type="button" id="modeOn">Online</button>
           </span>
@@ -338,10 +386,15 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
           </div>
           <span id="viewerLabel">No model</span>
           <span id="previewBar"><span class="pill on" id="previewPill">preview</span><button class="ghost" id="previewExit" type="button">Back to live</button></span>
-          <span id="estBadge">ESTIMATED · spec-generated geometry</span>
+          <span id="estBadge" class="prov"></span>
           <div id="badge"></div>
         </div>
-        <div class="orient" id="orientBar" title="Fix the model's frame so 0° = its front faces you and +Y is up (stored as a wrapper node; credited as a modification)">
+        <div class="kinfo kz" id="kInfo">
+          <div id="kName">Show an object to the camera</div>
+          <div class="krow"><span id="kBadge" class="prov"></span><span id="kDims"></span></div>
+          <div class="krow" id="kCredit"></div>
+        </div>
+        <div class="orient dbg" id="orientBar" title="Fix the model's frame so 0° = its front faces you and +Y is up (stored as a wrapper node; credited as a modification)">
           <span class="mute">Model frame:</span>
           <button class="ghost" type="button" data-axis="x">Rot X 90°</button>
           <button class="ghost" type="button" data-axis="y">Rot Y 90°</button>
@@ -350,7 +403,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
           <button class="ghost" type="button" data-op="reset">Reset</button>
           <span class="pill" id="orientPill">frame: —</span>
         </div>
-        <div class="scan" id="scanBar">
+        <div class="scan dbg" id="scanBar">
           <b>Label scan</b>
           <span class="meter"><i id="scanMeter"></i></span>
           <span class="pill" id="scanPill">0%</span>
@@ -361,7 +414,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         </div>
       </section>
 
-      <section class="panel">
+      <section class="panel dbg">
         <h2>Enrolled classes <span><span class="pill" id="classCount">0 classes</span> <button id="purgeBtn" class="purge" type="button">PURGE DATABASE</button></span></h2>
         <table class="classes">
           <thead><tr><th>Name</th><th>Category</th><th>Views</th><th>CAD</th><th></th><th></th></tr></thead>
@@ -369,7 +422,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         </table>
       </section>
 
-      <section class="panel">
+      <section class="panel dbg">
         <h2>Local model library <span><span class="pill" id="libCount">0 models</span></span></h2>
         <div class="libadd">
           <input type="text" id="libName" placeholder="Product name for a new .glb, e.g. Kirkland Sparkling Water Lemon" maxlength="80">
@@ -395,7 +448,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   <div id="mBody"></div>
   <div class="frow" id="mActions" style="justify-content:flex-end"></div>
 </div></div>
-<footer>Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/classes/&lt;id&gt;/cad_candidates</code> · <code>/api/settings/mode</code> · <code>/api/credits</code>. 3D models are shown only when they are an exact verified match, a model you picked or uploaded, or geometry generated from verified published dimensions (badged ESTIMATED); otherwise the stage reports NOT FOUND. <a href="/ATTRIBUTION.md" target="_blank" rel="noopener">Model &amp; asset attribution (ATTRIBUTION.md)</a>.</footer>
+<footer class="dbg">Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/classes/&lt;id&gt;/cad_candidates</code> · <code>/api/settings/mode</code> · <code>/api/settings/view</code> · <code>/api/scan</code> · <code>/api/credits</code>. 3D models are shown only when they are an exact verified match, a model you picked or uploaded, or geometry generated from verified published dimensions; the stage badge states provenance: VERIFIED (hand scan / upload), CAD 1:1 (Printables / Thingiverse dummy), PACKAGING, LIVE SCAN (360° label), ONLINE (Sketchfab / Poly Pizza) or ESTIMATED (spec-generated). Otherwise the stage reports NOT FOUND. <a href="/ATTRIBUTION.md" target="_blank" rel="noopener">Model &amp; asset attribution (ATTRIBUTION.md)</a>.</footer>
 
 <script>
   (function () {
@@ -418,6 +471,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
 
   const ctx = $('cam').getContext('2d');
   const viewer = $('viewer');
+  let kiosk = false, viewSynced = false;
   let frameBusy = false, lastSrc = '', syncPose = false, autoRotate = true, state = null, pose = null, lastSse = 0, lastTel = 0, preview = null;
 
   function brackets(x, y, side, color) {
@@ -434,14 +488,26 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   function drawOverlay() {
     const W = ctx.canvas.width, H = ctx.canvas.height, side = (state ? state.crop_fraction : 0.75) * Math.min(W, H);
     const x = (W - side) / 2, y = (H - side) / 2;
-    const color = COLORS[state ? state.state : 'SEARCHING'];
+    const sm = kiosk && state && state.smart_scan ? state.smart_scan : null;
+    let color = COLORS[state ? state.state : 'SEARCHING'];
+    if (sm && sm.status === 'scanning') color = `rgba(245,158,11,${0.55 + 0.45 * Math.abs(Math.sin(Date.now() / 260))})`;
+    else if (sm && sm.status === 'locked') color = COLORS.IDENTIFIED;
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,.42)';
     ctx.fillRect(0, 0, W, y); ctx.fillRect(0, y + side, W, H - y - side);
     ctx.fillRect(0, y, x, side); ctx.fillRect(x + side, y, W - x - side, side);
     ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 1; ctx.strokeRect(x, y, side, side);
     brackets(x, y, side, color);
-    if (state && state.label && state.state !== 'SEARCHING') {
+    if (sm && sm.status === 'scanning') {
+      ctx.fillStyle = 'rgba(245,158,11,.9)'; ctx.fillRect(x, y - 8, side * Math.min(1, sm.progress || 0), 4);
+    }
+    if (sm && sm.status === 'locked' && sm.label) {
+      const tag = `LOCKED · ${sm.display_name || sm.label}`;
+      ctx.font = '700 15px system-ui';
+      const tw = Math.min(side, ctx.measureText(tag).width + 16);
+      ctx.fillStyle = COLORS.IDENTIFIED; ctx.fillRect(x, y + side + 6, tw, 24);
+      ctx.fillStyle = '#000'; ctx.fillText(tag, x + 8, y + side + 23);
+    } else if (state && state.label && state.state !== 'SEARCHING') {
       const tag = `${state.label} ${(state.confidence * 100).toFixed(0)}%`;
       ctx.font = '600 13px system-ui';
       const tw = Math.min(side, ctx.measureText(tag).width + 14);
@@ -751,6 +817,10 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     tr.textContent = !rt.branch ? 'no detector gate (all classes)'
       : rt.branch === 'smartphone' ? `smartphone → DINOv2 + MobileNetV3${rt.dinov2 ? '' : ' (DINOv2 idle)'}`
       : `beverage → OCR lexicon${rt.lexicon ? ' ✓ ' + rt.lexicon.label.replace(/_/g, ' ') : ''} · ${(rt.rolling_tokens || []).length} tokens`;
+    $('kFps').textContent = fmt(st.infer_fps ?? inf.fps, 1);
+    $('kNpu').textContent = onNpu.length ? (st.live ? 'active' : 'ready') : (npu.fastrpc_cdsp ? 'CPU fallback' : 'off');
+    $('kRam').textContent = mem.total_mb ? `${(mem.used_mb / 1024).toFixed(1)} GB` : '—';
+    $('kTemp').textContent = temps.length ? Math.max(...temps).toFixed(1) + ' °C' : '—';
     const li = inf.lighting;
     $('tLight').textContent = li && li.mean_luma != null
       ? `${fmt(li.mean_luma, 0)} / ${fmt(li.glare_fraction * 100, 1, ' %')}${li.ok ? ' · ok' : ' · ' + li.issue.replace('_', ' ')}` : '—';
@@ -865,6 +935,9 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     }
     $('refetchActiveBtn').disabled = !name;
     renderCad(s, name, glb);
+    syncView(s.view);
+    renderSmart(s.smart_scan);
+    renderKiosk(s, name, glb);
     renderSignals(s);
     const poseTxt = pose && pose.valid ? `yaw ${Math.round(pose.yaw)}° · pitch ${Math.round(pose.pitch)}°${pose.source ? ' · ' + pose.source : ''}` : null;
     $('syncPill').textContent = syncPose ? (poseTxt ? 'syncing · ' + poseTxt : 'pose: no object') : (poseTxt ? 'pose: off · ' + poseTxt : 'pose: off');
@@ -909,7 +982,10 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     const nf = !!name && (s.asset_status === 'not_found' || s.asset_status === 'offline_missing');
     $('emptyStage').classList.toggle('show', !name && !preview);
     $('notFound').classList.toggle('show', nf && !preview);
-    $('estBadge').classList.toggle('show', !!glb && !!s.asset_badge);
+    const prov = s.asset_provenance || {};
+    $('estBadge').textContent = prov.text || '';
+    $('estBadge').className = 'prov ' + (prov.type || '');
+    $('estBadge').classList.toggle('show', !!glb && !!prov.type && !preview);
     $('browseBtn').disabled = !name || offline;
     $('nfOnline').style.display = offline ? '' : 'none';
     $('nfBrowse').style.display = offline ? 'none' : '';
@@ -923,7 +999,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
         : ' Pick a ranked online option, upload your own .glb, scan the can label 360°, or generate geometry from verified published dimensions.';
       if ($('nfReason').dataset.busy !== '1') $('nfReason').textContent = why + next;
     }
-    const st = !name ? 'CAD: —' : glb ? `CAD: ${s.asset_badge ? 'estimated' : 'verified'}` : `CAD: ${String(s.asset_status || '').replace('_', ' ')}`;
+    const st = !name ? 'CAD: —' : glb ? `CAD: ${prov.type || 'ready'}` : `CAD: ${String(s.asset_status || '').replace('_', ' ')}`;
     const net = m && m.network;
     const blocked = offline && net && net.blocked ? ` · ${net.blocked} net req blocked` : '';
     $('cadPill').textContent = st + (m ? ` · ${m.mode}` : '') + blocked;
@@ -933,6 +1009,82 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
       modal('No local CAD model', `"${s.asset_title || name}" has no local CAD model. Switch to Online Search mode to query repositories?`, null,
         [['Stay offline', 'ghost', closeModal], ['Switch to Online & Fetch', '', () => { closeModal(); setMode('online'); }]]);
     }
+  }
+
+  function applyView(v) {
+    kiosk = v === 'smart';
+    document.body.classList.toggle('kiosk', kiosk);
+    $('viewSmart').classList.toggle('on', kiosk);
+    $('viewDebug').classList.toggle('on', !kiosk);
+  }
+
+  async function setView(v) {
+    applyView(v);
+    try { localStorage.setItem('kzView', v); } catch (e) {}
+    const j = await post('/api/settings/view', { view: v });
+    if (j && j.view) applyView(j.view);
+  }
+
+  function syncView(v) {
+    if (!v) return;
+    if (!viewSynced) {
+      viewSynced = true;
+      let saved = null;
+      try { saved = localStorage.getItem('kzView'); } catch (e) {}
+      if (saved && saved !== v) { setView(saved); return; }  // restore the operator's choice after a receiver restart
+    }
+    if ((v === 'smart') !== kiosk) applyView(v);
+  }
+
+  function renderSmart(sm) {
+    if (!sm) return;
+    const bar = $('smartBar');
+    bar.className = 'smart kz ' + sm.status;
+    const pct = sm.status === 'locked' ? 100 : Math.round(100 * (sm.progress || 0));
+    $('smMeter').style.width = pct + '%';
+    const name = sm.display_name || (sm.label || '').replace(/_/g, ' ');
+    $('smTitle').textContent = sm.status === 'scanning' ? `SMART SCAN · ${(sm.elapsed || 0).toFixed(1)} / ${sm.window_s || 5} s`
+      : sm.status === 'locked' ? `LOCKED · ${name}` : sm.status === 'inconclusive' ? 'SCAN INCONCLUSIVE' : 'SMART SCAN · READY';
+    $('smPill').textContent = sm.status === 'idle' ? 'idle' : `${pct}% · ${sm.frames || 0} frames${sm.confidence ? ' · ' + Math.round(sm.confidence * 100) + '%' : ''}`;
+    const auto = sm.auto_label_scan;
+    $('smMsg').textContent = (sm.message || '') + (auto ? ` · Auto label scan ${Math.round(100 * (auto.coverage || 0))}% — keep rotating the can slowly.` : '');
+    const chips = $('smChips');
+    chips.replaceChildren();
+    (sm.votes || []).forEach((v) => {
+      const c = document.createElement('span');
+      c.className = 'chip' + (v.label === sm.label ? ' hit' : '');
+      c.textContent = `${String(v.label).replace(/_/g, ' ')} ${Math.round(100 * (v.share || 0))}%`;
+      chips.appendChild(c);
+    });
+    (sm.tokens || []).slice(0, 6).forEach((t) => {
+      const c = document.createElement('span');
+      c.className = 'chip';
+      c.textContent = 'OCR · ' + t;
+      chips.appendChild(c);
+    });
+  }
+
+  function dimsText(s) {
+    const a = s.asset_attribution || {}, sp = s.asset_spec || {}, prov = s.asset_provenance || {};
+    const mm = a.dummy_report && a.dummy_report.measured_mm;
+    if (mm) return `${mm.height} × ${mm.width} × ${mm.thickness} mm (measured CAD)`;
+    if (sp.diameter_mm) return `⌀ ${sp.diameter_mm} × ${sp.height_mm} mm${sp.volume_ml ? ' · ' + sp.volume_ml + ' ml' : ''}`;
+    if (sp.height_mm && sp.width_mm) return `${sp.height_mm} × ${sp.width_mm} × ${sp.depth_mm} mm`;
+    if (prov.type === 'verified') return 'true geometry (hand-scanned / uploaded)';
+    return '';
+  }
+
+  function renderKiosk(s, name, glb) {
+    if (!kiosk) return;
+    const sm = s.smart_scan || {};
+    const label = sm.status === 'locked' ? (sm.display_name || sm.label) : name ? (s.asset_title || name) : '';
+    $('kName').textContent = label ? String(label).replace(/_/g, ' ') : sm.status === 'scanning' ? 'Scanning…' : 'Show an object to the camera';
+    const prov = s.asset_provenance || {};
+    $('kBadge').textContent = glb ? (prov.text || '') : name ? String(s.asset_status || '').replace('_', ' ') : '';
+    $('kBadge').className = 'prov ' + (glb ? prov.type || '' : '');
+    $('kDims').textContent = glb ? dimsText(s) : '';
+    const a = glb ? s.asset_attribution : null;
+    $('kCredit').textContent = a ? [a.author ? 'by ' + a.author : '', a.license || '', a.source || ''].filter(Boolean).join(' · ') : '';
   }
 
   let scanBusy = false, scanPreviewAt = 0;
@@ -1363,6 +1515,8 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     const j = await post('/api/db/save');
     if (j.ok) $('enrollMsg').textContent = 'Saved ' + j.path;
   };
+  $('viewSmart').onclick = () => setView('smart');
+  $('viewDebug').onclick = () => setView('debug');
   $('rotBtn').onclick = () => {
     autoRotate = !autoRotate;
     $('rotBtn').classList.toggle('on', autoRotate);
