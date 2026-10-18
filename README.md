@@ -5,8 +5,9 @@ matching 3D model is fetched and shown in a pose-synchronised `<model-viewer>`, 
 co-processor show the recognition state.
 
 ```
-Windows webcam (stream_cam.py) --HTTP POST /api/ingest, 30 fps--> adb forward tcp:5000 --> receiver.py (VENTUNO Q, 0.0.0.0:5000)
-   receiver.py: ingest returns at once; an NPU worker thread always processes the newest frame (older ones are dropped)
+Logitech Brio (USB 3.0 on the board, /dev/video0, V4L2 MJPG 1920x1080 @ 30 fps) --> onboard_camera.py capture thread
+   (raw camera JPEG passthrough, no re-encode) --> receiver.py (VENTUNO Q, 0.0.0.0:5000) <-- adb forward tcp:5000 (dashboard)
+   receiver.py: capture returns at once; an NPU worker thread always processes the newest frame (older ones are dropped)
    receiver.py: YOLO26n (Ultralytics, Hexagon NPU)       -> crop the phone/can inside the 60% reticle
                 MobileNetV3-Large embedder (Hexagon NPU) -> 1280-d unit vector -> few-shot multi-view prototypes
                 pose.py (OpenCV/NumPy + view matching)   -> pitch/yaw/roll for the 3D viewer
@@ -36,22 +37,39 @@ YOLO; set `KAMIKAZE_DETECTOR=best`. The STM32 firmware in
 ## Run
 
 ```bash
-# board
-./run_receiver.sh                        # dashboard: http://<board>:5000 (or http://localhost:5000 through adb)
-# Windows
-adb forward tcp:5000 tcp:5000
-python stream_cam.py
+# board (Brio plugged into the USB 3.0 Type-A port)
+./run_receiver.sh                        # = receiver.py --camera auto (first USB UVC camera, e.g. /dev/video0)
+./run_receiver.sh --camera /dev/video0   # explicit device; --cam-width/--cam-height/--cam-fps (default 1920/1080/30)
+# Windows: only the dashboard
+adb forward tcp:5000 tcp:5000            # then open http://localhost:5000
 ```
 
-`stream_cam.py` captures in MJPG mode at 30 fps and POSTs over 3 parallel keep-alive connections (`--senders`), because
-one round trip through the ADB tunnel costs ~45 ms and a single sequential sender tops out at ~21 fps. The dashboard
-reads the MJPEG stream (`/api/stream`) with `fetch()` and draws each frame on the canvas; if no frame has arrived for
-`KAMIKAZE_STALE_S` (3 s) the preview is dropped and it shows *Awaiting stream from stream_cam.py on port 5000...*, so a
-stale or test image is never displayed. State and telemetry share one SSE connection (`/api/events?telemetry=1`), so
-several open tabs do not exhaust the browser's per-host connection limit.
-Measured live: camera 30 fps, 29.8 fps sent, NPU worker 29-30 fps (detect 8.7 ms, embed 2.3 ms, 17 ms per frame), MJPEG 29.6 fps, 0 dropped.
+Video is captured **on the board**. `onboard_camera.py` opens the camera with OpenCV's V4L2 backend in MJPG mode
+(1920x1080 @ 30 fps) with colour conversion disabled, so each read is the camera's own JPEG: the capture thread hands it
+unchanged to the pipeline (no decode/re-encode), the NPU worker decodes it once, and the same bytes are served on the
+MJPEG preview (native 16:9, full 1080p). Frames stay in RAM only. The startup log prints
+`[ONBOARD-CAM] Opened /dev/video0 (Brio 101): 1920x1080 MJPG @ 30 FPS`; if the camera is unplugged or stops delivering
+frames it is reopened with back-off. The V4L2 queue keeps its default depth: `CAP_PROP_BUFFERSIZE=1` makes the Brio drop
+every other frame (15 fps measured), while the capture thread drains the queue continuously so no lag builds up.
 
-### Frame ingest
+For inference the 1080p JPEG is decoded at half scale (`KAMIKAZE_DECODE_MAX=960`, JPEG DCT scaling, ~6.5 ms instead of
+~16 ms), and the 60% center square (324 px) is resized to 224x224. Measured on the board with the Brio: capture 29.9 fps,
+inference 30.8 fps, 0 dropped frames, 26 ms median per frame (detector + embedder + decode), CPU ~27%. With
+`KAMIKAZE_DECODE_MAX=0` (full-res decode) inference falls to ~17 fps (48 ms) and ~40% of frames are skipped.
+
+The dashboard reads the MJPEG stream (`/api/stream`) with `fetch()` and draws each frame on the canvas at the camera's
+aspect ratio; if no frame has arrived for `KAMIKAZE_STALE_S` (3 s) the preview is dropped and it shows
+*Awaiting on-board camera ...* with the camera status, so a stale or test image is never displayed. State and telemetry
+share one SSE connection (`/api/events?telemetry=1`), so several open tabs do not exhaust the browser's per-host
+connection limit. Camera device, negotiated mode, capture fps, reconnects and passthrough are in `stream.camera` of
+`/api/state` and `/api/telemetry`.
+
+**Legacy Windows streaming (decommissioned).** `stream_cam.py` + the HTTP ingest routes remain only as a fallback for a
+board without a USB camera: start `./run_receiver.sh --camera none` (or `auto` with no camera attached), then
+`python stream_cam.py` on Windows. While the on-board camera is live every ingest route answers **409** so two sources
+never interleave.
+
+### Frame ingest (legacy HTTP fallback, `--camera none`)
 
 Every route below accepts a frame; the payload format is detected from the body, not only from `Content-Type`:
 
@@ -64,10 +82,19 @@ Every route below accepts a frame; the payload format is detected from the body,
 `GET /api/ingest` returns the accepted routes and the live stream counters. The receiver logs
 `Live stream started: <client> POST <path> (<format>, ...)` when frames start and `Live stream idle` when they stop.
 
-### Troubleshooting "Awaiting stream"
+### Troubleshooting "Awaiting on-board camera"
+
+1. The receiver log shows `[ONBOARD-CAM] Opened ...` or the open error; `curl -s localhost:5000/api/state` →
+   `stream.camera.status` (`streaming`, `reconnecting`, `unavailable`) and `error`.
+2. `ls /sys/class/video4linux/` + `cat /sys/class/video4linux/video*/name`: the Brio exposes two nodes (index 0 = video,
+   index 1 = metadata); `--camera auto` picks the USB node with index 0. The user must be in the `video` group.
+3. Only one process can hold the camera: stop any other capture program on the board.
+
+Legacy `stream_cam.py` path:
 
 1. `stream_cam.py` prints `[STREAM] receiver reachable at ...` at startup, then `[STREAM] POST ... -> HTTP 200` for the
    first 5 frames and every error. *not reachable* means the ADB forward is missing: run `adb forward tcp:5000 tcp:5000`.
+   HTTP 409 means the on-board camera owns the stream (restart the receiver with `--camera none`).
 2. `[CAMERA]` lines show which backend opened the webcam (DirectShow+MJPG, DirectShow, MediaFoundation, default); a
    camera that delivers no frames for 4 s is reopened with the next backend. Use `--camera 1` for another device.
 3. The once-per-second stats line warns when the camera delivers no frames or frames do not reach the receiver.

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Kamikaze edge receiver: few-shot visual identification, guidance state machine, 3D dashboard.
 
-One process, one port (0.0.0.0:5000):
+One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Brio (V4L2, native 1920x1080 MJPG @ 30 fps,
+`--camera auto|/dev/videoN|none`, onboard_camera.py); the HTTP ingest routes below stay available as a legacy fallback
+(Windows stream_cam.py over adb forward) and answer 409 while the on-board camera is live.
   POST /api/ingest | /ingest | / | /upload | /api/upload | /frame
                                      live camera frames: return at once with the latest verdict; a background NPU worker
                                      always processes the newest frame (older unprocessed frames are dropped). Accepts raw
@@ -50,7 +52,9 @@ KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolo26n|yolo11n|lite2|lite0), KAM
 KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_FLOOR / C_IDENT / C_SEARCH / MARGIN
 (calibrated confidence), KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
-KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0).
+KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0),
+KAMIKAZE_CAMERA (auto|/dev/videoN|none), KAMIKAZE_CAM_WIDTH/HEIGHT/FPS (1920/1080/30), KAMIKAZE_DECODE_MAX (default 960:
+1080p frames are decoded at half scale via JPEG DCT scaling so the NPU worker keeps up with 30 fps; 0 = full-res).
 
 Privacy: no raw image is ever written to disk; only 1280-d vectors reach enrolled_classes.pt. The dashboard's live
 view keeps ONE most-recent JPEG in RAM (overwritten every frame, dropped when the stream goes idle, disabled in
@@ -100,6 +104,7 @@ import cad_harvester
 import device_taxonomy
 import entity_resolver
 import npu as npu_mod
+import onboard_camera
 import pose as pose_mod
 import taxonomy
 import telemetry
@@ -183,6 +188,11 @@ STALE_S = float(os.environ.get("KAMIKAZE_STALE_S", "3.0"))  # no camera frame fo
 STREAM_MAX_FPS = float(os.environ.get("KAMIKAZE_STREAM_FPS", "30"))  # MJPEG /api/stream rate cap
 RING_GB = float(os.environ.get("KAMIKAZE_RING_GB", "0")) if MODE == "training" else 0.0
 ASSET_CACHE_MB = float(os.environ.get("KAMIKAZE_ASSET_CACHE_MB", "1024"))
+CAMERA = os.environ.get("KAMIKAZE_CAMERA", "auto")  # on-board V4L2 camera: auto | /dev/videoN | N | none
+CAM_WIDTH = int(os.environ.get("KAMIKAZE_CAM_WIDTH", "1920"))
+CAM_HEIGHT = int(os.environ.get("KAMIKAZE_CAM_HEIGHT", "1080"))
+CAM_FPS = int(os.environ.get("KAMIKAZE_CAM_FPS", "30"))
+DECODE_MAX = int(os.environ.get("KAMIKAZE_DECODE_MAX", "960"))  # >0: JPEG DCT-scaled decode down to ~this long side
 JPEG_SOI = b"\xff\xd8\xff"
 
 
@@ -708,7 +718,7 @@ class Enroller:
             with self._lock:
                 collected = len(self._vectors)
                 target = self._target
-            self.cancel(f"timed out after {timeout:.0f}s with {collected}/{target} frames - is stream_cam.py running?")
+            self.cancel(f"timed out after {timeout:.0f}s with {collected}/{target} frames - is the on-board camera (or stream_cam.py) streaming?")
         return self.status()
 
     def status(self) -> dict:
@@ -859,7 +869,7 @@ class MultiViewEnroller:
         with self._cond:
             if not self._cond.wait_for(lambda: self.phase != "capturing", timeout):
                 self._buf, self.phase = [], "ready"
-                self.error = f"timed out after {timeout:.0f}s - is stream_cam.py running?"
+                self.error = f"timed out after {timeout:.0f}s - is the on-board camera (or stream_cam.py) streaming?"
         return self.status()
 
     def status(self) -> dict:
@@ -1510,6 +1520,7 @@ class Pipeline:
     def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager, detector=None) -> None:
         self.extractor, self.bank, self.leds, self.assets = extractor, bank, leds, assets
         self.detector = detector
+        self.camera = None  # onboard_camera.LocalBrioCapture when the on-board camera is the video source
         self.crop_tracker = npu_mod.CropTracker()
         self._detect_lat: collections.deque = collections.deque(maxlen=240)
         self._detection: dict = {"target": None, "objects": [], "crop": None, "crop_source": "center", "ms": 0.0}
@@ -1610,6 +1621,20 @@ class Pipeline:
                 "similarity": round(last["similarity"], 3), "confidence": round(last["confidence"], 3),
                 "fps": round(self._fps, 1), "ingest_fps": round(self._ingest_fps, 1), "latency_ms": round(last["total_ms"], 1)}
 
+    def attach_camera(self, camera) -> None:
+        """Make an on-board capture object the video source: every frame it reads goes through ingest()."""
+        self.camera = camera
+        camera.on_frame = self.camera_frame
+
+    def camera_live(self) -> bool:
+        return self.camera is not None and bool(self.camera.live)
+
+    def camera_frame(self, data: bytes) -> None:
+        cam = self.camera
+        self.note_source({"client": "onboard", "path": cam.device if cam is not None else "v4l2",
+                          "content_type": "image/jpeg", "format": "mjpeg-v4l2", "bytes": len(data)})
+        self.ingest(data)
+
     def note_source(self, source: dict) -> None:
         """Record who is streaming; log when a stream (re)starts so a route/format mismatch is obvious in the log."""
         with self._frame_lock:
@@ -1634,7 +1659,8 @@ class Pipeline:
             if age <= STALE_S:
                 return
             self._idle_logged = True
-        log.info("Live stream idle: no frame for %.0f s (preview dropped, waiting for stream_cam.py)", age)
+        log.info("Live stream idle: no frame for %.0f s (preview dropped, waiting for the camera%s)", age,
+                 f" {self.camera.device}: {self.camera.status}" if self.camera is not None else " / stream_cam.py")
 
     def _work(self) -> None:
         while True:
@@ -1660,7 +1686,8 @@ class Pipeline:
                 "ingest_fps": round(self._ingest_fps, 1) if live else 0.0, "infer_fps": round(self._fps, 1) if live else 0.0,
                 "ingested": self._ingested, "processed": self._frames, "dropped": self._dropped,
                 "decode_errors": self._decode_errors, "rejected": self._rejected, "source": self._source,
-                "async_worker": self._worker is not None}
+                "async_worker": self._worker is not None,
+                "camera": self.camera.info() if self.camera is not None else {"source": "http-ingest", "device": None}}
 
     def _bump(self) -> None:
         with self._ver_cv:
@@ -1687,6 +1714,9 @@ class Pipeline:
         t0 = time.perf_counter()
         try:
             image = Image.open(io.BytesIO(data))
+            if DECODE_MAX > 0 and image.format == "JPEG" and max(image.size) > DECODE_MAX:
+                k = DECODE_MAX / max(image.size)
+                image.draft("RGB", (max(1, int(image.width * k)), max(1, int(image.height * k))))
             image.load()
         except Exception as exc:
             raise ValueError(f"undecodable image: {exc}") from exc
@@ -2379,6 +2409,11 @@ class Handler(BaseHTTPRequestHandler):
         p = self.pipeline
         ctype = self.headers.get("Content-Type", "")
         source = {"client": self.client_address[0], "path": path, "content_type": ctype.split(";")[0].strip() or None}
+        if p.camera_live():
+            # Single video source: while the on-board camera streams, external POSTs would interleave with it.
+            return self._json(409, {"ok": False, "error": f"on-board camera {p.camera.device} is the active video source; "
+                                    "stop stream_cam.py (or start receiver.py --camera none to use HTTP ingest)",
+                                    "camera": p.camera.info()})
         try:
             frame, fmt = extract_frame(body, ctype)
         except ValueError as exc:
@@ -2439,6 +2474,11 @@ def main() -> None:
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--build-model", action="store_true", help="export the ExecuTorch embedder and exit")
+    parser.add_argument("--camera", default=CAMERA,
+                        help="on-board V4L2 camera: auto (first USB UVC node), /dev/videoN, N, or none for HTTP ingest only")
+    parser.add_argument("--cam-width", type=int, default=CAM_WIDTH)
+    parser.add_argument("--cam-height", type=int, default=CAM_HEIGHT)
+    parser.add_argument("--cam-fps", type=int, default=CAM_FPS)
     args = parser.parse_args()
     logging.basicConfig(level=os.environ.get("KAMIKAZE_LOG", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     for noisy in ("httpx", "httpcore", "huggingface_hub", "urllib3"):
@@ -2462,18 +2502,32 @@ def main() -> None:
     if pipeline.ring.enabled:
         log.info("RAM frame ring enabled: %.1f GB budget (training mode, never written to disk)", pipeline.ring.budget / 2**30)
     leds.set(led_params(SEARCHING, 0.0))
+    camera = None
+    device = onboard_camera.resolve_device(args.camera)
+    if device:
+        camera = onboard_camera.LocalBrioCapture(device, args.cam_width, args.cam_height, args.cam_fps)
+        pipeline.attach_camera(camera)
+        camera.start()
+        if camera.status != "open":
+            log.warning("On-board camera %s not ready (%s); retrying in the background, HTTP ingest stays available",
+                        device, camera.error)
+    elif args.camera.strip().lower() == "auto":
+        log.info("No USB camera found for --camera auto; waiting for HTTP ingest (stream_cam.py)")
     server = make_server(pipeline, args.host, args.port)
     log.info(
-        "Kamikaze receiver on %s:%d | embedder %s | detector %s | %s | ready in %.1fs | %d enrolled classes %s | "
+        "Kamikaze receiver on %s:%d | camera %s | embedder %s | detector %s | %s | ready in %.1fs | %d enrolled classes %s | "
         "dashboard http://localhost:%d/",
-        args.host, args.port, extractor.name, detector.info()["runtime"] if detector else "off", pipeline.accelerator(),
-        time.perf_counter() - t0, loaded, bank.labels(), args.port,
+        args.host, args.port, f"{device} ({camera.actual_w}x{camera.actual_h} {camera.fourcc} @ {camera.actual_fps:.0f})"
+        if camera is not None else "http-ingest", extractor.name, detector.info()["runtime"] if detector else "off",
+        pipeline.accelerator(), time.perf_counter() - t0, loaded, bank.labels(), args.port,
     )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if camera is not None:
+            camera.stop()
         server.server_close()
         set_leds(0, 0, 0, 0, 0)
 

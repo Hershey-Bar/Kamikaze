@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 
 import mcp_server
+import onboard_camera
 import receiver
 
 try:
@@ -55,6 +56,125 @@ class FakeRouterSock:
 
     def close(self):
         pass
+
+
+class FakeV4L2:
+    """Stand-in for cv2.VideoCapture: returns raw MJPG buffers (1xN uint8) or decoded BGR frames, optionally failing."""
+
+    def __init__(self, frame=None, bgr=False, fail=False):
+        self.frame, self.bgr, self.fail, self.props, self.released = frame or jpeg(size=(192, 108)), bgr, fail, {}, False
+
+    def isOpened(self):
+        return True
+
+    def set(self, prop, value):
+        self.props[prop] = value
+        return True
+
+    def get(self, prop):
+        cv2 = onboard_camera.cv2
+        if cv2 is not None and prop == cv2.CAP_PROP_FOURCC:
+            return float(int.from_bytes(b"MJPG", "little"))
+        return float(self.props.get(prop, 0))
+
+    def read(self):
+        time.sleep(0.005)
+        if self.fail:
+            return False, None
+        if self.bgr:
+            return True, np.asarray(Image.open(io.BytesIO(self.frame)).convert("RGB"))[:, :, ::-1].copy()
+        return True, np.frombuffer(self.frame, np.uint8).reshape(1, -1)
+
+    def release(self):
+        self.released = True
+
+
+def wait_for(pred, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
+
+
+class OnboardCameraTests(unittest.TestCase):
+    def test_resolve_device(self):
+        self.assertIsNone(onboard_camera.resolve_device("none"))
+        self.assertIsNone(onboard_camera.resolve_device(""))
+        self.assertEqual(onboard_camera.resolve_device("2"), "/dev/video2")
+        self.assertEqual(onboard_camera.resolve_device("/dev/video0"), "/dev/video0")
+
+    def test_find_camera_prefers_usb_capture_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            usb = root / "devices" / "platform" / "usb1" / "1-1" / "1-1.0"
+            isp = root / "devices" / "platform" / "camss"
+            usb.mkdir(parents=True), isp.mkdir(parents=True)
+            sysfs = root / "video4linux"
+            for name, index, parent in (("video32", "0", isp), ("video1", "1", usb), ("video0", "0", usb)):
+                (sysfs / name).mkdir(parents=True)
+                (sysfs / name / "index").write_text(index + "\n")
+                (sysfs / name / "name").write_text("Brio 101\n")
+                try:
+                    os.symlink(parent, sysfs / name / "device", target_is_directory=True)
+                except OSError as exc:
+                    self.skipTest(f"symlinks unavailable: {exc}")
+            self.assertEqual(onboard_camera.find_camera(sysfs), "/dev/video0")
+            self.assertEqual(onboard_camera.resolve_device("auto", sysfs), "/dev/video0")
+            self.assertEqual(onboard_camera.device_name("/dev/video0", sysfs), "Brio 101")
+            self.assertIsNone(onboard_camera.find_camera(root / "missing"))
+
+    def test_mjpeg_passthrough_delivers_camera_bytes_unchanged(self):
+        fake, got = FakeV4L2(), []
+        cam = onboard_camera.LocalBrioCapture("/dev/video9", on_frame=got.append, opener=lambda d: fake).start()
+        try:
+            self.assertTrue(wait_for(lambda: len(got) >= 3))
+            self.assertEqual(got[0], fake.frame)
+            info = cam.info()
+            self.assertTrue(info["live"])
+            self.assertTrue(info["mjpeg_passthrough"])
+            self.assertEqual(info["status"], "streaming")
+            self.assertFalse(info["persisted_to_disk"])
+            if onboard_camera.cv2 is not None:
+                cv2 = onboard_camera.cv2
+                self.assertEqual(fake.props[cv2.CAP_PROP_FRAME_WIDTH], 1920)
+                self.assertEqual(fake.props[cv2.CAP_PROP_FRAME_HEIGHT], 1080)
+                self.assertEqual(fake.props[cv2.CAP_PROP_CONVERT_RGB], 0)
+                self.assertEqual(info["fourcc"], "MJPG")
+                self.assertEqual(cam.read_latest().shape, (108, 192, 3))
+        finally:
+            cam.stop()
+        self.assertFalse(cam.live)
+        self.assertTrue(fake.released)
+
+    @unittest.skipIf(onboard_camera.cv2 is None, "OpenCV not installed")
+    def test_decoded_frames_are_reencoded_in_memory(self):
+        got = []
+        cam = onboard_camera.LocalBrioCapture("/dev/video9", on_frame=got.append, opener=lambda d: FakeV4L2(bgr=True)).start()
+        try:
+            self.assertTrue(wait_for(lambda: got))
+            self.assertTrue(got[0].startswith(b"\xff\xd8"))
+            self.assertFalse(cam.info()["mjpeg_passthrough"])
+        finally:
+            cam.stop()
+
+    def test_failed_reads_trigger_reopen(self):
+        opened = []
+        cam = onboard_camera.LocalBrioCapture("/dev/video9", opener=lambda d: opened.append(d) or FakeV4L2(fail=True)).start()
+        try:
+            self.assertTrue(wait_for(lambda: cam.reconnects >= 1 and len(opened) >= 2, 5.0))
+            self.assertFalse(cam.live)
+        finally:
+            cam.stop()
+
+    def test_unopenable_device_reports_unavailable(self):
+        def boom(device):
+            raise OSError("no such device")
+        cam = onboard_camera.LocalBrioCapture("/dev/video9", opener=boom)
+        self.assertFalse(cam.open())
+        self.assertEqual(cam.info()["status"], "unavailable")
+        self.assertIn("no such device", cam.info()["error"])
 
 
 class FallbackTests(unittest.TestCase):
@@ -602,6 +722,31 @@ class PipelineHttpTests(unittest.TestCase):
         status, data = self.call("POST", "/api/enroll", json.dumps({"label": "slow", "frames": 5, "wait": True, "timeout": 0.3}).encode())
         self.assertEqual(status, 504)
         self.assertIn("stream_cam", json.loads(data)["error"])
+
+    def test_onboard_camera_feeds_pipeline_and_owns_the_stream(self):
+        a = unit(1)
+        self.ext.vec = a
+        cam = onboard_camera.LocalBrioCapture("/dev/video0", opener=lambda d: FakeV4L2(frame=jpeg()))
+        self.pipe.attach_camera(cam)
+        cam.start()
+        try:
+            self.assertTrue(wait_for(lambda: self.pipe.stream_stats()["processed"] >= 3))
+            st = self.pipe.stream_stats()
+            self.assertEqual((st["source"]["client"], st["source"]["format"]), ("onboard", "mjpeg-v4l2"))
+            self.assertEqual(st["camera"]["device"], "/dev/video0")
+            self.assertTrue(st["camera"]["live"])
+            self.assertEqual(self.pipe.latest_jpeg, cam.latest_jpeg())  # preview == the camera's own JPEG
+            status, data = self.call("POST", "/api/ingest", jpeg(), "image/jpeg")
+            self.assertEqual(status, 409, data)
+            self.assertIn("on-board camera", json.loads(data)["error"])
+            state = json.loads(self.call("GET", "/api/state")[1])
+            self.assertEqual(state["stream"]["camera"]["source"], "onboard-v4l2")
+        finally:
+            cam.stop()
+        self.assertEqual(self.call("POST", "/api/frame", jpeg(), "image/jpeg")[0], 200)  # HTTP ingest is back
+
+    def test_http_ingest_reports_no_camera(self):
+        self.assertEqual(self.pipe.stream_stats()["camera"], {"source": "http-ingest", "device": None})
 
 
 if __name__ == "__main__":

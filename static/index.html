@@ -20,7 +20,7 @@
   @media (max-width:640px) { .row2 { grid-template-columns:1fr; } }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; min-width:0; }
   .panel h2 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.12em; color:var(--mute); display:flex; justify-content:space-between; align-items:center; gap:8px; font-weight:600; }
-  .stage { position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; overflow:hidden; }
+  .stage { position:relative; width:100%; aspect-ratio:16/9; background:#000; border-radius:10px; overflow:hidden; }
   .stage canvas { position:absolute; inset:0; width:100%; height:100%; }
   #statusPill { position:absolute; top:10px; left:10px; padding:4px 12px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.08em; background:rgba(56,189,248,.18); color:var(--blue); border:1px solid var(--blue); backdrop-filter:blur(4px); }
   #statusPill.IDENTIFIED { background:rgba(16,185,129,.2); color:var(--green); border-color:var(--green); }
@@ -100,9 +100,9 @@
   <!-- ROW 1: live camera (45%) | 3D CAD stage (55%) -->
   <div class="row1">
     <section class="panel">
-      <h2>Live camera · 60% reticle <span class="pill" id="viewPill">view: —</span></h2>
-      <div class="stage">
-        <canvas id="cam" width="640" height="480"></canvas>
+      <h2>Live camera · 60% reticle <span class="pill" id="camPill">camera: —</span> <span class="pill" id="viewPill">view: —</span></h2>
+      <div class="stage" id="stage">
+        <canvas id="cam" width="960" height="540"></canvas>
         <span id="statusPill" class="SEARCHING">SEARCHING</span>
       </div>
       <div id="banner" class="SEARCHING"><span id="hudIcon"></span><span id="hudText">Awaiting object inside center reticle...</span></div>
@@ -267,7 +267,7 @@
   }
 
   function drawOverlay() {
-    const W = 640, H = 480, side = (state ? state.crop_fraction : 0.6) * Math.min(W, H);
+    const W = ctx.canvas.width, H = ctx.canvas.height, side = (state ? state.crop_fraction : 0.6) * Math.min(W, H);
     const x = (W - side) / 2, y = (H - side) / 2;
     const color = COLORS[state ? state.state : 'SEARCHING'];
     ctx.save();
@@ -392,29 +392,41 @@
   }
 
   function drawAwaiting(t) {
+    const W = ctx.canvas.width, H = ctx.canvas.height, cx = W / 2, cy = H / 2;
     const pulse = 0.5 + 0.5 * Math.sin(t / 380);
-    ctx.fillStyle = '#05070d'; ctx.fillRect(0, 0, 640, 480);
+    ctx.fillStyle = '#05070d'; ctx.fillRect(0, 0, W, H);
     ctx.save();
     ctx.textAlign = 'center';
     ctx.fillStyle = `rgba(56,189,248,${0.35 + 0.5 * pulse})`;
-    ctx.beginPath(); ctx.arc(320, 200, 9 + 5 * pulse, 0, 2 * Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, cy - 40, 9 + 5 * pulse, 0, 2 * Math.PI); ctx.fill();
     const off = state && state.privacy && state.privacy.preview_enabled === false;
-    ctx.font = '600 17px system-ui'; ctx.fillStyle = `rgba(226,232,240,${0.55 + 0.4 * pulse})`;
-    ctx.fillText(off ? 'Live preview disabled (deployment mode)' : 'Awaiting stream from stream_cam.py on port 5000…', 320, 250);
-    ctx.font = '13px ui-monospace, monospace'; ctx.fillStyle = '#64748b';
-    ctx.fillText(state ? 'adb forward tcp:5000 tcp:5000  ·  python stream_cam.py' : 'connecting to receiver…', 320, 278);
     const st = state && state.stream;
+    const cam = st && st.camera && st.camera.device ? st.camera : null;
+    ctx.font = '600 17px system-ui'; ctx.fillStyle = `rgba(226,232,240,${0.55 + 0.4 * pulse})`;
+    ctx.fillText(off ? 'Live preview disabled (deployment mode)' : cam ? `Awaiting on-board camera ${cam.name || ''} on ${cam.device}…`
+      : 'Awaiting camera stream on port 5000…', cx, cy + 10);
+    ctx.font = '13px ui-monospace, monospace'; ctx.fillStyle = '#64748b';
+    ctx.fillText(!state ? 'connecting to receiver…' : cam ? `camera status: ${cam.status}${cam.error ? ' · ' + cam.error : ''}`
+      : 'no USB camera on the board: plug in the Brio and restart, or use legacy stream_cam.py', cx, cy + 38);
     const detail = st && st.ingested ? `last frame ${st.frame_age_s}s ago from ${st.source ? st.source.client + ' ' + st.source.path : '?'}` +
       (st.rejected ? ` · ${st.rejected} rejected` : '') : st && st.rejected ? `${st.rejected} frames rejected (bad format) - see receiver log` : feedNote;
-    ctx.fillText(detail, 320, 302);
+    ctx.fillText(detail, cx, cy + 62);
     ctx.restore();
+  }
+
+  function fitCanvas(w, h) {  // keep the camera's native aspect ratio (16:9 Brio, 4:3 webcams)
+    const cw = 960, ch = Math.round(960 * h / w);
+    if (!w || !h || (ctx.canvas.width === cw && ctx.canvas.height === ch)) return;
+    ctx.canvas.width = cw; ctx.canvas.height = ch;
+    $('stage').style.aspectRatio = `${cw} / ${ch}`;
   }
 
   function tick(t) {
     const serverLive = !!(state && state.stream && state.stream.live && Date.now() - lastStateAt < 4000);
     if (serverLive && Date.now() - lastMjpegAt > 1500 && Date.now() - lastPoll > 66) { lastPoll = Date.now(); pullFrame(); }
     if (isLive() && lastBmp) {
-      ctx.drawImage(lastBmp, 0, 0, 640, 480);
+      fitCanvas(lastBmp.width, lastBmp.height);
+      ctx.drawImage(lastBmp, 0, 0, ctx.canvas.width, ctx.canvas.height);
       drawOverlay();
     } else {
       if (lastBmp && !isLive()) { lastBmp.close(); lastBmp = null; }  // never redraw an old frame after the stream stops
@@ -610,6 +622,9 @@
     const live = isLive();
     $('conn').textContent = live ? `live · camera ${s.ingest_fps} fps → NPU ${s.fps} fps` :
       (s.stream && s.stream.live ? 'receiver receiving frames · connecting video…' : 'receiver up · awaiting camera stream');
+    const cam = s.stream && s.stream.camera;
+    $('camPill').textContent = cam && cam.device ? `${cam.name || 'camera'} · ${cam.width}×${cam.height} ${cam.fourcc || ''} @ ${cam.capture_fps || 0} fps · ${cam.status}`
+      : 'source: HTTP ingest (stream_cam.py)';
     $('statusPill').className = s.state;
     $('statusPill').textContent = s.state === 'SEARCHING' && s.empty_scene ? 'SEARCHING · EMPTY' : s.state;
     $('banner').className = s.state;
