@@ -9,6 +9,8 @@
     NpuDetector  - MediaPipe EfficientDet-Lite0/2 int8 (COCO-90, Apache-2.0), kept as an alternative
                    (KAMIKAZE_DETECTOR=lite2). Raw SSD outputs decoded with anchors matching TFLite_Detection_PostProcess.
     CropTracker  - smooths the detector box over frames into the square crop that feeds the embedder.
+    DinoPoseEmbedder - Meta DINOv2 ViT-S/14 (Apache-2.0) exported by export_dinov2.py: 224x224 crop -> [CLS | mean patch]
+                   viewpoint descriptor for continuous yaw estimation, ~20 ms on the HTP vs ~240 ms on the CPU.
 
 Runtime: ai-edge-litert + libQnnTFLiteDelegate.so from Qualcomm's qairt-libs / qairt-dsp-binaries packages
 (ppa:ubuntu-qcom-iot/qcom-ppa). Each model is compiled for the HTP on first load (~0.7 s embedder, ~2-4 s detector);
@@ -46,7 +48,7 @@ QNN_DELEGATE = os.environ.get("KAMIKAZE_QNN_DELEGATE", "libQnnTFLiteDelegate.so"
 QNN_OPTIONS = {"backend_type": "htp", "htp_performance_mode": "2", "htp_precision": "1", "log_level": "0"}
 FASTRPC_DEVICE = "/dev/fastrpc-cdsp"
 DSP_LIB_DIRS = ("/usr/lib/dsp/cdsp", "/usr/lib/rfsa/adsp", "/usr/share/qcom")
-DETECTOR_VARIANT = os.environ.get("KAMIKAZE_DETECTOR", "yolo26n")
+DETECTOR_VARIANT = os.environ.get("KAMIKAZE_DETECTOR", "yolov8s-worldv2-kz")
 DETECT_SCORE = float(os.environ.get("KAMIKAZE_DETECT_SCORE", "0.30"))
 VERBOSE = os.environ.get("KAMIKAZE_NPU_VERBOSE", "0") == "1"
 CPU_THREADS = 4
@@ -75,9 +77,18 @@ DETECTOR_SPECS = {
                        "MediaPipe Object Detector - EfficientDet-Lite2 (int8, COCO)"),
 }
 YOLO_SPECS = {
+    "yolov8s-worldv2-kz": ModelSpec("yolov8s-worldv2-kz_float32.tflite", "",
+                                    "Ultralytics YOLO-World v2 S, open vocabulary {beverage can, soda can, smartphone, "
+                                    "bottle} (TFLite FP32 -> HTP FP16)", "AGPL-3.0"),
     "yolo26n": ModelSpec("yolo26n_float32.tflite", "", "Ultralytics YOLO26n (COCO-80, TFLite FP32 -> HTP FP16)", "AGPL-3.0"),
     "yolo11n": ModelSpec("yolo11n_float32.tflite", "", "Ultralytics YOLO11n (COCO-80, TFLite FP32 -> HTP FP16)", "AGPL-3.0"),
 }
+DINO_SPEC = ModelSpec("dinov2_vits14_pose_float32.tflite", "",
+                      "Meta DINOv2 ViT-S/14 (224 px, [CLS | mean patch] 2x384-d, TFLite FP32 -> HTP FP16)")
+DINO_ID = "dinov2_vits14-cls+meanpatch-768"
+WORLD_VARIANT = "yolov8s-worldv2-kz"  # export_yolo.sh world  (YOLO-World with the domain vocabulary baked in)
+WORLD_CLASSES = ("beverage can", "soda can", "smartphone", "bottle")
+FALLBACK_DETECTOR = "yolo26n"
 EMBEDDER_ID = "mediapipe-mobilenet_v3_large-embedder-1280"
 
 COCO_LABELS = (
@@ -294,6 +305,54 @@ class NpuEmbedder:
                 "runtime": self.rt.note, "init_ms": round(self.rt.init_ms, 1), "input": list(self.size), "dim": self.dim}
 
 
+class DinoPoseEmbedder:
+    """RGB crop -> unit-norm DINOv2 ViT-S/14 viewpoint descriptor (export_dinov2.py).
+
+    The graph takes 224x224 RGB in [0,1] (ImageNet normalisation is baked in) and returns [CLS | mean patch token]
+    (2x384). Each half is L2-normalised and the halves are averaged, so a cosine between two descriptors is the mean of
+    the CLS and patch-token cosines. ~20 ms on the HTP, ~240 ms on the CPU."""
+
+    embedder_id = DINO_ID
+
+    def __init__(self, path: Path | None = None, prefer_npu: bool = True):
+        self.spec = DINO_SPEC
+        path = Path(path) if path else MODELS_DIR / DINO_SPEC.file
+        if not _valid_tflite(path):
+            raise FileNotFoundError(f"{path} missing - run export_dinov2.py on the board")
+        self.rt = Runtime(path, prefer_npu)
+        shape = self.rt.input["shape"]
+        self.size = (int(shape[2]), int(shape[1]))
+        out = self.rt.outputs()[0]
+        self._out = out["index"]
+        self.dim = int(out["shape"][-1])
+        self.half = self.dim // 2
+
+    @property
+    def device(self) -> str:
+        return self.rt.device
+
+    def embed_rgb01(self, nhwc: np.ndarray) -> np.ndarray:
+        raw = self.rt.run(np.ascontiguousarray(nhwc, dtype=np.float32), [self._out])[0].reshape(-1).astype(np.float32)
+        parts = [raw[:self.half], raw[self.half:]]
+        norms = [float(np.linalg.norm(p)) for p in parts]
+        if not all(math.isfinite(n) and n > 0 for n in norms):
+            raise ValueError("degenerate DINOv2 descriptor")
+        return np.concatenate([p / n for p, n in zip(parts, norms)]) * np.float32(1.0 / math.sqrt(2.0))
+
+    def info(self) -> dict:
+        return {"model": self.spec.title, "file": self.rt.path.name, "license": self.spec.license, "device": self.rt.device,
+                "runtime": self.rt.note, "init_ms": round(self.rt.init_ms, 1), "input": list(self.size), "dim": self.dim}
+
+
+def make_pose_embedder(prefer_npu: bool = True) -> DinoPoseEmbedder | None:
+    """DINOv2 pose descriptor on the HTP; None when the exported model is missing (pose falls back to MobileNet views)."""
+    try:
+        return DinoPoseEmbedder(prefer_npu=prefer_npu)
+    except Exception as exc:  # missing model, missing runtime or delegate failure
+        log.warning("DINOv2 pose embedder unavailable (%s) - pose uses the MobileNet view centroids", exc)
+        return None
+
+
 # --------------------------------------------------------------------------------------
 # Detector
 # --------------------------------------------------------------------------------------
@@ -365,9 +424,32 @@ class Detection:
     def center(self) -> tuple[float, float]:
         return (self.box[0] + self.box[2]) / 2, (self.box[1] + self.box[3]) / 2
 
-    def to_dict(self) -> dict:
-        return {"label": self.label, "score": round(self.score, 3), "category": self.category,
-                "box": [round(v, 4) for v in self.box]}
+    def kind(self, width: int | None = None, height: int | None = None) -> str:
+        """Domain label shown to the user: COCO has no "can", so cup -> "beverage can" and can-shaped bottles too."""
+        return domain_label(self.label, self.box, width, height)
+
+    def to_dict(self, width: int | None = None, height: int | None = None) -> dict:
+        return {"label": self.kind(width, height), "raw_label": self.label, "score": round(self.score, 3),
+                "category": self.category, "box": [round(v, 4) for v in self.box]}
+
+
+CAN_ASPECT = (1.4, 2.6)  # pixel H/W of an upright 330-500 ml can (incl. sleek cans) seen from the side
+
+
+def domain_label(label: str, box=None, width: int | None = None, height: int | None = None) -> str:
+    """Raw detector class -> domain vocabulary ("beverage can", "bottle", "smartphone"). A "bottle" box is renamed
+    to "beverage can" only when its pixel aspect ratio is can-like; other classes pass through unchanged."""
+    name = str(label).lower()
+    if name in ("cup", "can", "soda can", "beverage can"):
+        return "beverage can"
+    if name in ("cell phone", "phone", "smartphone"):
+        return "smartphone"
+    if name == "bottle" and box is not None and width and height:
+        bw = (box[2] - box[0]) * width
+        bh = (box[3] - box[1]) * height
+        if bw > 0 and CAN_ASPECT[0] <= bh / bw <= CAN_ASPECT[1]:
+            return "beverage can"
+    return label
 
 
 class NpuDetector:
@@ -608,12 +690,17 @@ class UltralyticsDetector:
 
 
 def make_detector(variant: str = DETECTOR_VARIANT, prefer_npu: bool = True):
-    """YOLO (default) or EfficientDet-Lite. YOLO runs from models/npu/<variant>_float32.tflite on the HTP; without the
-    exported file it falls back to Ultralytics PyTorch on the CPU."""
+    """YOLO (default: YOLO-World with the domain vocabulary) or EfficientDet-Lite. YOLO runs from
+    models/npu/<variant>_float32.tflite on the HTP. A missing YOLO-World export falls back to YOLO26n (COCO, with the
+    cup/bottle -> "beverage can" remap); any other missing export falls back to Ultralytics PyTorch on the CPU."""
     if variant in DETECTOR_SPECS:
         return NpuDetector(variant, prefer_npu=prefer_npu)
     if _valid_tflite(detector_model_path(variant)):
         return YoloDetector(variant, prefer_npu=prefer_npu)
+    if variant == WORLD_VARIANT:
+        log.warning("%s missing (run ./export_yolo.sh world); falling back to %s",
+                    detector_model_path(variant).name, FALLBACK_DETECTOR)
+        return make_detector(FALLBACK_DETECTOR, prefer_npu)
     log.warning("%s missing (run ./export_yolo.sh %s); using Ultralytics PyTorch on the CPU",
                 detector_model_path(variant).name, variant)
     return UltralyticsDetector(variant)

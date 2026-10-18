@@ -40,17 +40,22 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
   POST /api/cad/fetch                {"raw_name": "...", "force": true} resolve + (re)harvest the CAD model, with attribution
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
-Pipeline per frame: Ultralytics YOLO26n object detection on the Hexagon NPU (npu.py; phones, bottles/cans) ->
-square crop around the target inside the central 60% box (temporally smoothed; the fixed center-60% crop when nothing
+Pipeline per frame: Ultralytics YOLO-World v2 (open vocabulary: beverage can / soda can / smartphone / bottle; YOLO26n
+COCO fallback) object detection on the Hexagon NPU (npu.py) ->
+square crop around the target inside the central 75% box (temporally smoothed; the fixed center-75% crop when nothing
 is detected) -> 224x224 -> 1280-d MobileNetV3-Large embedding on the NPU (QNN TFLite delegate; ExecuTorch/XNNPACK or
 torch on the Arm CPU as fallbacks) -> L2-normalised vector -> cosine similarity against the multi-view prototypes
 (front/back/side/top centroids + global centroid) -> 5-frame temporal state machine -> Modulino Pixels via the Arduino
-Router socket (STM32 firmware untouched), background 3D CAD retrieval and physical pose estimation (pose.py).
+Router socket (STM32 firmware untouched), background 3D CAD retrieval and physical pose estimation (pose.py; yaw from
+DINOv2 ViT-S/14 viewpoint descriptors on the NPU in a separate pose worker thread when the class was enrolled with them).
 
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
-KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE, KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
-KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_FLOOR / C_IDENT / C_SEARCH / MARGIN
-(calibrated confidence), KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
+KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolov8s-worldv2-kz|yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE,
+KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
+KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_SLOPE / CAL_CENTER / C_IDENT / C_SEARCH / MARGIN /
+EMA_ALPHA (calibrated confidence), KAMIKAZE_CROP_FRACTION (0.75), KAMIKAZE_POSE_DINO (1|0, DINOv2 pose worker),
+KAMIKAZE_POSE_HZ (10, pose worker rate cap),
+KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
 KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0),
 KAMIKAZE_CAMERA (auto|/dev/videoN|none), KAMIKAZE_CAM_WIDTH/HEIGHT/FPS (1920/1080/30), KAMIKAZE_DECODE_MAX (default 960:
@@ -106,6 +111,7 @@ import entity_resolver
 import npu as npu_mod
 import onboard_camera
 import pose as pose_mod
+import procedural_glb
 import taxonomy
 import telemetry
 from mcp_server import (
@@ -133,27 +139,30 @@ MODE = os.environ.get("KAMIKAZE_MODE", "training").strip().lower()  # training |
 PREVIEW_FRAME = os.environ.get("KAMIKAZE_PREVIEW", "1" if MODE == "training" else "0") != "0"
 
 INPUT_SIZE = 224
-CROP_FRACTION = 0.60
+CROP_FRACTION = float(os.environ.get("KAMIKAZE_CROP_FRACTION", "0.75"))  # 810x810 px on 1080p: [555,135,1365,945]
 EMBED_DIM = 1280
 EMBEDDER_ID = "mobilenet_v3_large-fc1280"  # torchvision weights (ExecuTorch / eager); the NPU embedder has its own id
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Calibrated confidence: C = 0 for raw cosine <= CAL_FLOOR, else (S - CAL_FLOOR) / (1 - CAL_FLOOR). High-dimensional
-# embeddings sit at a 0.35-0.50 cosine baseline for arbitrary scenes, so raw cosine is not a usable confidence.
-CAL_FLOOR = float(os.environ.get("KAMIKAZE_CAL_FLOOR", "0.52"))
+# Calibrated confidence: a logistic curve normalised to C(1) = 1,
+#   C(S) = sigmoid(k (S - c)) / sigmoid(k (1 - c)),  k = 7.38, c = 0.833,
+# fitted to the operating points C(0.856) = 0.70 (IDENTIFIED) and C(0.64) = 0.25 (SEARCHING) so the gates are unchanged.
+# Smooth (no hard 0% cliff); high-dimensional embeddings sit at a 0.35-0.52 cosine baseline for arbitrary scenes, which
+# maps to 5-12% here, never to "identified".
+CAL_SLOPE = float(os.environ.get("KAMIKAZE_CAL_SLOPE", "7.38"))
+CAL_CENTER = float(os.environ.get("KAMIKAZE_CAL_CENTER", "0.8334"))
 C_IDENT = float(os.environ.get("KAMIKAZE_C_IDENT", "0.70"))
 C_SEARCH = float(os.environ.get("KAMIKAZE_C_SEARCH", "0.25"))
 MIN_MARGIN = float(os.environ.get("KAMIKAZE_MARGIN", "0.15"))  # calibrated top-1 minus top-2
-T_IDENT = CAL_FLOOR + C_IDENT * (1.0 - CAL_FLOOR)  # raw cosine equivalents (0.856 / 0.640)
-T_SEARCH = CAL_FLOOR + C_SEARCH * (1.0 - CAL_FLOOR)
+EMA_ALPHA = float(os.environ.get("KAMIKAZE_EMA_ALPHA", "0.25"))  # reported confidence: C_t = a*C + (1-a)*C_t-1
 WINDOW = 5
 IDENT_FRAMES = 3
 GUIDE_FRAMES = 3
 SEARCH_FRAMES = 3
-# Empty-scene gate on the 60% center crop (resampled to SALIENCY_SIZE px so thresholds do not depend on resolution)
+# Empty-scene gate on the center crop (resampled to SALIENCY_SIZE px so thresholds do not depend on resolution)
 SCENE_GATE = os.environ.get("KAMIKAZE_SCENE_GATE", "1") != "0"
-LAPLACIAN_MIN = float(os.environ.get("KAMIKAZE_LAPLACIAN_MIN", "18"))
+LAPLACIAN_MIN = float(os.environ.get("KAMIKAZE_LAPLACIAN_MIN", "8"))  # low: smooth metal cans are not "empty"
 EDGE_MIN = float(os.environ.get("KAMIKAZE_EDGE_MIN", "0.002"))
 CANNY_LO = int(os.environ.get("KAMIKAZE_CANNY_LO", "10"))  # low thresholds: dim webcam scenes have soft outlines
 CANNY_HI = int(os.environ.get("KAMIKAZE_CANNY_HI", "30"))
@@ -193,6 +202,9 @@ CAM_WIDTH = int(os.environ.get("KAMIKAZE_CAM_WIDTH", "1920"))
 CAM_HEIGHT = int(os.environ.get("KAMIKAZE_CAM_HEIGHT", "1080"))
 CAM_FPS = int(os.environ.get("KAMIKAZE_CAM_FPS", "30"))
 DECODE_MAX = int(os.environ.get("KAMIKAZE_DECODE_MAX", "960"))  # >0: JPEG DCT-scaled decode down to ~this long side
+POSE_DINO = os.environ.get("KAMIKAZE_POSE_DINO", "1") != "0"  # DINOv2 viewpoint descriptors for yaw (pose worker)
+POSE_HZ = float(os.environ.get("KAMIKAZE_POSE_HZ", "10"))  # pose worker rate cap (NPU time shared with detector)
+POSE_FRESH_S = 1.0  # DINOv2 view sims older than this fall back to the MobileNet view centroids
 JPEG_SOI = b"\xff\xd8\xff"
 
 
@@ -208,7 +220,7 @@ def center_crop_box(width: int, height: int) -> tuple[int, int, int]:
 
 
 def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> np.ndarray:
-    """Square crop (detector box, else the center 60%) -> 224x224 -> ImageNet normalisation. float32 (1,3,224,224)."""
+    """Square crop (detector box, else the center 75%) -> 224x224 -> ImageNet normalisation. float32 (1,3,224,224)."""
     if image.mode != "RGB":
         image = image.convert("RGB")
     size, left, top = box or center_crop_box(*image.size)
@@ -217,15 +229,104 @@ def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> n
     return np.ascontiguousarray(arr.transpose(2, 0, 1)[None])
 
 
+def rgb01_nhwc(arr: np.ndarray) -> np.ndarray:
+    """Undo preprocess(): ImageNet-normalised (1,3,H,W) -> RGB [0,1] (1,H,W,3) for the NPU graphs."""
+    return np.ascontiguousarray(arr[0].transpose(1, 2, 0) * IMAGENET_STD + IMAGENET_MEAN, dtype=np.float32)[None]
+
+
+class PoseWorker:
+    """DINOv2 viewpoint descriptors on the NPU, off the 30 Hz inference thread.
+
+    The inference loop submits the current crop (latest wins, rate-capped at POSE_HZ); the worker embeds it and
+    stores its cosine with the identified class's per-view DINOv2 centroids. PoseEstimator turns those into yaw with
+    the circular blend yaw = atan2(w_side, w_front - w_back) (softmax view weights)."""
+
+    def __init__(self, embedder, bank: "EmbeddingBank", hz: float = POSE_HZ) -> None:
+        self.embedder, self.bank = embedder, bank
+        self.period = 1.0 / max(0.1, hz)
+        self._cv = threading.Condition()
+        self._job: tuple[str, np.ndarray] | None = None
+        self._result: dict | None = None
+        self._last_submit = 0.0
+        self._thread: threading.Thread | None = None
+        self._lat: collections.deque = collections.deque(maxlen=240)
+        self.runs = 0
+        self.errors = 0
+
+    def describe(self, arr: np.ndarray) -> np.ndarray:
+        t = time.perf_counter()
+        desc = self.embedder.embed_rgb01(rgb01_nhwc(arr))
+        self._lat.append((time.perf_counter() - t) * 1000.0)
+        return desc
+
+    def submit(self, label: str, arr: np.ndarray) -> bool:
+        now = time.monotonic()
+        with self._cv:
+            if now - self._last_submit < self.period:
+                return False
+            self._last_submit = now
+            self._job = (label, arr)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="pose-dinov2", daemon=True)
+                self._thread.start()
+            self._cv.notify()
+        return True
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                self._cv.wait_for(lambda: self._job is not None)
+                label, arr = self._job
+                self._job = None
+            try:
+                sims = self.bank.pose_view_sims(label, self.describe(arr))
+                self.runs += 1
+                with self._cv:
+                    self._result = {"label": label, "sims": sims, "t": time.monotonic()}
+            except Exception:
+                self.errors += 1
+                if self.errors <= 3:
+                    log.exception("DINOv2 pose descriptor failed")
+
+    def latest(self, label: str | None) -> dict[str, float] | None:
+        with self._cv:
+            r = self._result
+        if not r or r["label"] != label or not r["sims"] or time.monotonic() - r["t"] > POSE_FRESH_S:
+            return None
+        return dict(r["sims"])
+
+    def reset(self) -> None:
+        with self._cv:
+            self._result, self._job = None, None
+
+    def info(self) -> dict:
+        lat = sorted(self._lat)
+        return {**self.embedder.info(), "rate_hz": round(1.0 / self.period, 1), "runs": self.runs, "errors": self.errors,
+                "median_ms": round(lat[len(lat) // 2], 2) if lat else None}
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x)) if x >= 0 else math.exp(x) / (1.0 + math.exp(x))
+
+
 def calibrate(sim: float) -> float:
-    """Raw cosine -> calibrated confidence in [0, 1] (0 at or below CAL_FLOOR)."""
-    if sim <= CAL_FLOOR:
-        return 0.0
-    return min(1.0, (sim - CAL_FLOOR) / (1.0 - CAL_FLOOR))
+    """Raw cosine -> calibrated confidence in [0, 1]: normalised logistic, C(1) = 1, monotone, no hard floor."""
+    s = min(1.0, float(sim))
+    return min(1.0, _sigmoid(CAL_SLOPE * (s - CAL_CENTER)) / _sigmoid(CAL_SLOPE * (1.0 - CAL_CENTER)))
+
+
+def raw_threshold(c: float) -> float:
+    """Inverse of calibrate(): the raw cosine at which the calibrated confidence equals c."""
+    p = min(1.0 - 1e-9, max(1e-9, c * _sigmoid(CAL_SLOPE * (1.0 - CAL_CENTER))))
+    return CAL_CENTER + math.log(p / (1.0 - p)) / CAL_SLOPE
+
+
+T_IDENT = raw_threshold(C_IDENT)  # raw cosine equivalents (~0.856 / ~0.640)
+T_SEARCH = raw_threshold(C_SEARCH)
 
 
 def scene_saliency(image: Image.Image) -> dict:
-    """Laplacian variance + Canny edge density of the 60% center crop. empty=True for blank walls, bare desks, a
+    """Laplacian variance + Canny edge density of the center crop. empty=True for blank walls, bare desks, a
     covered lens or a dark room, so the detector and embedder never score background noise."""
     size, left, top = center_crop_box(*image.size)
     crop = image.crop((left, top, left + size, top + size)).convert("L")
@@ -393,6 +494,7 @@ class EmbeddingBank:
         self.centroids: dict[str, "torch.Tensor"] = {}
         self.views: dict[str, dict[str, "torch.Tensor"]] = {}
         self.view_counts: dict[str, dict[str, int]] = {}
+        self.pose_views: dict[str, dict[str, "torch.Tensor"]] = {}  # DINOv2 viewpoint centroids (pose only)
         self.meta: dict[str, dict] = {}
         self.cad: dict[str, dict | None] = {}
         self.created: dict[str, str] = {}
@@ -439,14 +541,17 @@ class EmbeddingBank:
             self.centroids[label] = centroid
             self.views.pop(label, None)
             self.view_counts.pop(label, None)
+            self.pose_views.pop(label, None)
             self.meta.setdefault(label, {})
             self.created.setdefault(label, _now_iso())
             self._rebuild()
             self.save()
             return {"label": label, "vectors": int(stack.shape[0]), "consistency": round(float((stack @ centroid).mean()), 4)}
 
-    def add_multiview(self, label: str, view_vectors: dict[str, list], metadata: dict) -> dict:
-        """Store angle-tagged centroids; the global centroid is the normalised mean of the view centroids."""
+    def add_multiview(self, label: str, view_vectors: dict[str, list], metadata: dict,
+                      pose_vectors: dict[str, list] | None = None) -> dict:
+        """Store angle-tagged centroids; the global centroid is the normalised mean of the view centroids.
+        `pose_vectors` (optional) are DINOv2 descriptors per view, kept only for pose estimation."""
         with self._lock:
             views, counts, all_vecs = {}, {}, []
             for view, vecs in view_vectors.items():
@@ -458,11 +563,17 @@ class EmbeddingBank:
                 all_vecs += clean
             if not views:
                 raise ValueError("no frames captured")
+            pose = {view: self._unit_mean([torch.as_tensor(np.asarray(v, dtype=np.float32)) for v in vecs])
+                    for view, vecs in (pose_vectors or {}).items() if vecs and view in views}
             global_centroid = self._unit_mean(list(views.values()))
             self.exemplars[label] = all_vecs
             self.centroids[label] = global_centroid
             self.views[label] = views
             self.view_counts[label] = counts
+            if pose:
+                self.pose_views[label] = pose
+            else:
+                self.pose_views.pop(label, None)
             self.meta[label] = dict(metadata)
             self.cad.setdefault(label, None)
             self.created[label] = _now_iso()
@@ -470,7 +581,7 @@ class EmbeddingBank:
             self.save()
             stack = torch.stack(all_vecs)
             return {
-                "label": label, "vectors": len(all_vecs), "views": counts,
+                "label": label, "vectors": len(all_vecs), "views": counts, "pose_views": sorted(pose),
                 "consistency": round(float((stack @ global_centroid).mean()), 4), "metadata": dict(metadata),
             }
 
@@ -479,7 +590,7 @@ class EmbeddingBank:
             if label not in self.centroids:
                 return False
             del self.centroids[label]
-            for table in (self.exemplars, self.views, self.view_counts, self.meta, self.cad, self.created):
+            for table in (self.exemplars, self.views, self.view_counts, self.pose_views, self.meta, self.cad, self.created):
                 table.pop(label, None)
             self._rebuild()
             self.save()
@@ -489,7 +600,8 @@ class EmbeddingBank:
         """Drop every enrolled class and persist the empty database. Returns how many were removed."""
         with self._lock:
             n = len(self.centroids)
-            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.meta, self.cad, self.created):
+            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.pose_views, self.meta, self.cad,
+                          self.created):
                 table.clear()
             self._rebuild()
             self.save()
@@ -499,7 +611,8 @@ class EmbeddingBank:
         """Drop every enrolled class and delete the database file (plus old-embedder backups) from disk."""
         with self._lock:
             n = len(self.centroids)
-            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.meta, self.cad, self.created):
+            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.pose_views, self.meta, self.cad,
+                          self.created):
                 table.clear()
             self._rebuild()
             if self.path is not None:
@@ -546,6 +659,16 @@ class EmbeddingBank:
         with self._lock:
             return {view: float(c @ vec) for view, c in self.views.get(label, {}).items()}
 
+    def has_pose_views(self, label: str | None) -> bool:
+        with self._lock:
+            return bool(label) and bool(self.pose_views.get(label))
+
+    def pose_view_sims(self, label: str, desc: np.ndarray) -> dict[str, float]:
+        """Cosine of a DINOv2 descriptor with the label's per-view DINOv2 centroids ({} if none were enrolled)."""
+        with self._lock:
+            table = self.pose_views.get(label) or {}
+            return {view: float(np.dot(c.numpy(), desc)) for view, c in table.items()}
+
     def metadata(self, label: str) -> dict | None:
         with self._lock:
             meta = self.meta.get(label)
@@ -577,6 +700,7 @@ class EmbeddingBank:
         return {
             "label": k, "class_id": k, "canonical_name": taxonomy.display_name(meta) if meta else k.replace("_", " ").title(),
             "vectors": len(self.exemplars.get(k, [])), "views": counts, "view_count": len(counts),
+            "pose_views": sorted(self.pose_views.get(k, {})),
             "metadata": meta, "category": meta.get("category"), "created_at": self.created.get(k),
             "phone_tier": device_taxonomy.tier_for(meta), "cad_path": cad_path,
             "cad_asset": cad, "cad_model_url": (cad or {}).get("glb_url") or None,
@@ -599,6 +723,7 @@ class EmbeddingBank:
                     "cad_model_url": entry["cad_model_url"],
                     "views": dict(self.views.get(label, {})),
                     "view_counts": dict(self.view_counts.get(label, {})),
+                    "pose_views": dict(self.pose_views.get(label, {})),
                     "global_centroid": self.centroids[label],
                     "created_at": self.created.get(label),
                     "cad_asset": self.cad.get(label),
@@ -606,6 +731,7 @@ class EmbeddingBank:
             payload = {
                 "version": 2,
                 "embedder": self.embedder_id,
+                "pose_embedder": npu_mod.DINO_ID,
                 "exemplars": {k: torch.stack(v) for k, v in self.exemplars.items()},
                 "centroids": dict(self.centroids),
                 "prototypes": prototypes,
@@ -635,6 +761,9 @@ class EmbeddingBank:
                               for k, p in protos.items()}
                 self.view_counts = {k: {taxonomy.canonical_view(vn): int(n) for vn, n in (p.get("view_counts") or {}).items()}
                                     for k, p in protos.items()}
+                dino_ok = data.get("pose_embedder") == npu_mod.DINO_ID
+                self.pose_views = {k: {taxonomy.canonical_view(vn): vv.float() for vn, vv in (p.get("pose_views") or {}).items()}
+                                   for k, p in protos.items() if dino_ok and p.get("pose_views")}
                 self.meta = {k: dict(p.get("metadata") or {}) for k, p in protos.items()}
                 self.cad = {k: p.get("cad_asset") for k, p in protos.items()}
                 self.created = {k: p.get("created_at") or _now_iso() for k, p in protos.items()}
@@ -761,9 +890,11 @@ class MultiViewEnroller:
         self.per_view = FRAMES_PER_VIEW
         self.current: str | None = None
         self.captured: dict[str, list] = {}
+        self.pose_captured: dict[str, list] = {}
         self.stability: dict[str, float] = {}
         self.warnings: dict[str, str] = {}
         self._buf: list = []
+        self._pose_buf: list = []
         self.result: dict | None = None
         self.error: str | None = None
         self._touched = time.monotonic()
@@ -802,21 +933,28 @@ class MultiViewEnroller:
                 if view not in taxonomy.VIEWS:
                     raise ValueError(f"view must be one of {', '.join(taxonomy.VIEWS)}")
                 self.current = view
-            self._buf, self.error, self.phase = [], None, "capturing"
+            self._buf, self._pose_buf, self.error, self.phase = [], [], None, "capturing"
             self._touched = time.monotonic()
             self._cond.notify_all()
         return self.status()
 
-    def feed(self, vec) -> str | None:
-        """Offer a frame embedding. Returns "view_done", "complete" or None."""
+    def feed(self, vec, pose_desc=None) -> str | None:
+        """Offer a frame embedding (and optionally its DINOv2 pose descriptor). Returns "view_done", "complete" or None."""
         with self._cond:
             if self.phase != "capturing":
                 return None
             self._buf.append(vec)
+            if pose_desc is not None:
+                self._pose_buf.append(pose_desc)
             self._touched = time.monotonic()
             if len(self._buf) < self.per_view:
                 return None
             view, buf = self.current, self._buf
+            if len(self._pose_buf) == len(buf):
+                self.pose_captured[view] = self._pose_buf
+            else:
+                self.pose_captured.pop(view, None)
+            self._pose_buf = []
             centroid = EmbeddingBank._unit_mean(buf)
             self.captured[view] = buf
             self.stability[view] = round(float((torch.stack(buf) @ centroid).mean()), 3)
@@ -838,7 +976,7 @@ class MultiViewEnroller:
 
     def _finalize(self) -> None:
         try:
-            self.result = self.bank.add_multiview(self.label, self.captured, self.meta or {})
+            self.result = self.bank.add_multiview(self.label, self.captured, self.meta or {}, self.pose_captured)
             self.phase = "done"
             log.info("Multi-view enrolled %s: %s", self.label, {k: v for k, v in self.result.items() if k != "metadata"})
             if self.on_complete:
@@ -893,7 +1031,7 @@ class MultiViewEnroller:
                 "current_view": self.current if self.active else None,
                 "current_title": current["title"] if current else None,
                 "current_instruction": current["instruction"] if current else None,
-                "collected": len(self._buf), "views": views,
+                "collected": len(self._buf), "views": views, "pose_views": sorted(self.pose_captured),
                 "done": self.phase == "done", "ok": self.phase == "done", "error": self.error, "result": self.result,
             }
 
@@ -934,7 +1072,8 @@ class FrameScore:
 
 
 class StateMachine:
-    """5-frame sliding window over calibrated confidence with hysteresis between SEARCHING / GUIDING / IDENTIFIED."""
+    """Hysteresis between SEARCHING / GUIDING / IDENTIFIED on per-frame calibrated confidence (3-frame streaks); the
+    reported score is a temporal EMA (C_t = a*C + (1-a)*C_t-1), reseeded from the current run on any state/label change."""
 
     def __init__(self) -> None:
         self.window: collections.deque = collections.deque(maxlen=WINDOW)
@@ -943,10 +1082,13 @@ class StateMachine:
         self.hint: str | None = None
         self.prompt: str | None = None
         self.empty = False
+        self.ema: float | None = None
+        self.ema_key: tuple | None = None
 
     def reset(self) -> None:
         self.window.clear()
         self.state, self.label, self.hint, self.prompt, self.empty = SEARCHING, None, None, None, False
+        self.ema, self.ema_key = None, None
 
     @staticmethod
     def frame_kind(frame: FrameScore) -> str:
@@ -982,17 +1124,25 @@ class StateMachine:
             self.label = frame.label
 
         if self.state == SEARCHING and kind == "search":
+            self.ema, self.ema_key = None, None
             return {"state": self.state, "label": None, "score": 0.0 if frame.empty else frame.c1,
                     "margin": 0.0 if frame.empty else frame.margin}
         subject = self.label if self.state != SEARCHING else frame.label
-        # Average the current run only, so frames from a previous pose (e.g. a capped front view) don't drag the score.
+        # Seed from the current run only, so frames from a previous pose (e.g. a capped front view) don't drag the score.
         picks = []
         for w in reversed(self.window):
             if w[1] != subject or w[0] != kind:
                 break
             picks.append(w)
         picks = picks or [w for w in self.window if w[1] == subject] or [self.window[-1]]
-        score = sum(w[2] for w in picks) / len(picks)
+        run_mean = sum(w[2] for w in picks) / len(picks)
+        key = (self.state, subject)
+        if self.ema is None or self.ema_key != key:
+            self.ema, self.ema_key = run_mean, key
+        else:
+            current = frame.c1 if frame.label == subject else run_mean
+            self.ema = EMA_ALPHA * current + (1.0 - EMA_ALPHA) * self.ema
+        score = self.ema
         if frame.cap is not None:
             score = min(score, frame.cap)
         return {
@@ -1221,10 +1371,20 @@ class AssetManager:
         """Background: default model, vendored <model-viewer>, and GLBs for the initial classes."""
 
         def work() -> None:
-            if not is_valid_glb(local_glb_path("default")):
-                base = cad_harvester.ensure_base_models().get("smartphone")
-                if base:
-                    shutil.copyfile(base, local_glb_path("default"))
+            default = local_glb_path("default")
+            try:
+                current = default.read_bytes()[:4096] if default.is_file() else b""
+            except OSError:
+                current = b""
+            if not is_valid_glb(default) or procedural_glb.PLACEHOLDER_TAG.encode() not in current:
+                try:  # replaces older placeholders (the legacy untextured red box)
+                    default.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = default.with_suffix(".part")
+                    tmp.write_bytes(procedural_glb.build_placeholder())
+                    os.replace(tmp, default)
+                except OSError as exc:
+                    log.warning("Could not write the default placeholder model: %s", exc)
+            cad_harvester.ensure_base_models()
             vendor = STATIC_DIR / "vendor" / "model-viewer.min.js"
             if not vendor.is_file() or vendor.stat().st_size < 50_000:
                 try:
@@ -1517,9 +1677,11 @@ def extract_frame(body: bytes, content_type: str = "", depth: int = 0) -> tuple[
 
 
 class Pipeline:
-    def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager, detector=None) -> None:
+    def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager, detector=None,
+                 pose_embedder=None) -> None:
         self.extractor, self.bank, self.leds, self.assets = extractor, bank, leds, assets
         self.detector = detector
+        self.pose_worker = PoseWorker(pose_embedder, bank) if pose_embedder is not None else None
         self.camera = None  # onboard_camera.LocalBrioCapture when the on-board camera is the video source
         self.crop_tracker = npu_mod.CropTracker()
         self._detect_lat: collections.deque = collections.deque(maxlen=240)
@@ -1528,7 +1690,7 @@ class Pipeline:
         self.mv = MultiViewEnroller(bank, on_complete=self._mv_complete)
         self.pose_est = pose_mod.PoseEstimator()
         self.stats = SystemStats()
-        self._pose: dict = {"pitch": 0.0, "yaw": 0.0, "roll": 0.0, "valid": False, "view": None, "ms": 0.0}
+        self._pose: dict = {"pitch": 0.0, "yaw": 0.0, "roll": 0.0, "valid": False, "view": None, "ms": 0.0, "source": None}
         self._best_view: str | None = None
         self._category: str | None = None
         self._version = 0
@@ -1706,6 +1868,8 @@ class Pipeline:
     def _mv_complete(self, label: str) -> None:
         self.sm.reset()
         self.pose_est.reset()
+        if self.pose_worker is not None:
+            self.pose_worker.reset()
         self._viewer_label = label
         self.assets.get(label)
         self._bump()
@@ -1739,15 +1903,22 @@ class Pipeline:
                                    "skipped": "empty_scene"}
                 frame, views, best_view, category = FrameScore(None, 0.0, empty=True), {}, None, None
                 arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None}
+                arr = None
             else:
                 box, detect_ms = self._locate(image)
                 arr = preprocess(image, box)
                 t1 = time.perf_counter()
                 vec = self.extractor.embed_array(arr)
                 t2 = time.perf_counter()
+                pose_desc = None
+                if self.mv.capturing and self.pose_worker is not None:
+                    try:
+                        pose_desc = self.pose_worker.describe(arr)
+                    except Exception:
+                        log.exception("DINOv2 enrollment descriptor failed")
                 if self.enroller.feed(vec):
                     self.sm.reset()
-                if self.mv.feed(vec) == "complete":
+                if self.mv.feed(vec, pose_desc) == "complete":
                     capturing = False
                 frame, views, best_view, category, arb = self._arbitrate(vec)
             prev = (self.sm.state, self.sm.label)
@@ -1765,8 +1936,15 @@ class Pipeline:
                 self.assets.get(label)
             pose = self._pose
             if frame.label and state != SEARCHING:
+                pose_sims, pose_src = views, "mobilenet-views"
+                if self.pose_worker is not None and arr is not None and self.bank.has_pose_views(frame.label):
+                    self.pose_worker.submit(frame.label, arr)
+                    dino = self.pose_worker.latest(frame.label)
+                    if dino:
+                        pose_sims, pose_src = dino, "dinov2-npu"
                 try:
-                    pose = self.pose_est.update(image, box or center_crop_box(*image.size), views, frame.label, category)
+                    pose = self.pose_est.update(image, box or center_crop_box(*image.size), pose_sims, frame.label, category)
+                    pose["source"] = pose_src
                 except Exception:
                     log.exception("pose estimation failed")
             self._pose, self._best_view, self._category = pose, best_view, category
@@ -1862,8 +2040,8 @@ class Pipeline:
         box = self.crop_tracker.update(npu_mod.square_crop(target, width, height) if target else None, width, height)
         crop = box or center_crop_box(width, height)
         self._detection = {
-            "target": target.to_dict() if target else None,
-            "objects": [d.to_dict() for d in dets[:5]],
+            "target": target.to_dict(width, height) if target else None,
+            "objects": [d.to_dict(width, height) for d in dets[:5]],
             "crop": [round(crop[1] / width, 4), round(crop[2] / height, 4), round(crop[0] / width, 4), round(crop[0] / height, 4)],
             "crop_source": "detector" if box else "center",
             "ms": round(ms, 2),
@@ -1886,6 +2064,8 @@ class Pipeline:
     def _clear_verdict(self) -> None:
         self.sm.reset()
         self.pose_est.reset()
+        if self.pose_worker is not None:
+            self.pose_worker.reset()
         with self._snap_lock:
             self._last.update(label=None, similarity=0.0, confidence=0.0, margin=0.0, top2=None, frame_confidence=0.0,
                               state=SEARCHING, guidance=MSG_SEARCHING, hint=None, conflict=False, front_dominant=False,
@@ -1997,7 +2177,8 @@ class Pipeline:
             "bank": self.bank.info(),
             "classes": self.bank.counts(),
             "backend": self.extractor.name,
-            "thresholds": {"calibration_floor": CAL_FLOOR, "identified": C_IDENT, "searching": C_SEARCH,
+            "thresholds": {"calibration": {"form": "sigmoid(k(S-c))/sigmoid(k(1-c))", "k": CAL_SLOPE, "c": CAL_CENTER},
+                           "ema_alpha": EMA_ALPHA, "identified": C_IDENT, "searching": C_SEARCH,
                            "margin": MIN_MARGIN, "identified_raw_cosine": round(T_IDENT, 4),
                            "searching_raw_cosine": round(T_SEARCH, 4), "phone_margin": PHONE_AMBIG_MARGIN,
                            "front_cap": device_taxonomy.FRONT_CONFIDENCE_CAP, "scene_gate": SCENE_GATE,
@@ -2012,7 +2193,8 @@ class Pipeline:
                 "ram_ring_enabled": self.ring.enabled, "ram_ring_frames": len(self.ring)}
 
     def accelerator(self) -> str:
-        on_npu = [name for name, part in (("embedder", self.extractor), ("detector", self.detector))
+        on_npu = [name for name, part in (("embedder", self.extractor), ("detector", self.detector),
+                                          ("pose", self.pose_worker.embedder if self.pose_worker else None))
                   if part is not None and getattr(part, "device", "cpu") == "npu"]
         if on_npu:
             arch = npu_mod.htp_arch()
@@ -2059,6 +2241,7 @@ class Pipeline:
                 "models": {
                     "embedder": self.extractor.info() if hasattr(self.extractor, "info") else {"runtime": self.extractor.name},
                     "detector": self.detector.info() if self.detector is not None else None,
+                    "pose": self.pose_worker.info() if self.pose_worker is not None else None,
                 },
                 "detection": self._detection,
             },
@@ -2456,7 +2639,8 @@ def make_server(pipeline: Pipeline, host: str = HOST, port: int = PORT) -> Threa
 
 
 def build_detector():
-    """YOLO (KAMIKAZE_DETECTOR, default yolo26n) or EfficientDet-Lite object detector on the Hexagon NPU; None (fixed
+    """YOLO (KAMIKAZE_DETECTOR, default YOLO-World with the domain vocabulary, YOLO26n fallback) or EfficientDet-Lite
+    object detector on the Hexagon NPU; None (fixed
     center crop) if the NPU is unavailable, unless KAMIKAZE_DETECTOR_CPU=1 accepts the slower CPU detector."""
     ok, why = npu_mod.npu_available()
     if not ok and os.environ.get("KAMIKAZE_DETECTOR_CPU", "0") != "1":
@@ -2467,6 +2651,23 @@ def build_detector():
     except Exception as exc:
         log.warning("Object detector unavailable, using the fixed center crop (%s: %s)", type(exc).__name__, exc)
         return None
+
+
+def build_pose_embedder():
+    """DINOv2 ViT-S/14 viewpoint descriptor on the Hexagon NPU for continuous yaw (KAMIKAZE_POSE_DINO=1, default).
+    None without the NPU (240 ms/frame on the CPU is too slow) or without models/npu/dinov2_vits14_pose_float32.tflite;
+    pose then uses the MobileNet view centroids."""
+    if not POSE_DINO:
+        return None
+    ok, why = npu_mod.npu_available()
+    if not ok:
+        log.info("DINOv2 pose off (NPU unavailable: %s)", why)
+        return None
+    emb = npu_mod.make_pose_embedder(prefer_npu=True)
+    if emb is not None and emb.device != "npu":
+        log.warning("DINOv2 pose off: the model did not compile for the HTP")
+        return None
+    return emb
 
 
 def main() -> None:
@@ -2491,11 +2692,12 @@ def main() -> None:
     t0 = time.perf_counter()
     extractor = FeatureExtractor()
     detector = build_detector() if DETECT_CROP else None
+    pose_embedder = build_pose_embedder()
     bank = EmbeddingBank(BANK_PATH, extractor.embedder_id)
     loaded = bank.load()
     leds = LedDriver()
     assets = AssetManager()
-    pipeline = Pipeline(extractor, bank, leds, assets, detector)
+    pipeline = Pipeline(extractor, bank, leds, assets, detector, pose_embedder)
     assets.prepare_static()
     threading.Thread(target=lambda: log.info("RAM asset cache: %d static files preloaded (%s)", pipeline.static_cache.preload(STATIC_DIR),
                                              pipeline.static_cache.info()), name="asset-preload", daemon=True).start()

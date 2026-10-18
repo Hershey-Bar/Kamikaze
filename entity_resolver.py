@@ -1,4 +1,4 @@
-"""Entity resolver: free-text product descriptions -> one canonical, stable product record.
+﻿"""Entity resolver: free-text product descriptions -> one canonical, stable product record.
 
     resolve("coke zero can 330ml")            -> class_id "coca_cola_zero_330ml_can"
     resolve("iphone 14 pro max deep purple")  -> class_id "iphone_14_pro_max", color "deep purple"
@@ -43,6 +43,8 @@ class CanonicalProduct:
     package_type: str = ""
     container_volume: str = ""
     color: str = ""
+    flavor: str = ""
+    drink_type: str = ""
 
     def metadata(self) -> dict:
         """taxonomy-compatible enrollment metadata (the structure stored with each prototype)."""
@@ -111,7 +113,11 @@ def _phone_plan(brand: str, model: str, tier: str) -> list[tuple[str, str]]:
     return plan
 
 
-def _beverage_plan(category: str, brand: str, variant: str, volume: str) -> list[tuple[str, str]]:
+_WATER_TYPES = ("", "sparkling water", "seltzer", "water", "mineral water")
+
+
+def _beverage_plan(category: str, brand: str, variant: str, volume: str, flavor: str = "",
+                   drink_type: str = "") -> list[tuple[str, str]]:
     pkg = "Bottle" if category == "beverage_bottle" else "Can"
     name = _SEARCH_BRAND.get(brand, brand)
     nick = _SEARCH_NICK.get(brand, name)
@@ -121,31 +127,54 @@ def _beverage_plan(category: str, brand: str, variant: str, volume: str) -> list
         phrases = [f"Diet {nick}", f"{name} Diet"]
     else:
         phrases = [name, nick]
-    plan = [(f"{phrases[0]} {pkg}", "exact")]
-    if volume:
-        plan.append((f"{phrases[1]} {volume} {pkg}", "exact"))
-    plan += [(f"{p} {pkg}", "exact") for p in phrases[1:]]
-    if variant not in ("", "original"):
+    # a store brand's drink type is part of its product name ("Kirkland Sparkling Water"); "Coca Cola Cola" is not
+    kind = drink_type.title() if drink_type and brand not in taxonomy.KNOWN_BRANDS else ""
+    plan: list[tuple[str, str]] = []
+    if flavor:
+        fl = flavor.title()
+        if kind:
+            plan.append((f"{phrases[0]} {fl} {kind} {pkg}", "exact"))
+        plan += [(f"{p} {fl} {pkg}", "exact") for p in phrases]
+        if kind:
+            plan.append((f"{name} {kind} {pkg}", "similar"))
         plan.append((f"{name} {pkg}", "similar"))
+        plan.append((f"{fl} {drink_type.title() if drink_type not in _WATER_TYPES else 'Sparkling Water'} {pkg}", "similar"))
+        if drink_type in _WATER_TYPES:
+            plan.append((f"{fl} Seltzer {pkg}", "similar"))
+    else:
+        if kind:
+            plan.append((f"{phrases[0]} {kind} {pkg}", "exact"))
+        plan.append((f"{phrases[0]} {pkg}", "exact"))
+        if volume:
+            plan.append((f"{phrases[1]} {volume} {pkg}", "exact"))
+        plan += [(f"{p} {pkg}", "exact") for p in phrases[1:]]
+        if variant not in ("", "original"):
+            plan.append((f"{name} {pkg}", "similar"))
+    if drink_type and drink_type not in ("soda", "cola", "energy drink"):
+        plan.append((f"{drink_type.title()} {pkg}", "category"))
     if category == "beverage_bottle":
         plan += [("Soda Bottle", "category"), ("Plastic Bottle", "category")]
     else:
-        plan.append(("Energy Drink Can" if brand == "Red Bull" else "Soda Can", "category"))
+        energy = brand == "Red Bull" or drink_type == "energy drink"
+        plan.append(("Energy Drink Can" if energy else "Soda Can", "category"))
     return plan
 
 
-def query_plan(category: str, brand: str, model_or_variant: str, sub_tier: str, container_volume: str = "") -> list[tuple[str, str]]:
+def query_plan(category: str, brand: str, model_or_variant: str, sub_tier: str, container_volume: str = "",
+               flavor: str = "", drink_type: str = "") -> list[tuple[str, str]]:
     """Ordered [(query, level)] for CAD search: exact product -> similar product -> generic category (most specific first).
 
     "coke zero can 330ml" -> Coca Cola Zero Can, Coke Zero 330ml Can, Coke Zero Can | Coca Cola Can | Soda Can
     "s25 ultra"           -> Samsung Galaxy S25 Ultra, Samsung S25 Ultra, Galaxy S25 Ultra | Galaxy S24 Ultra | Smartphone
     "iphone 15 pro max"   -> iPhone 15 Pro Max, Apple iPhone 15 Pro Max | iPhone 15 Pro, iPhone 14 Pro Max | Smartphone
+    "Kirkland Grapefruit" -> Kirkland Grapefruit Can | Kirkland Can, Grapefruit Sparkling Water Can,
+                             Grapefruit Seltzer Can | Soda Can          (never another brand such as Coca-Cola)
     """
     if category == "smartphone":
         plan = _phone_plan(brand, model_or_variant, sub_tier)
     else:
         variant = {"regular": "original"}.get(sub_tier, sub_tier)
-        plan = _beverage_plan(category, brand, variant, container_volume)
+        plan = _beverage_plan(category, brand, variant, container_volume, flavor, drink_type)
     return _dedupe_plan(plan)
 
 
@@ -165,6 +194,7 @@ def resolve(text: str, category: str = "", brand: str = "", variant: str = "", p
     name = taxonomy.display_name(meta)
 
     color = ""
+    flavor = drink_type = ""
     if meta["category"] == "smartphone":
         found = _COLOR_RE.search(raw.lower())
         color = found.group(1) if found else ""
@@ -173,13 +203,17 @@ def resolve(text: str, category: str = "", brand: str = "", variant: str = "", p
     else:
         model_or_variant = _CAN_VARIANT_NAMES.get(meta["variant"], meta["variant"].title())
         sub_tier = _CAN_SUB_TIER.get(meta["variant"], meta["variant"])
+        flavor = taxonomy.product_flavor(meta)
+        drink_type = taxonomy.find_drink_type(f"{raw} {meta['variant']}")
 
-    plan = query_plan(meta["category"], meta["brand"], model_or_variant, sub_tier, meta["container_volume"])
+    plan = query_plan(meta["category"], meta["brand"], model_or_variant, sub_tier, meta["container_volume"], flavor,
+                      drink_type)
     ordered = [query for query, _ in plan]
     return CanonicalProduct(
         raw_query=raw, class_id=class_id, canonical_name=name, category=meta["category"], brand=meta["brand"],
         model_or_variant=model_or_variant, sub_tier=sub_tier, cad_search_terms=tuple(ordered),
-        package_type=meta["package_type"], container_volume=meta["container_volume"], color=color,
+        package_type=meta["package_type"], container_volume=meta["container_volume"], color=color, flavor=flavor,
+        drink_type=drink_type,
     )
 
 

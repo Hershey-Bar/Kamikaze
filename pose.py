@@ -2,9 +2,11 @@
 
 NumPy only (no OpenCV needed), ~1-2 ms per frame on 72x72 pixels:
   * roll  - principal-axis angle of the foreground mask (image moments), 0 = upright, + = clockwise.
-  * yaw   - view matching: the live embedding is compared with the enrolled front/side/back centroids and
-            the matches are blended on the yaw circle (front 0, side +/-90, back 180). For phones the
-            apparent width/height ratio (oriented-box foreshortening) refines the magnitude.
+  * yaw   - view matching: the live descriptor is compared with the enrolled front/side/back centroids and the matches
+            are blended on the yaw circle (front 0, side +/-90, back 180), i.e. yaw = atan2(w_side, w_front - w_back)
+            with softmax view weights. The descriptor is DINOv2 ViT-S/14 (NPU pose worker in receiver.py) when the class
+            was enrolled with DINOv2 view centroids, else the MobileNet embedding. For phones the apparent width/height
+            ratio (oriented-box foreshortening) refines the magnitude.
   * pitch - top-view weight plus the perspective taper of the mask along its major axis.
 The result is an approximation intended to drive the dashboard's 3D model, not a metrology-grade pose.
 """

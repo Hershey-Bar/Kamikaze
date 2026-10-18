@@ -304,14 +304,30 @@ class StateMachineTests(unittest.TestCase):
         out = self.feed(sm, [receiver.FrameScore("s25_ultra", 0.75, 0.0)] * 3)
         self.assertEqual(out["state"], receiver.GUIDING)
 
-    def test_background_cosine_calibrates_to_zero(self):
-        for raw in (-0.3, 0.0, 0.38, 0.45, receiver.CAL_FLOOR):
-            self.assertEqual(receiver.calibrate(raw), 0.0)
+    def test_background_cosine_calibrates_low_and_smooth(self):
+        for raw in (-0.3, 0.0, 0.38, 0.45, 0.52):
+            self.assertLess(receiver.calibrate(raw), 0.15)
+        grid = [i / 100 for i in range(-30, 101)]
+        cal = [receiver.calibrate(s) for s in grid]
+        self.assertTrue(all(b > a for a, b in zip(cal, cal[1:])))  # strictly monotone: no hard 0% floor
+        self.assertTrue(all(b - a < 0.03 for a, b in zip(cal, cal[1:])))  # no jumps between 0.01 cosine steps
         self.assertAlmostEqual(receiver.calibrate(1.0), 1.0)
         self.assertAlmostEqual(receiver.calibrate(receiver.T_IDENT), receiver.C_IDENT)
+        self.assertAlmostEqual(receiver.calibrate(receiver.T_SEARCH), receiver.C_SEARCH)
+        self.assertAlmostEqual(receiver.T_IDENT, 0.856, places=2)  # operating points kept from the linear calibration
+        self.assertAlmostEqual(receiver.T_SEARCH, 0.640, places=2)
         sm = receiver.StateMachine()
         out = self.feed(sm, [receiver.FrameScore("coke_can", 0.45, 0.40, "pepsi_can")] * 5)
-        self.assertEqual((out["state"], out["score"], out["margin"]), (receiver.SEARCHING, 0.0, 0.0))
+        self.assertEqual(out["state"], receiver.SEARCHING)
+        self.assertLess(out["score"], receiver.C_SEARCH)
+
+    def test_reported_confidence_is_ema(self):
+        sm = receiver.StateMachine()
+        self.feed(sm, [self.ident(s1=0.90)] * 3)
+        before = self.feed(sm, [self.ident(s1=0.90)])["score"]
+        after = self.feed(sm, [self.ident(s1=0.95)])["score"]
+        expected = receiver.EMA_ALPHA * receiver.calibrate(0.95) + (1 - receiver.EMA_ALPHA) * before
+        self.assertAlmostEqual(after, expected, places=6)
 
     def test_empty_scene_reads_zero(self):
         sm = receiver.StateMachine()
@@ -329,7 +345,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(out["state"], receiver.GUIDING)
         self.assertLessEqual(out["score"], 0.35)
         self.assertEqual(receiver.guidance_message(out["state"], out["label"], out["score"], "flip"),
-                         "Front screen detected. Flip phone 180° to expose camera island and sensors.")
+                         "Front screen detected. Flip phone 180° to expose camera island.")
 
     def test_low_similarity_searches(self):
         sm = receiver.StateMachine()
@@ -380,8 +396,10 @@ class GuidanceTests(unittest.TestCase):
 
 
 class PreprocessTests(unittest.TestCase):
-    def test_center_crop_is_sixty_percent(self):
-        self.assertEqual(receiver.center_crop_box(640, 480), (288, 176, 96))
+    def test_center_crop_is_seventy_five_percent(self):
+        self.assertEqual(receiver.center_crop_box(640, 480), (360, 140, 60))
+        size, left, top = receiver.center_crop_box(1920, 1080)
+        self.assertEqual((left, top, left + size, top + size), (555, 135, 1365, 945))
 
     def test_shape_dtype_contiguity(self):
         arr = receiver.preprocess(Image.new("RGB", (640, 480), (255, 255, 255)))
@@ -444,6 +462,89 @@ class BankTests(unittest.TestCase):
 
     def test_empty_bank_scores(self):
         self.assertEqual(receiver.EmbeddingBank(None).scores(unit(1)), [])
+
+    def test_dinov2_pose_views_persist_and_clear(self):
+        def desc(i, dim=8):
+            v = np.zeros(dim, np.float32)
+            v[i] = 1.0
+            return v
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bank.pt"
+            bank = receiver.EmbeddingBank(path)
+            info = bank.add_multiview("coke_can", {"front": [unit(1)] * 2, "side": [unit(2)] * 2, "back": [unit(3)] * 2},
+                                      {"category": "beverage_can"},
+                                      {"front": [desc(0)] * 2, "side": [desc(1)] * 2, "top": [desc(3)]})
+            self.assertEqual(info["pose_views"], ["front", "side"])  # "top" has no MobileNet view: dropped
+            self.assertTrue(bank.has_pose_views("coke_can"))
+            again = receiver.EmbeddingBank(path)
+            again.load()
+            sims = again.pose_view_sims("coke_can", desc(1))
+            self.assertAlmostEqual(sims["side"], 1.0, places=5)
+            self.assertAlmostEqual(sims["front"], 0.0, places=5)
+            self.assertEqual(again.info()[0]["pose_views"], ["front", "side"])
+            again.add_multiview("pepsi_can", {"front": [unit(4)]}, {"category": "beverage_can"})
+            self.assertFalse(again.has_pose_views("pepsi_can"))
+            self.assertEqual(again.pose_view_sims("pepsi_can", desc(0)), {})
+            data = torch.load(path, weights_only=True)
+            data["pose_embedder"] = "some-other-model"
+            torch.save(data, path)
+            stale = receiver.EmbeddingBank(path)
+            stale.load()
+            self.assertFalse(stale.has_pose_views("coke_can"))  # descriptors from another model are never compared
+            self.assertTrue(again.remove("coke_can"))
+            self.assertFalse(again.has_pose_views("coke_can"))
+
+
+class FakePoseEmbedder:
+    device = "npu"
+
+    def __init__(self, desc):
+        self.desc = desc
+        self.calls = 0
+
+    def embed_rgb01(self, nhwc):
+        assert nhwc.shape == (1, 224, 224, 3) and 0.0 <= float(nhwc.min()) and float(nhwc.max()) <= 1.0001
+        self.calls += 1
+        return self.desc
+
+    def info(self):
+        return {"model": "fake-dinov2", "device": self.device}
+
+
+class PoseWorkerTests(unittest.TestCase):
+    def test_rgb01_inverts_preprocess(self):
+        img = Image.new("RGB", (300, 300), (200, 30, 90))
+        back = receiver.rgb01_nhwc(receiver.preprocess(img, (300, 0, 0)))
+        self.assertEqual(back.shape, (1, 224, 224, 3))
+        np.testing.assert_allclose(back[0, 100, 100], np.array([200, 30, 90]) / 255.0, atol=1e-4)
+
+    @needs_torch
+    def test_worker_scores_latest_crop_against_view_centroids(self):
+        bank = receiver.EmbeddingBank(None)
+        side = np.array([0, 1, 0, 0], np.float32)
+        bank.add_multiview("coke_can", {"front": [unit(1)], "side": [unit(2)], "back": [unit(3)]}, {"category": "beverage_can"},
+                           {"front": [np.array([1, 0, 0, 0], np.float32)], "side": [side],
+                            "back": [np.array([0, 0, 1, 0], np.float32)]})
+        emb = FakePoseEmbedder(side)
+        worker = receiver.PoseWorker(emb, bank, hz=1000)
+        arr = receiver.preprocess(Image.new("RGB", (64, 64), (10, 20, 30)))
+        self.assertIsNone(worker.latest("coke_can"))
+        self.assertTrue(worker.submit("coke_can", arr))
+        deadline = time.monotonic() + 5
+        while worker.latest("coke_can") is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        sims = worker.latest("coke_can")
+        self.assertEqual(max(sims, key=sims.get), "side")
+        self.assertIsNone(worker.latest("pepsi_can"))  # results are tied to the class they were computed for
+        yaw, _, best = receiver.pose_mod.PoseEstimator._view_yaw(sims, 0.0)
+        self.assertEqual(best, "side")
+        self.assertAlmostEqual(yaw, 90.0, delta=1.0)  # atan2(w_side, w_front - w_back)
+        worker.reset()
+        self.assertIsNone(worker.latest("coke_can"))
+        slow = receiver.PoseWorker(emb, bank, hz=0.5)
+        self.assertTrue(slow.submit("coke_can", arr))
+        self.assertFalse(slow.submit("coke_can", arr))  # rate cap keeps NPU time for the detector
 
 
 class FakeExtractor:
@@ -614,7 +715,7 @@ class PipelineHttpTests(unittest.TestCase):
         self.assertLessEqual(verdict["confidence"], 0.35)
         self.assertEqual(verdict["hint"], "flip")
         state = json.loads(self.call("GET", "/api/state")[1])
-        self.assertEqual(state["guidance"], "Front screen detected. Flip phone 180° to expose camera island and sensors.")
+        self.assertEqual(state["guidance"], "Front screen detected. Flip phone 180° to expose camera island.")
         self.assertTrue(state["front_dominant"])
         time.sleep(0.3)
         self.assertEqual(self.leds_log[-1], (255, 120, 0, 40, 4))

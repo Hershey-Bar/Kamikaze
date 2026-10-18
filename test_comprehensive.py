@@ -9,6 +9,7 @@ import os
 import statistics
 import tempfile
 import threading
+import time
 import unittest
 from http.client import HTTPConnection
 from pathlib import Path
@@ -61,11 +62,11 @@ class MetadataTests(unittest.TestCase):
         base = np.full((480, 640), 20.0)
         empty = Image.fromarray(np.clip(base + rng.normal(0, 0.6, base.shape), 0, 255).astype(np.uint8)).convert("RGB")
         phone = base.copy()
-        phone[150:330, 270:370] = 45.0  # 25 grey levels of contrast, no texture
-        phone = Image.fromarray(np.clip(phone + rng.normal(0, 1.0, base.shape), 0, 255).astype(np.uint8)).convert("RGB")
+        phone[150:330, 270:370] = 38.0  # 18 grey levels of contrast, no texture
+        phone = Image.fromarray(np.clip(phone + rng.normal(0, 0.6, base.shape), 0, 255).astype(np.uint8)).convert("RGB")
         e, p = receiver.scene_saliency(empty), receiver.scene_saliency(phone)
         self.assertTrue(e["empty"], e)
-        self.assertLess(p["laplacian_var"], receiver.LAPLACIAN_MIN, p)
+        self.assertLess(p["laplacian_var"], receiver.LAPLACIAN_MIN, p)  # the Laplacian alone would call it empty
         self.assertGreaterEqual(p["edge_density"], receiver.EDGE_MIN, p)
         self.assertFalse(p["empty"], p)
         self.assertFalse(receiver.scene_saliency(rect_image(90, 150))["empty"])
@@ -332,6 +333,46 @@ class MultiViewFlowTests(unittest.TestCase):
         # strict <10 ms budget is enforced in PoseTests; here the estimator shares a busy test process
         self.assertLess(min(times), 30.0, times)
         self.assertIn("pose", self.pipe.snapshot())
+
+    def test_dinov2_pose_views_enrolled_and_drive_yaw(self):
+        class FakeDino:
+            device = "npu"
+            desc = None
+
+            def embed_rgb01(self, nhwc):
+                return self.desc
+
+            def info(self):
+                return {"model": "fake-dinov2", "device": "npu"}
+
+        dino = FakeDino()
+        self.pipe.pose_worker = receiver.PoseWorker(dino, self.bank, hz=1000)
+        descs = {v: np.eye(8, dtype=np.float32)[i] for i, v in enumerate(taxonomy.VIEWS)}
+        self.call("POST", "/api/enroll/start", {"raw_name": "Sprite Can", "category": "beverage_can", "frames_per_view": 3})
+        base = {v: unit(40 + i) for i, v in enumerate(taxonomy.VIEWS)}
+        for view in taxonomy.VIEWS:
+            self.call("POST", "/api/enroll/capture", {"view": view})
+            dino.desc = descs[view]
+            for _ in range(3):
+                self.frame(base[view])
+        _, st = self.call("GET", "/api/enroll/status")
+        self.assertEqual(st["phase"], "done", st)
+        label = self.bank.labels()[0]
+        self.assertEqual(self.bank.info()[0]["pose_views"], sorted(taxonomy.VIEWS))
+        buf = io.BytesIO()
+        rect_image(60, 120, size=(320, 240)).save(buf, "JPEG")
+        self.ext.vec, dino.desc = base["side"], descs["side"]
+        for _ in range(12):
+            self.conn.request("POST", "/api/frame", body=buf.getvalue(), headers={"Content-Type": "image/jpeg"})
+            self.conn.getresponse().read()
+            time.sleep(0.02)  # let the pose worker publish
+        pose = self.pipe.snapshot()["pose"]
+        self.assertEqual(self.pipe.snapshot()["label"], label)
+        self.assertEqual(pose["source"], "dinov2-npu", pose)
+        self.assertEqual(pose["view"], "side")
+        self.assertGreater(abs(pose["yaw"]), 60.0, pose)
+        models = self.pipe.telemetry_snapshot()["inference"]["models"]
+        self.assertEqual(models["pose"]["model"], "fake-dinov2")
 
     def test_db_save_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:

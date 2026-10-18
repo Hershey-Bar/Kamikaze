@@ -8,10 +8,13 @@ co-processor show the recognition state.
 Logitech Brio (USB 3.0 on the board, /dev/video0, V4L2 MJPG 1920x1080 @ 30 fps) --> onboard_camera.py capture thread
    (raw camera JPEG passthrough, no re-encode) --> receiver.py (VENTUNO Q, 0.0.0.0:5000) <-- adb forward tcp:5000 (dashboard)
    receiver.py: capture returns at once; an NPU worker thread always processes the newest frame (older ones are dropped)
-   receiver.py: YOLO26n (Ultralytics, Hexagon NPU)       -> crop the phone/can inside the 60% reticle
+   receiver.py: YOLO-World v2-S (Hexagon NPU, vocabulary "beverage can" / "soda can" / "smartphone" / "bottle")
+                                                         -> crop the phone/can inside the 75% reticle
                 MobileNetV3-Large embedder (Hexagon NPU) -> 1280-d unit vector -> few-shot multi-view prototypes
+                DINOv2 ViT-S/14 pose worker (Hexagon NPU, own thread, 10 Hz) -> per-view centroids -> continuous yaw
                 pose.py (OpenCV/NumPy + view matching)   -> pitch/yaw/roll for the 3D viewer
-                cad_harvester.py (Sketchfab, Poly Pizza, Khronos) -> static/models/<class>.glb + attribution
+                cad_harvester.py (Sketchfab + Poly Pizza pooled and popularity-ranked, Khronos)
+                                                         -> static/models/<class>.glb + attribution
                 /var/run/arduino-router.sock (MessagePack-RPC set_pixels) -> STM32 -> Wire1 (I2C4) -> Modulino Pixels
 ```
 
@@ -23,7 +26,8 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 # Hexagon NPU runtime (QNN TFLite delegate + cDSP skeletons)
 sudo add-apt-repository ppa:ubuntu-qcom-iot/qcom-ppa && sudo apt install qairt-libs qairt-dsp-binaries
 cp .env.example .env   # add SKETCHFAB_TOKEN and POLY_PIZZA_API_KEY
-./export_yolo.sh       # YOLO26n + YOLO11n -> models/npu/*_float32.tflite (~10 min the first time)
+./export_yolo.sh       # YOLO-World (domain vocabulary) + YOLO26n + YOLO11n -> models/npu/*_float32.tflite
+TORCH_HOME=models/dinov2 ~/yolo_export/venv/bin/python export_dinov2.py  # DINOv2 ViT-S/14 -> models/npu/dinov2_vits14_pose_float32.tflite (pose worker)
 ```
 
 The embedder (MediaPipe, Apache-2.0) is downloaded to `models/npu/` on first start. The YOLO detectors (Ultralytics,
@@ -53,7 +57,7 @@ frames it is reopened with back-off. The V4L2 queue keeps its default depth: `CA
 every other frame (15 fps measured), while the capture thread drains the queue continuously so no lag builds up.
 
 For inference the 1080p JPEG is decoded at half scale (`KAMIKAZE_DECODE_MAX=960`, JPEG DCT scaling, ~6.5 ms instead of
-~16 ms), and the 60% center square (324 px) is resized to 224x224. Measured on the board with the Brio: capture 29.9 fps,
+~16 ms), and the 75% center square (810x810 px on 1080p, `[555,135,1365,945]`; `KAMIKAZE_CROP_FRACTION`) is resized to 224x224. Measured on the board with the Brio: capture 29.9 fps,
 inference 30.8 fps, 0 dropped frames, 26 ms median per frame (detector + embedder + decode), CPU ~27%. With
 `KAMIKAZE_DECODE_MAX=0` (full-res decode) inference falls to ~17 fps (48 ms) and ~40% of frames are skipped.
 
@@ -107,13 +111,17 @@ The startup log prints the accelerator, e.g. `Hexagon NPU (HTP v75, QNN TFLite d
 | Stage (QCS8275, measured)  | Hexagon NPU | Arm CPU (XNNPACK, 4 threads) |
 |----------------------------|-------------|------------------------------|
 | MobileNetV3-L embedder     | ~0.9 ms     | ~20 ms                       |
-| YOLO26n 640 (default)      | ~6–8.5 ms   | ~200 ms                      |
+| YOLO-World v2-S 640 (default) | ~19 ms   | —                            |
+| DINOv2 ViT-S/14 224 (pose) | ~20 ms      | ~730 ms                      |
+| YOLO26n 640 (fallback)     | ~6–8.5 ms   | ~200 ms                      |
 | YOLO11n 640                | ~6.7 ms     | ~166 ms                      |
 | EfficientDet-Lite2 int8    | ~3–6 ms     | ~84 ms                       |
 
 End to end per frame (JPEG decode, letterbox, detect, crop, embed) is ~20–30 ms, dominated by image resizing on the CPU.
-COCO has no "can" class, so cans crop as `bottle`/`cup` and phones as `cell phone`/`remote`; when nothing is found the center crop is used.
-For real can/phone classes, train a custom YOLO and run `./export_yolo.sh best.pt` with `KAMIKAZE_DETECTOR=best`.
+The default detector is YOLO-World with the domain vocabulary baked in at export (`export_yolo.sh world`), so cans are
+reported as `beverage can`, never `cup`. With the COCO fallback (`KAMIKAZE_DETECTOR=yolo26n`) `cup`, and `bottle` boxes with
+H/W 1.4–2.6, are relabelled `beverage can`. When nothing is found the center crop is used. A custom-trained YOLO can be
+exported with `./export_yolo.sh best.pt` and selected with `KAMIKAZE_DETECTOR=best`.
 
 ### Memory
 
@@ -149,43 +157,74 @@ kept as `enrolled_classes.<embedder>.bak.pt` and the objects must be re-enrolled
 
 Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` / `_arbitrate`):
 
-1. **Empty-scene gate.** The 60% reticle crop is scored for structure (Laplacian variance and Canny edge density, Canny
+1. **Empty-scene gate.** The 75% reticle crop is scored for structure (Laplacian variance and Canny edge density, Canny
    10/30 after a 3×3 blur so dim, soft outlines still register). Only when **both** are low — Laplacian below
-   `KAMIKAZE_LAPLACIAN_MIN` (default 18) *and* edge density below `KAMIKAZE_EDGE_MIN` (0.002) — is the frame a blank wall /
+   `KAMIKAZE_LAPLACIAN_MIN` (default 8, so smooth metallic cans pass) *and* edge density below `KAMIKAZE_EDGE_MIN` (0.002) — is the frame a blank wall /
    dark scene (a smooth phone has a low Laplacian variance but a clear outline, so a Laplacian-only test would reject it):
    detector and
    embedder are skipped, the state is **SEARCHING** with confidence 0% / margin 0%, the banner reads
    *Awaiting object inside center reticle...* and one cyan LED is lit `(0,100,150,15,1)`. Disable with `KAMIKAZE_SCENE_GATE=0`;
    tune edges with `KAMIKAZE_CANNY_LO` / `KAMIKAZE_CANNY_HI`. Live values are shown in the Edge-AI telemetry card.
-2. **Detector = domain gate.** YOLO26n on the NPU only restricts *which classes may match*: `cell phone` ≥ 0.50 → smartphones
-   only, `cup` / `bottle` ≥ 0.50 → beverage cans/bottles only. If the unrestricted top-1 is from the other domain the frame is
+2. **Detector = domain gate.** YOLO-World on the NPU only restricts *which classes may match*: `smartphone` ≥ 0.50 →
+   smartphones only, `beverage can` / `soda can` / `bottle` ≥ 0.50 → beverage cans/bottles only. If the unrestricted top-1 is from the other domain the frame is
    **GUIDING** with *Verifying object geometry... Hold steady in center.*
-3. **Calibrated confidence.** Raw cosine `S` maps to `C = max(0, (S − 0.52) / 0.48)` (`KAMIKAZE_CAL_FLOOR`), so the empty
-   background (raw 0.38–0.45) reads 0%. **IDENTIFIED** needs `C ≥ 0.70` (raw ≈ 0.856) *and* margin `Δ ≥ 0.15` for 3 consecutive
-   frames; `0.25 ≤ C < 0.70` or `Δ < 0.15` is **GUIDING**; `C < 0.25` is **SEARCHING**.
+3. **Calibrated confidence.** Raw cosine `S` maps through a normalised logistic
+   `C = σ(k(S − c)) / σ(k(1 − c))` with `k = 7.38`, `c = 0.8334` (`KAMIKAZE_CAL_SLOPE` / `KAMIKAZE_CAL_CENTER`), so `C = 1`
+   at `S = 1` and there is no hard 0% cliff. (The directive's `1/(1+e^(−12(S−0.45)))` was not used: MobileNetV3 cosines of
+   empty backgrounds already sit at 0.45–0.52, which that curve would report as 50–70%, i.e. near-false IDENTIFIED; the
+   fitted curve keeps the gates exact: C(0.856) = 0.70, C(0.64) = 0.25, C(0.52) = 0.12.) The reported confidence is smoothed
+   with an EMA `C̄ₜ = 0.25·Cₜ + 0.75·C̄ₜ₋₁` (`KAMIKAZE_EMA_ALPHA`). **IDENTIFIED** needs `C ≥ 0.70` *and* margin `Δ ≥ 0.15`
+   for 3 consecutive frames (green, LEDs 1–8 by confidence); `0.25 ≤ C < 0.70` or `Δ < 0.15` is **GUIDING** (amber
+   `(255,120,0)`, 4 LEDs); `C < 0.25` is **SEARCHING** (dim cyan `(0,100,150)`, 1 LED).
 4. **Smartphones.** Views are weighted back 0.65 / side 0.15 / top 0.10 / front 0.10 (`device_taxonomy.py`). Because the camera
    sees one face at a time, the weights act as per-view reliability (back × 1.00, side × 0.81, top/front × 0.79): only the rear
    shell can push a phone over the IDENTIFIED floor. If the live frame matches a phone's screen better than its back,
    confidence is capped at 35%, LEDs go amber and the banner says *Front screen detected. Flip phone 180° to expose camera
-   island and sensors.* When two enrolled phones are within Δ 0.15, the tier taxonomy picks the cue that separates them
+   island.* When two enrolled phones are within Δ 0.15, the tier taxonomy picks the cue that separates them
    (Pro LiDAR aperture, Ultra boxy corners + periscope, iPhone lens layout, Apple vs Samsung island).
+5. **Pose.** A separate pose worker thread runs DINOv2 ViT-S/14 on the NPU (rate-capped at `KAMIKAZE_POSE_HZ`, 10 Hz) on
+   the identified crop. During enrollment each view also stores a 768-d DINOv2 centroid ([CLS | mean patch]); live, the
+   cosines to the Front / Side / Back centroids give `w = max(0, cos)` weights and `yaw = atan2(w_side, w_front − w_back)`;
+   pitch comes from the Top-view weight plus the perspective taper of the object outline. Classes enrolled before the pose worker existed fall back to MobileNet view centroids
+   (`pose.source` = `mobilenet-views` instead of `dinov2-npu`); re-enroll them for DINOv2 pose. `KAMIKAZE_POSE_DINO=0`
+   disables the worker.
 
 ## Dashboard
 
-Row 1: live camera with the 60% corner-bracket reticle, status pill and guidance banner (45%) | interactive 3D CAD stage
-(55%, `<model-viewer>`, Auto Rotate / Sync Live Pose / Re-Fetch CAD for Active, author + licence badge).
-Row 2: four telemetry cards — Host QCS8275 (junction °C, per-core GHz, load), Memory (16 GB LPDDR5 used/total), STM32H5F5
-bridge (`set_pixels` RPC ms, LEDs, router socket) and Edge-AI pipeline (NPU runtime, embed/detect ms, fps, calibrated
-similarity %, margin %, scene-gate values, active detector domain).
-Row 3: training console (name + category, Capture Front 0° → Back 180° → Side 90° → Top) | enrolled classes table
-(Name · Category · Views · CAD · Re-Fetch CAD · Delete) and **PURGE DATABASE**.
+Two columns. **Left**, top to bottom: live camera (16:9) with the 75% corner-bracket reticle, status pill and guidance
+banner; the guided 4-angle training console (name + category, Capture Front 0° → Back 180° → Side 90° → Top); a 2×2 grid
+of telemetry cards — Host QCS8275 (junction °C, per-core GHz, load), Memory (16 GB LPDDR5 used/total), STM32H5F5 bridge
+(`set_pixels` RPC ms, LEDs, router socket) and Edge-AI pipeline (NPU runtime, embed/detect ms, DINOv2 pose ms, fps,
+calibrated similarity %, margin %, scene-gate values, active detector domain).
+**Right** (sticky): the interactive 3D CAD stage (`<model-viewer>`, ≥ 620 px tall, `environment-image="neutral"`,
+`exposure="1.0"`, `shadow-intensity="1.2"`, `tone-mapping="aces"`; Auto Rotate / **Sync Physical Pose** / Re-Fetch CAD
+for Active; author + licence badge), then the enrolled classes table (Name · Category · Views · CAD · Re-Fetch CAD ·
+Delete) and **PURGE DATABASE**. Sync Physical Pose drives `camera-orbit` from the live yaw/pitch; the pill shows the
+pose and its source. Until a model is found the stage shows a neutral brushed-metal placeholder (grey-silver PBR,
+metallic 0.8, roughness 0.35), never an untextured red box.
 
 ## 3D models and attribution
 
 `cad_harvester.build_search_queries()` turns plain text into a cascade of queries, most specific first
 (`s25 ultra` -> `Samsung Galaxy S25 Ultra`, `Samsung S25 Ultra`, `Galaxy S25 Ultra`, `Galaxy S24 Ultra`, `Smartphone`).
-Sketchfab (downloadable, non-NC licences) and Poly Pizza (`https://api.poly.pizza/v1.1/search/{query}`, `X-Auth-Token`)
-are tried at each level, then Khronos sample assets, then a procedural model. Every downloaded model gets a JSON sidecar
+At each level (exact → similar → category) every query is sent to Sketchfab (downloadable, non-NC licences) and Poly
+Pizza (`https://api.poly.pizza/v1.1/search/{query}`, `X-Auth-Token`); the results are pooled, de-duplicated and ranked by
+
+    RankScore = relevance(title, level) + popularity
+    popularity = min(25, 2.5·ln(1 + likes) + 0.75·ln(1 + views) + 4·staff_pick)     (Sketchfab)
+    popularity = 6 − 0.5·rank position                                               (Poly Pizza: no counts exposed)
+
+and the best four are tried for download. Neither API returns download counts, and raw `likes × 3` would let a famous
+but wrong model beat an exact title match, so popularity is log-scaled and capped below the gap between relevance
+levels. Relevance rejects any title naming another brand or drink type (a Kirkland sparkling water never becomes a
+Coca-Cola or "Cola Can") and penalises another flavour or phone tier. Generic titles hide liveries, so tags and
+descriptions are checked too: a "Soda Can" described as "A simple old Pepsi Soda can", or tagged `pepsi` / `cola`, is
+rejected for every other brand, as are `crushed` / `grenade` variants. Plain text such as `Kirkland Grapefruit` resolves
+to brand *Kirkland*, flavour *grapefruit*, drink type *sparkling water* (`kirkland_grapefruit_can`) and searches
+`Kirkland Grapefruit Can` → `Kirkland Can`, `Grapefruit Sparkling Water Can`, `Grapefruit Seltzer Can` → `Soda Can`; on
+the live APIs this picks the most-liked unbranded soda can (Sketchfab "Soda Can" by sunich, CC-BY). After the online
+sources come Khronos sample assets,
+then a procedural model (neutral grey-silver for unknown brands). Every downloaded model gets a JSON sidecar
 with title, author, author URL, licence and source; credits are shown in the dashboard and written to
 `static/models/CREDITS.md`.
 

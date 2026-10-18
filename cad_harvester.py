@@ -6,13 +6,16 @@ Search queries come from build_search_queries()/search_plan(): colloquial text i
 expanded into exact -> similar -> category queries ("s25 ultra" -> "Samsung Galaxy S25 Ultra" ... "Galaxy S24 Ultra" ...
 "Smartphone"). Each level is tried against every online source before falling back to the next level.
 
-Source order per level (first acceptable GLB wins):
-  1. Sketchfab Data API  (SKETCHFAB_TOKEN)   - results are relevance-filtered (exact model + tier), licence-filtered
-                                               (CC0 / CC-BY / CC-BY-SA / CC-BY-ND / Sketchfab Standard; NonCommercial rejected),
-                                               single-object, face-count and download-size capped.
-  2. Poly Pizza API      (POLY_PIZZA_API_KEY, header X-Auth-Token) - CC0 / CC-BY models only.
-  3. Open repos          - KhronosGroup/glTF-Sample-Assets (exact level only; credits read from each model README).
-  4. Local parametric model (original work, brand/tier aware) built by procedural_glb.py; generic templates live in
+Source order per level (exact -> similar -> category; the first level that yields a downloadable GLB wins):
+  1. Online pool - Sketchfab Data API (SKETCHFAB_TOKEN) + Poly Pizza API (POLY_PIZZA_API_KEY, header X-Auth-Token).
+     All queries of the level are searched on both services; candidates are relevance-filtered (exact model + tier +
+     flavour, no competing brand), licence-filtered (CC0 / CC-BY / CC-BY-SA / CC-BY-ND / Sketchfab Standard; NonCommercial
+     rejected), single-object and face-count capped, then ranked by
+         relevance + licence + popularity - mesh weight,   popularity = 2.5·ln(1+likes) + 0.75·ln(1+views) + 4·staff_pick
+     (capped at 25; Poly Pizza has no counters, so its own relevance order stands in). The best GLB within the download
+     size cap wins.
+  2. Open repos          - KhronosGroup/glTF-Sample-Assets (exact level only; credits read from each model README).
+  3. Local parametric model (original work, brand/tier aware) built by procedural_glb.py; generic templates live in
      static/models/base/{soda_can,bottle,smartphone}.glb.
 
 Every cached model gets a sidecar static/models/<class_id>.json holding the attribution (title, author, author URL,
@@ -53,7 +56,10 @@ SEARCH_TIMEOUT_S = float(os.environ.get("KAMIKAZE_CAD_SEARCH_TIMEOUT", "10"))
 MAX_FACES = int(os.environ.get("KAMIKAZE_CAD_MAX_FACES", "150000"))
 MAX_GLB_MB = float(os.environ.get("KAMIKAZE_CAD_MAX_MB", "24"))
 ALLOW_NONCOMMERCIAL = os.environ.get("KAMIKAZE_CAD_ALLOW_NC", "0") == "1"
-CANDIDATES_PER_QUERY = 3
+DOWNLOAD_TRIES = 4
+POPULARITY_CAP = 25.0
+FLAVOR_CONFLICT = 12.0
+TIER_CONFLICT = 6.0
 ALLOW_GENERIC = os.environ.get("KAMIKAZE_CAD_GENERIC", "1") != "0"
 POLY_PIZZA_SEARCH = "https://api.poly.pizza/v1.1/search/{query}"
 LEVEL_SCORE = {"exact": 0.0, "similar": 30.0, "category": 10.0}
@@ -63,18 +69,26 @@ CAN_TIER_SYNONYMS = {"zero": "zero", "max": "zero", "diet": "diet", "light": "di
 REJECT_COMMON = {"pack", "crate", "fridge", "vending", "machine", "dispenser", "scene", "pile", "collection", "set",
                  "cooler", "display", "shelf", "store", "room", "stack", "carton", "rack", "bundle", "truck", "series",
                  "cans", "bottles", "phones", "smartphones", "sixpack", "case", "cases", "logo", "sign", "poster",
-                 "billboard", "crushed", "broken", "destroyed"}
+                 "billboard", "crushed", "broken", "destroyed", "grenade", "bomb", "weapon", "explosive"}
+# shape-changing words that disqualify a model even when they only appear in its tags / description
+META_REJECT = {"crushed", "broken", "destroyed", "dented", "smashed", "grenade", "bomb", "weapon", "explosive"}
 REJECT_PHONE = {"cover", "holder", "stand", "charger", "box", "packaging", "tablet", "ipad", "fold", "flip", "watch",
                 "buds", "protector", "wallpaper", "desk", "hand", "holding", "dock", "tripod", "gimbal", "accessory",
                 "pen", "spen", "stylus", "pencil", "airpods", "earbuds", "headphones", "airtag", "strap", "lens"}
 REJECT_CAN = {"bottle", "glass", "cup", "keg", "tin", "fanart", "sonic", "character", "sprite3d"}
 REJECT_BOTTLE = {"can", "glass", "cup", "keg", "tin", "fanart", "sonic", "character", "sprite3d", "wine", "beer"}
-CAN_WORDS = {"can", "soda", "drink", "beverage", "lemon", "lime", "cola", "aluminum", "aluminium", "energy"}
+CAN_WORDS = {"can", "soda", "drink", "beverage", "lemon", "lime", "cola", "aluminum", "aluminium", "energy", "seltzer",
+             "sparkling", "fizzy"}
 BOTTLE_WORDS = {"bottle", "soda", "drink", "beverage", "pet", "plastic"}
 PHONE_WORDS = {"phone", "smartphone", "mobile", "cellphone", "handset"}
 PHONE_BRANDS = {"iphone", "apple", "samsung", "galaxy", "pixel", "google", "xiaomi", "redmi", "huawei", "oneplus",
                 "nokia", "motorola", "moto", "sony", "xperia", "oppo", "vivo", "realme", "honor", "nothing", "asus"}
 PHONE_FAMILY = {"Apple": {"iphone", "apple"}, "Samsung": {"galaxy", "samsung"}}
+# brands looked for in free-text descriptions; words that are also common English ("nothing", "honor") are left out
+META_PHONE_BRANDS = {"iphone", "apple", "samsung", "galaxy", "pixel", "xiaomi", "redmi", "huawei", "oneplus", "motorola",
+                     "xperia", "oppo", "realme"}
+BRAND_DRINK = {"Coca-Cola": "cola", "Pepsi": "cola", "Red Bull": "energy drink"}
+DRINK_GROUP = {"seltzer": "water", "sparkling water": "water", "water": "water", "mineral water": "water"}
 BEVERAGE_BRANDS = {"coke", "coca", "cocacola", "pepsi", "sprite", "fanta", "redbull", "monster", "dew", "schweppes",
                    "rockstar", "drpepper", "mirinda", "lipton", "nestea", "heineken", "budweiser", "beer", "corona",
                    "carlsberg", "guinness", "arizona", "celsius"}
@@ -227,7 +241,7 @@ def search_plan(product) -> list[tuple[str, str]]:
     """[(query, level)] for a product, most specific first (levels: exact -> similar -> category)."""
     product = _coerce(product)
     return entity_resolver.query_plan(product.category, product.brand, product.model_or_variant, product.sub_tier,
-                                      product.container_volume)
+                                      product.container_volume, product.flavor, product.drink_type)
 
 
 def plan_queries(product, level: str) -> list[str]:
@@ -308,9 +322,90 @@ def name_score(product: entity_resolver.CanonicalProduct, name: str) -> float | 
         have_tier = {CAN_TIER_SYNONYMS[t] for t in tokens if t in CAN_TIER_SYNONYMS}
         if have_tier != want_tier:
             return None
+        if product.flavor and not _has_seq(tokens, _tokens(product.flavor)):
+            return None  # "Kirkland Grapefruit" needs grapefruit in the title to count as the exact product
+        if not product.flavor and _title_flavor(product, name):
+            return None  # a Cherry Coke model is not the plain Coca-Cola can
         pkg = "bottle" if product.category == "beverage_bottle" else "can"
         score = 50.0 + (10.0 if pkg in tokens else 0.0)
     return score - min(10.0, 0.5 * max(0, len(tokens) - 8))
+
+
+def _title_flavor(product, name: str) -> str:
+    """Flavour named in a model title, ignoring the brand's own signature flavour (Sprite = lemon-lime)."""
+    flavor = taxonomy.find_flavor(name)
+    signature = taxonomy.SIGNATURE_FLAVOR.get(product.brand, "")
+    return "" if flavor and set(flavor.split()) <= set(signature.split()) else flavor
+
+
+def _flavor_conflict(product, name: str, tokens: list[str]) -> bool:
+    """The title names a different flavour (e.g. "Orange Soda" for a grapefruit can)."""
+    other = _title_flavor(product, name)
+    return bool(other) and not (product.flavor and _has_seq(tokens, _tokens(product.flavor)))
+
+
+def _drink_conflict(product, name: str) -> bool:
+    """The title names a different drink type (e.g. "Cola Can" for sparkling water). Plain "soda" is generic."""
+    theirs = taxonomy.find_drink_type(name)
+    if not theirs or theirs == "soda":
+        return False
+    mine = product.drink_type or BRAND_DRINK.get(product.brand, "soda")
+    group = lambda d: DRINK_GROUP.get(d, d)  # noqa: E731
+    if mine == "soda" and group(theirs) == "water":
+        return False
+    return group(theirs) != group(mine)
+
+
+def _tag_names(tags) -> list[str]:
+    """Sketchfab tags are [{"name": ...}], Poly Pizza tags are plain strings."""
+    out = []
+    for tag in tags or []:
+        name = tag.get("name") or tag.get("slug") if isinstance(tag, dict) else tag
+        if name:
+            out.append(str(name))
+    return out
+
+
+def metadata_score(product, title: str, tags, description: str = "") -> float | None:
+    """Brand / flavour evidence that a generic title hides, from the model's tags and description (None = reject).
+
+    A Sketchfab "Soda Can" whose description reads "A simple old Pepsi Soda can" (or that is tagged pepsi / dew / cola)
+    carries a Pepsi / Coke livery: it must never stand in for a Kirkland can. When the title itself names the product's
+    brand the title is trusted (descriptions often compare with competitors). A different flavour in the tags only
+    lowers the score; crushed / grenade variants are rejected.
+    """
+    tag_text = " ".join(_tag_names(tags))
+    tokens = set(_tokens(tag_text + " " + (description or "")))
+    if not tokens:
+        return 0.0
+    if META_REJECT & set(_tokens(tag_text)):
+        return None
+    title_tokens = _tokens(title)
+    if product.category == "smartphone":
+        family = PHONE_FAMILY.get(product.brand, set(_tokens(product.brand)))
+        if family & set(title_tokens):
+            return 0.0
+        return None if (META_PHONE_BRANDS - family) & tokens else 0.0
+    if _brand_present(product.brand, title_tokens):
+        return 0.0
+    if _foreign_beverage(product, sorted(tokens)):
+        return None
+    if not _drink_conflict(product, title) and any(_drink_conflict(product, t) for t in _tag_names(tags)):
+        return None  # a generic "Soda Can" tagged cola is textured as a cola can
+    if not _flavor_conflict(product, title, title_tokens) and any(
+            _flavor_conflict(product, t, _tokens(t)) for t in _tag_names(tags)):
+        return -FLAVOR_CONFLICT / 2
+    return 0.0
+
+
+def popularity(likes: int = 0, views: int = 0, staff_picked: bool = False) -> float:
+    """Log-scaled community signal: 2.5·ln(1+likes) + 0.75·ln(1+views) + 4 if staff-picked, capped at 25.
+
+    Log scaling keeps a 5,000-like model from out-voting relevance; neither Sketchfab search nor Poly Pizza exposes
+    download counts, so likes / views / staff picks are the available popularity signals.
+    """
+    score = 2.5 * math.log1p(max(0, likes)) + 0.75 * math.log1p(max(0, views)) + (4.0 if staff_picked else 0.0)
+    return min(POPULARITY_CAP, score)
 
 
 def _foreign_beverage(product, tokens: list[str]) -> bool:
@@ -326,8 +421,10 @@ def match_score(product: entity_resolver.CanonicalProduct, name: str, level: str
     """Relevance of a model title at a search level (None = reject).
 
     exact    - the exact product and tier (name_score).
-    similar  - same brand family / product line (another generation, tier or flavour), e.g. Galaxy S24 Ultra for S25 Ultra.
-    category - a generic object of the same category with no competing brand, e.g. "Soda Can", "Smartphone".
+    similar  - same brand family / product line (another generation, tier or flavour), e.g. Galaxy S24 Ultra for S25 Ultra,
+               or an unbranded can of the same flavour ("Grapefruit Seltzer Can" for "Kirkland Grapefruit").
+    category - a generic object of the same category with no competing brand, e.g. "Soda Can", "Smartphone"; a title
+               naming another flavour or drink type ("Orange Soda", "Cola Can" for a grapefruit seltzer) is penalised.
     """
     exact = name_score(product, name)
     if exact is not None or level == "exact":
@@ -344,11 +441,19 @@ def match_score(product: entity_resolver.CanonicalProduct, name: str, level: str
             return LEVEL_SCORE["category"] - penalty
         return None
     words = _container_words(product)
-    if _brand_present(product.brand, tokens) and words & set(tokens) and not _foreign_beverage(product, tokens):
+    foreign = _foreign_beverage(product, tokens)
+    if _brand_present(product.brand, tokens) and words & set(tokens) and not foreign:
         return LEVEL_SCORE["similar"] - penalty
+    drink_conflict = _drink_conflict(product, name)
+    if (product.flavor and _has_seq(tokens, _tokens(product.flavor)) and words & set(tokens) and not foreign
+            and not drink_conflict):
+        return LEVEL_SCORE["similar"] - 4.0 - penalty
     pkg = "bottle" if product.category == "beverage_bottle" else "can"
-    if level == "category" and (pkg in tokens or "soda" in tokens) and not _foreign_beverage(product, tokens):
-        return LEVEL_SCORE["category"] - penalty
+    if level == "category" and (pkg in tokens or "soda" in tokens) and not foreign and not drink_conflict:
+        want_tier = {"zero"} if product.sub_tier == "zero" else {"diet"} if product.sub_tier == "diet" else set()
+        have_tier = {CAN_TIER_SYNONYMS[t] for t in tokens if t in CAN_TIER_SYNONYMS}
+        return (LEVEL_SCORE["category"] - penalty - (FLAVOR_CONFLICT if _flavor_conflict(product, name, tokens) else 0.0)
+                - (TIER_CONFLICT if have_tier - want_tier else 0.0))
     return None
 
 
@@ -391,8 +496,12 @@ def rank_sketchfab(product: entity_resolver.CanonicalProduct, results: list[dict
         base = match_score(product, name, level)
         if base is None:
             continue
-        likes = int(model.get("likeCount") or 0)
-        score = base + license_rank(lic) + min(6.0, 2.0 * math.log10(likes + 1)) - min(8.0, faces / 25000.0)
+        meta = metadata_score(product, name, model.get("tags"), str(model.get("description") or ""))
+        if meta is None:
+            continue
+        likes, views = int(model.get("likeCount") or 0), int(model.get("viewCount") or 0)
+        pop = popularity(likes, views, bool(model.get("staffpickedAt")))
+        score = base + meta + license_rank(lic) + pop - min(8.0, faces / 25000.0)
         user = model.get("user") or {}
         ranked.append(Candidate(
             provider="sketchfab", title=name, score=score,
@@ -400,6 +509,7 @@ def rank_sketchfab(product: entity_resolver.CanonicalProduct, results: list[dict
             author_url=str(user.get("profileUrl") or ""), license=lic, license_url=license_url(lic),
             source_url=f"https://sketchfab.com/3d-models/{uid}", uid=uid, faces=faces,
             thumbnail_url=mcp._pick_thumbnail(model.get("thumbnails")),
+            extra={"likes": likes, "views": views, "popularity": round(pop, 2)},
         ))
     ranked.sort(key=lambda c: -c.score)
     return ranked
@@ -418,15 +528,22 @@ def _attribution_license_url(text: str) -> str:
 
 
 def rank_polypizza(product: entity_resolver.CanonicalProduct, results: list[dict], level: str = "exact") -> list[Candidate]:
-    """Filter and rank Poly Pizza search results (tolerates both capitalised and lower-case field names)."""
+    """Filter and rank Poly Pizza search results (tolerates both capitalised and lower-case field names).
+
+    Poly Pizza returns no likes / views, so its own relevance order stands in for popularity (6 points, -0.5 per rank).
+    """
     ranked: list[Candidate] = []
-    for item in results or []:
+    for position, item in enumerate(results or []):
         title = str(_poly_field(item, "Title", "title"))
         lic = str(_poly_field(item, "Licence", "License", "licence", "license"))
         url = str(_poly_field(item, "Download", "download"))
         tris = int(_poly_field(item, "Tri Count", "triCount", "TriCount") or 0)
         base = match_score(product, title, level)
         if not url or base is None or not license_allowed(lic) or tris > MAX_FACES:
+            continue
+        meta = metadata_score(product, title, _poly_field(item, "Tags", "tags") or [],
+                              str(_poly_field(item, "Description", "description")))
+        if meta is None:
             continue
         creator = _poly_field(item, "Creator", "creator")
         creator = creator if isinstance(creator, dict) else {}
@@ -438,13 +555,14 @@ def rank_polypizza(product: entity_resolver.CanonicalProduct, results: list[dict
         if not profile and username:
             profile = f"https://poly.pizza/u/{urllib.parse.quote(username)}"
         attribution = str(_poly_field(item, "Attribution", "attribution"))
+        pop = max(0.0, 6.0 - 0.5 * position)
         ranked.append(Candidate(
-            provider="polypizza", title=title, score=base + license_rank(lic),
+            provider="polypizza", title=title, score=base + meta + license_rank(lic) + pop,
             author=username, author_url=profile,
             license=lic, license_url=_attribution_license_url(attribution) or license_url(lic),
             source_url=f"https://poly.pizza/m/{pid}" if pid else "https://poly.pizza", download_url=url,
             thumbnail_url=str(_poly_field(item, "Thumbnail", "thumbnail", "previewUrl")), uid=pid, faces=tris,
-            attribution_text=attribution,
+            attribution_text=attribution, extra={"popularity": pop},
         ))
     ranked.sort(key=lambda c: -c.score)
     return ranked
@@ -483,6 +601,8 @@ def _record(product, cand: Candidate, source_name: str) -> dict:
         "faces": cand.faces, "class_id": product.class_id, "canonical_name": product.canonical_name,
         "match": cand.extra.get("match", "exact" if cand.provider in ("sketchfab", "polypizza", "github") else "parametric"),
         "query": cand.extra.get("query", ""),
+        "rank_score": round(cand.score, 2), "popularity": cand.extra.get("popularity"),
+        "likes": cand.extra.get("likes"), "views": cand.extra.get("views"),
         "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -503,13 +623,20 @@ def _sketchfab_download_url(uid: str, token: str) -> str | None:
     return str(glb["url"])
 
 
-def _try_sketchfab(product, slug: str, deadline: float, queries: list[str] | None = None,
-                   level: str = "exact") -> tuple[Candidate, str] | None:
+def _keep_best(best: dict[str, Candidate], cands: list[Candidate], query: str, level: str) -> None:
+    for cand in cands:
+        cand.extra.update(query=query, match=level)
+        if cand.uid not in best or cand.score > best[cand.uid].score:
+            best[cand.uid] = cand
+
+
+def _search_sketchfab(product, queries: list[str], level: str, deadline: float) -> list[Candidate]:
+    """Every relevant, licence-clean Sketchfab model across all queries of one level (deduplicated by uid)."""
     token = os.environ.get("SKETCHFAB_TOKEN")
-    if not token or _blocked("sketchfab"):
-        return None
-    seen: set[str] = set()
-    for query in queries if queries is not None else plan_queries(product, "exact"):
+    best: dict[str, Candidate] = {}
+    if not token:
+        return []
+    for query in queries:
         if time.monotonic() > deadline or _blocked("sketchfab"):
             break
         params = urllib.parse.urlencode({"type": "models", "q": query, "downloadable": "true", "count": 24})
@@ -519,24 +646,17 @@ def _try_sketchfab(product, slug: str, deadline: float, queries: list[str] | Non
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             _http_failure("sketchfab", exc)
             continue
-        for cand in rank_sketchfab(product, data.get("results", []), level)[:CANDIDATES_PER_QUERY]:
-            if cand.uid in seen or time.monotonic() > deadline:
-                continue
-            seen.add(cand.uid)
-            url = _sketchfab_download_url(cand.uid, token)
-            if url and mcp.download_glb(url, slug):
-                cand.extra.update(query=query, match=level)
-                return cand, "Sketchfab"
-    return None
+        _keep_best(best, rank_sketchfab(product, (data or {}).get("results", []), level), query, level)
+    return list(best.values())
 
 
-def _try_polypizza(product, slug: str, deadline: float, queries: list[str] | None = None,
-                   level: str = "exact") -> tuple[Candidate, str] | None:
+def _search_polypizza(product, queries: list[str], level: str, deadline: float) -> list[Candidate]:
+    """Every relevant CC0 / CC-BY Poly Pizza model across all queries of one level (deduplicated by id)."""
     key = os.environ.get("POLY_PIZZA_API_KEY")
-    if not key or _blocked("polypizza"):
-        return None
-    seen: set[str] = set()
-    for query in queries if queries is not None else plan_queries(product, "exact"):
+    best: dict[str, Candidate] = {}
+    if not key:
+        return []
+    for query in queries:
         if time.monotonic() > deadline or _blocked("polypizza"):
             break
         try:
@@ -545,13 +665,34 @@ def _try_polypizza(product, slug: str, deadline: float, queries: list[str] | Non
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             _http_failure("polypizza", exc)
             continue
-        for cand in rank_polypizza(product, (data or {}).get("results", []), level)[:CANDIDATES_PER_QUERY]:
-            if cand.uid in seen or time.monotonic() > deadline:
-                continue
-            seen.add(cand.uid)
-            if mcp.download_glb(cand.download_url, slug):
-                cand.extra.update(query=query, match=level)
-                return cand, "Poly Pizza"
+        _keep_best(best, rank_polypizza(product, (data or {}).get("results", []), level), query, level)
+    return list(best.values())
+
+
+SOURCE_NAMES = {"sketchfab": "Sketchfab", "polypizza": "Poly Pizza"}
+
+
+def _fetch(cand: Candidate, slug: str) -> bool:
+    if cand.provider == "sketchfab":
+        token = os.environ.get("SKETCHFAB_TOKEN", "")
+        url = _sketchfab_download_url(cand.uid, token) if token else None
+        return bool(url and mcp.download_glb(url, slug))
+    return bool(cand.download_url and mcp.download_glb(cand.download_url, slug))
+
+
+def _try_online(product, slug: str, deadline: float, queries: list[str], level: str) -> tuple[Candidate, str] | None:
+    """Pool Sketchfab + Poly Pizza candidates for one search level, rank them by relevance + licence + popularity and
+    download the best one that fits the size budget (up to DOWNLOAD_TRIES attempts)."""
+    pool = _search_sketchfab(product, queries, level, deadline) + _search_polypizza(product, queries, level, deadline)
+    pool.sort(key=lambda c: -c.score)
+    if pool:
+        log.info("CAD %s [%s] top candidates: %s", product.class_id, level,
+                 "; ".join(f"{c.title!r} ({SOURCE_NAMES.get(c.provider, c.provider)}, {c.score:.1f})" for c in pool[:3]))
+    for cand in pool[:DOWNLOAD_TRIES]:
+        if time.monotonic() > deadline:
+            break
+        if _fetch(cand, slug):
+            return cand, SOURCE_NAMES.get(cand.provider, cand.provider)
     return None
 
 
@@ -720,12 +861,10 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
             levels = [lv for lv in entity_resolver.QUERY_LEVELS if lv != "category" or ALLOW_GENERIC]
             for level in levels:
                 queries = [q for q, lv in plan if lv == level]
-                steps = [("sketchfab", _try_sketchfab, (queries, level)), ("polypizza", _try_polypizza, (queries, level))]
+                steps = [("online", _try_online, (queries, level))] if queries else []
                 if level == "exact":
                     steps.append(("github", _try_khronos, ()))
                 for name, provider, extra in steps:
-                    if not queries and extra:
-                        continue
                     try:
                         found = provider(product, slug, deadline, *extra)
                     except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError) as exc:

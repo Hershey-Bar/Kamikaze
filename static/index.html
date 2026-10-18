@@ -12,12 +12,12 @@
   header h1 { margin:0; font-size:17px; letter-spacing:.14em; }
   header h1 small { font-size:11px; color:var(--mute); letter-spacing:.06em; font-weight:500; margin-left:10px; }
   #conn { color:var(--mute); font-size:12px; }
-  .wrap { padding:16px 22px 8px; display:flex; flex-direction:column; gap:16px; }
-  .row1 { display:grid; grid-template-columns:minmax(0,45fr) minmax(0,55fr); gap:16px; }
-  .row2 { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; }
-  .row3 { display:grid; grid-template-columns:minmax(0,45fr) minmax(0,55fr); gap:16px; }
-  @media (max-width:1100px) { .row1, .row3 { grid-template-columns:1fr; } .row2 { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-  @media (max-width:640px) { .row2 { grid-template-columns:1fr; } }
+  .wrap { padding:16px 22px 8px; display:grid; grid-template-columns:minmax(0,50fr) minmax(0,50fr); gap:16px; align-items:start; }
+  .col { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  .col.right { position:sticky; top:12px; }
+  .tele { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+  @media (max-width:1100px) { .wrap { grid-template-columns:1fr; } .col.right { position:static; } }
+  @media (max-width:640px) { .tele { grid-template-columns:1fr; } }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; min-width:0; }
   .panel h2 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.12em; color:var(--mute); display:flex; justify-content:space-between; align-items:center; gap:8px; font-weight:600; }
   .stage { position:relative; width:100%; aspect-ratio:16/9; background:#000; border-radius:10px; overflow:hidden; }
@@ -40,7 +40,7 @@
   .bar { height:6px; background:#060a15; border-radius:3px; overflow:hidden; margin-top:6px; }
   .bar > div { height:100%; width:0; background:var(--green); transition:width .15s; }
   .bar.m > div { background:var(--blue); }
-  model-viewer { width:100%; min-height:560px; height:560px; display:block; background:radial-gradient(circle at 50% 38%, #1a2a52, #070b16 72%); border-radius:10px; --poster-color:transparent; }
+  model-viewer { width:100%; min-height:620px; height:clamp(620px, 72vh, 900px); display:block; background:radial-gradient(circle at 50% 38%, #1a2a52, #070b16 72%); border-radius:10px; --poster-color:transparent; }
   .vstage { position:relative; }
   #badge { position:absolute; left:10px; bottom:10px; right:10px; padding:8px 10px; border-radius:8px; background:rgba(7,11,22,.78); border:1px solid var(--line); font-size:11px; color:var(--mute); overflow-wrap:anywhere; backdrop-filter:blur(4px); }
   #badge:empty { display:none; }
@@ -97,140 +97,141 @@
 </header>
 
 <div class="wrap">
-  <!-- ROW 1: live camera (45%) | 3D CAD stage (55%) -->
-  <div class="row1">
-    <section class="panel">
-      <h2>Live camera · 60% reticle <span class="pill" id="camPill">camera: —</span> <span class="pill" id="viewPill">view: —</span></h2>
-      <div class="stage" id="stage">
-        <canvas id="cam" width="960" height="540"></canvas>
-        <span id="statusPill" class="SEARCHING">SEARCHING</span>
-      </div>
-      <div id="banner" class="SEARCHING"><span id="hudIcon"></span><span id="hudText">Awaiting object inside center reticle...</span></div>
-      <div class="mini">
-        <div class="stat"><b>Top-1 match</b><span id="tLabel">—</span></div>
-        <div class="stat"><b>Confidence</b><span id="tSim">0.0%</span><div class="bar"><div id="confBar"></div></div></div>
-        <div class="stat"><b>Margin Δ (top-1 − top-2)</b><span id="tMargin">0.0%</span><div class="bar m"><div id="marginBar"></div></div></div>
-      </div>
-    </section>
+  <!-- LEFT: live camera -> guided enrollment -> hardware telemetry -->
+  <div class="col left">
+      <section class="panel">
+        <h2>Live camera · 75% reticle <span class="pill" id="camPill">camera: —</span> <span class="pill" id="viewPill">view: —</span></h2>
+        <div class="stage" id="stage">
+          <canvas id="cam" width="960" height="540"></canvas>
+          <span id="statusPill" class="SEARCHING">SEARCHING</span>
+        </div>
+        <div id="banner" class="SEARCHING"><span id="hudIcon"></span><span id="hudText">Awaiting object inside center reticle...</span></div>
+        <div class="mini">
+          <div class="stat"><b>Top-1 match</b><span id="tLabel">—</span></div>
+          <div class="stat"><b>Confidence</b><span id="tSim">0.0%</span><div class="bar"><div id="confBar"></div></div></div>
+          <div class="stat"><b>Margin Δ (top-1 − top-2)</b><span id="tMargin">0.0%</span><div class="bar m"><div id="marginBar"></div></div></div>
+        </div>
+      </section>
 
-    <section class="panel">
-      <h2>Interactive 3D CAD
-        <span class="tools">
-          <button class="ghost on" id="rotBtn" type="button">Auto Rotate</button>
-          <button class="ghost" id="syncBtn" type="button">Sync Live Pose</button>
-          <button class="ghost" id="refetchActiveBtn" type="button">Re-Fetch CAD for Active</button>
-          <span class="pill" id="syncPill">pose: off</span>
-        </span></h2>
-      <div class="vstage">
-        <model-viewer id="viewer" src="/static/models/default.glb" camera-controls auto-rotate shadow-intensity="1.2"
-                      environment-image="neutral" exposure="1.1" camera-orbit="45deg 75deg auto" interaction-prompt="none"
-                      alt="Matched 3D model"></model-viewer>
-        <span id="viewerLabel">Default model</span>
-        <div id="badge"></div>
-      </div>
-    </section>
+      <section class="panel">
+        <h2>Training console · guided 4-angle enrollment</h2>
+        <div class="frow">
+          <input type="text" id="mName" placeholder="Object name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
+          <select id="mCat">
+            <option value="">Category (auto)</option>
+            <option value="smartphone">smartphone</option>
+            <option value="beverage_can">beverage_can</option>
+            <option value="beverage_bottle">beverage_bottle</option>
+          </select>
+        </div>
+        <div class="frow">
+          <input type="text" id="mBrand" placeholder="Brand (optional)" maxlength="40">
+          <input type="text" id="mVariant" placeholder="Variant / model (optional)" maxlength="40">
+        </div>
+        <div class="frow">
+          <button id="startBtn">Start wizard</button>
+          <button id="capBtn" disabled>Capture Front 0° &amp; Next</button>
+          <button id="finishBtn" class="ghost" disabled>Done (save captured views)</button>
+          <button id="cancelBtn" class="ghost" disabled>Cancel</button>
+        </div>
+        <div class="steps" id="steps"></div>
+        <div id="enrollMsg"></div>
+        <div class="frow">
+          <button id="resolveBtn" class="ghost" title="Parse the name into a canonical product and download its 3D model">Resolve &amp; Fetch CAD</button>
+          <button id="saveBtn" class="ghost">Save database</button>
+          <a href="/api/db/export" download="enrolled_classes.pt"><button class="ghost" type="button">Export .pt</button></a>
+        </div>
+        <div id="resolved"></div>
+      </section>
+
+    <div class="tele">
+      <section class="panel card">
+        <h3>Host · Qualcomm Dragonwing QCS8275</h3>
+        <div class="sub" id="socSub">aarch64 · 8 cores · Ubuntu</div>
+        <div class="big" id="tTemp">— <small>°C max junction</small></div>
+        <dl class="kvs">
+          <dt>CPU load</dt><dd id="tCpu">—</dd>
+          <dt>Thermal zones</dt><dd id="tZones">—</dd>
+          <dt>Uptime</dt><dd id="tUp">—</dd>
+        </dl>
+        <div class="freqs" id="freqs"></div>
+      </section>
+
+      <section class="panel card">
+        <h3>Memory · 16 GB LPDDR5</h3>
+        <div class="sub">/proc/meminfo</div>
+        <div class="big" id="tRam">— <small>GB used</small></div>
+        <div class="gauge16"><div id="ramBar"></div></div>
+        <dl class="kvs">
+          <dt>Available</dt><dd id="tAvail">—</dd>
+          <dt>Total (OS-visible)</dt><dd id="tTotalMem">—</dd>
+          <dt>GLB/JS RAM cache</dt><dd id="tCache">—</dd>
+          <dt>Frame ring</dt><dd id="tRing">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel card">
+        <h3>Co-processor · STM32H5F5</h3>
+        <div class="sub">Modulino Pixels (8 LEDs) on Wire1 (I2C4) · Zephyr</div>
+        <div class="big" id="tBus">— <small>ms set_pixels RPC</small></div>
+        <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
+        <dl class="kvs">
+          <dt>Bridge state</dt><dd id="tBridge">—</dd>
+          <dt>RPC p95 / calls</dt><dd id="tRpc">—</dd>
+          <dt>Router socket</dt><dd id="tSock">—</dd>
+          <dt>Pixels</dt><dd id="tLed">—</dd>
+        </dl>
+      </section>
+
+      <section class="panel card">
+        <h3>Edge-AI pipeline</h3>
+        <div class="sub" id="tRuntime">runtime: —</div>
+        <div class="big" id="tFps">— <small>fps inferred</small></div>
+        <dl class="kvs">
+          <dt>NPU (cDSP)</dt><dd id="tNpu">—</dd>
+          <dt>Embed median / p95</dt><dd id="tEmbed">—</dd>
+          <dt>Detect median</dt><dd id="tDetect">—</dd>
+          <dt>Total / frame</dt><dd id="tTotal">—</dd>
+          <dt>Similarity (calibrated)</dt><dd id="tCos">—</dd>
+          <dt>Top-1 vs top-2 margin</dt><dd id="tMarg">—</dd>
+          <dt>Scene gate (lap / edges)</dt><dd id="tGate">—</dd>
+          <dt>Detector domain</dt><dd id="tDomain">—</dd>
+          <dt>Pose (DINOv2)</dt><dd id="tPose">—</dd>
+        </dl>
+      </section>
+    </div>
   </div>
 
-  <!-- ROW 2: hardware + pipeline telemetry -->
-  <div class="row2">
-    <section class="panel card">
-      <h3>Host · Qualcomm Dragonwing QCS8275</h3>
-      <div class="sub" id="socSub">aarch64 · 8 cores · Ubuntu</div>
-      <div class="big" id="tTemp">— <small>°C max junction</small></div>
-      <dl class="kvs">
-        <dt>CPU load</dt><dd id="tCpu">—</dd>
-        <dt>Thermal zones</dt><dd id="tZones">—</dd>
-        <dt>Uptime</dt><dd id="tUp">—</dd>
-      </dl>
-      <div class="freqs" id="freqs"></div>
-    </section>
+  <!-- RIGHT: interactive 3D CAD stage (>= 620 px) + enrolled classes -->
+  <div class="col right">
+      <section class="panel">
+        <h2>Interactive 3D CAD
+          <span class="tools">
+            <button class="ghost on" id="rotBtn" type="button">Auto Rotate</button>
+            <button class="ghost" id="syncBtn" type="button" title="Drive the viewer camera-orbit from the live yaw/pitch estimate">Sync Physical Pose</button>
+            <button class="ghost" id="refetchActiveBtn" type="button">Re-Fetch CAD for Active</button>
+            <span class="pill" id="syncPill">pose: off</span>
+          </span></h2>
+        <div class="vstage">
+          <model-viewer id="viewer" src="/static/models/default.glb" camera-controls auto-rotate shadow-intensity="1.2"
+                        environment-image="neutral" exposure="1.0" tone-mapping="aces" camera-orbit="45deg 75deg auto"
+                        interaction-prompt="none"
+                        alt="Matched 3D model"></model-viewer>
+          <span id="viewerLabel">Default model</span>
+          <div id="badge"></div>
+        </div>
+      </section>
 
-    <section class="panel card">
-      <h3>Memory · 16 GB LPDDR5</h3>
-      <div class="sub">/proc/meminfo</div>
-      <div class="big" id="tRam">— <small>GB used</small></div>
-      <div class="gauge16"><div id="ramBar"></div></div>
-      <dl class="kvs">
-        <dt>Available</dt><dd id="tAvail">—</dd>
-        <dt>Total (OS-visible)</dt><dd id="tTotalMem">—</dd>
-        <dt>GLB/JS RAM cache</dt><dd id="tCache">—</dd>
-        <dt>Frame ring</dt><dd id="tRing">—</dd>
-      </dl>
-    </section>
-
-    <section class="panel card">
-      <h3>Co-processor · STM32H5F5</h3>
-      <div class="sub">Modulino Pixels (8 LEDs) on Wire1 (I2C4) · Zephyr</div>
-      <div class="big" id="tBus">— <small>ms set_pixels RPC</small></div>
-      <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
-      <dl class="kvs">
-        <dt>Bridge state</dt><dd id="tBridge">—</dd>
-        <dt>RPC p95 / calls</dt><dd id="tRpc">—</dd>
-        <dt>Router socket</dt><dd id="tSock">—</dd>
-        <dt>Pixels</dt><dd id="tLed">—</dd>
-      </dl>
-    </section>
-
-    <section class="panel card">
-      <h3>Edge-AI pipeline</h3>
-      <div class="sub" id="tRuntime">runtime: —</div>
-      <div class="big" id="tFps">— <small>fps inferred</small></div>
-      <dl class="kvs">
-        <dt>NPU (cDSP)</dt><dd id="tNpu">—</dd>
-        <dt>Embed median / p95</dt><dd id="tEmbed">—</dd>
-        <dt>Detect median</dt><dd id="tDetect">—</dd>
-        <dt>Total / frame</dt><dd id="tTotal">—</dd>
-        <dt>Similarity (calibrated)</dt><dd id="tCos">—</dd>
-        <dt>Top-1 vs top-2 margin</dt><dd id="tMarg">—</dd>
-        <dt>Scene gate (lap / edges)</dt><dd id="tGate">—</dd>
-        <dt>Detector domain</dt><dd id="tDomain">—</dd>
-      </dl>
-    </section>
-  </div>
-
-  <!-- ROW 3: training console | enrolled classes -->
-  <div class="row3">
-    <section class="panel">
-      <h2>Training console · guided 4-angle enrollment</h2>
-      <div class="frow">
-        <input type="text" id="mName" placeholder="Object name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
-        <select id="mCat">
-          <option value="">Category (auto)</option>
-          <option value="smartphone">smartphone</option>
-          <option value="beverage_can">beverage_can</option>
-          <option value="beverage_bottle">beverage_bottle</option>
-        </select>
-      </div>
-      <div class="frow">
-        <input type="text" id="mBrand" placeholder="Brand (optional)" maxlength="40">
-        <input type="text" id="mVariant" placeholder="Variant / model (optional)" maxlength="40">
-      </div>
-      <div class="frow">
-        <button id="startBtn">Start wizard</button>
-        <button id="capBtn" disabled>Capture Front 0° &amp; Next</button>
-        <button id="finishBtn" class="ghost" disabled>Done (save captured views)</button>
-        <button id="cancelBtn" class="ghost" disabled>Cancel</button>
-      </div>
-      <div class="steps" id="steps"></div>
-      <div id="enrollMsg"></div>
-      <div class="frow">
-        <button id="resolveBtn" class="ghost" title="Parse the name into a canonical product and download its 3D model">Resolve &amp; Fetch CAD</button>
-        <button id="saveBtn" class="ghost">Save database</button>
-        <a href="/api/db/export" download="enrolled_classes.pt"><button class="ghost" type="button">Export .pt</button></a>
-      </div>
-      <div id="resolved"></div>
-    </section>
-
-    <section class="panel">
-      <h2>Enrolled classes <span><span class="pill" id="classCount">0 classes</span> <button id="purgeBtn" class="purge" type="button">PURGE DATABASE</button></span></h2>
-      <table class="classes">
-        <thead><tr><th>Name</th><th>Category</th><th>Views</th><th>CAD</th><th></th><th></th></tr></thead>
-        <tbody id="classRows"></tbody>
-      </table>
-    </section>
+      <section class="panel">
+        <h2>Enrolled classes <span><span class="pill" id="classCount">0 classes</span> <button id="purgeBtn" class="purge" type="button">PURGE DATABASE</button></span></h2>
+        <table class="classes">
+          <thead><tr><th>Name</th><th>Category</th><th>Views</th><th>CAD</th><th></th><th></th></tr></thead>
+          <tbody id="classRows"></tbody>
+        </table>
+      </section>
   </div>
 </div>
-<footer>Training mode. YOLO26n detection (domain gate only) and 1280-d MobileNetV3-Large embeddings run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is calibrated: C = max(0, (cos − floor) / (1 − floor)). No camera image is ever saved: only 1280-d vectors reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/credits</code>.</footer>
+<footer>Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/credits</code>.</footer>
 
 <script>
   (function () {
@@ -267,7 +268,7 @@
   }
 
   function drawOverlay() {
-    const W = ctx.canvas.width, H = ctx.canvas.height, side = (state ? state.crop_fraction : 0.6) * Math.min(W, H);
+    const W = ctx.canvas.width, H = ctx.canvas.height, side = (state ? state.crop_fraction : 0.75) * Math.min(W, H);
     const x = (W - side) / 2, y = (H - side) / 2;
     const color = COLORS[state ? state.state : 'SEARCHING'];
     ctx.save();
@@ -568,6 +569,9 @@
     const sal = inf.saliency;
     $('tGate').textContent = sal ? `${sal.laplacian_var ?? '—'} / ${sal.edge_density != null ? (sal.edge_density * 100).toFixed(2) + ' %' : '—'}${sal.empty ? ' · EMPTY' : ''}` : '—';
     $('tDomain').textContent = inf.domain ? inf.domain.join(', ').replace(/_/g, ' ') : 'all classes';
+    const pm = models.pose;
+    $('tPose').textContent = pm ? `${pm.device === 'npu' ? 'NPU' : (pm.device || 'cpu').toUpperCase()} · ${fmt(pm.median_ms, 1, ' ms')} · ${pm.rate_hz} Hz cap`
+      : 'off (MobileNet view centroids)';
   }
 
   async function pollTelemetry() {  // only used when EventSource is unavailable
@@ -649,7 +653,8 @@
     $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${s.asset_status}` : 'Default model';
     $('refetchActiveBtn').disabled = !name;
     renderCredit(name ? s.asset_attribution : null);
-    $('syncPill').textContent = syncPose ? (pose && pose.valid ? 'pose: syncing' : 'pose: no object') : 'pose: off';
+    const poseTxt = pose && pose.valid ? `yaw ${Math.round(pose.yaw)}° · pitch ${Math.round(pose.pitch)}°${pose.source ? ' · ' + pose.source : ''}` : null;
+    $('syncPill').textContent = syncPose ? (poseTxt ? 'syncing · ' + poseTxt : 'pose: no object') : (poseTxt ? 'pose: off · ' + poseTxt : 'pose: off');
     $('syncPill').className = 'pill' + (syncPose && pose && pose.valid ? ' on' : '');
     applyPose();
   }

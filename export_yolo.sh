@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Export Ultralytics YOLO detectors to TFLite for the Hexagon NPU (QNN TFLite delegate) on the VENTUNO Q.
 #
-#   ./export_yolo.sh                 # yolo26n + yolo11n at 640 px
+#   ./export_yolo.sh                 # YOLO-World (domain vocab) + yolo26n + yolo11n at 640 px
+#   ./export_yolo.sh world           # YOLO-World v2 S with {beverage can, soda can, smartphone, bottle} (receiver default)
 #   ./export_yolo.sh yolo26s         # any Ultralytics detect model (or a custom best.pt path)
 #   IMGSZ=480 ./export_yolo.sh yolo26n
 #
@@ -16,7 +17,7 @@ WORK="${YOLO_EXPORT_DIR:-$HOME/yolo_export}"
 OUT="${KAMIKAZE_NPU_MODELS:-$ROOT/models/npu}"
 IMGSZ="${IMGSZ:-640}"
 MODELS=("$@")
-[ ${#MODELS[@]} -eq 0 ] && MODELS=(yolo26n yolo11n)
+[ ${#MODELS[@]} -eq 0 ] && MODELS=(world yolo26n yolo11n)
 
 mkdir -p "$WORK" "$OUT"
 cd "$WORK"
@@ -33,6 +34,18 @@ venv/bin/python -m pip install -q "ultralytics>=8.4" "tensorflow==2.19.1" "tf_ke
 
 for model in "${MODELS[@]}"; do
   weights="$model"
+  if [ "$model" = "world" ]; then
+    # YOLO-World v2 (open vocabulary): bake the domain classes into the head, then export like any detector.
+    # The text encoder (CLIP) is only needed here, never on the inference path.
+    venv/bin/python -m pip install -q "git+https://github.com/ultralytics/CLIP.git"
+    venv/bin/python - <<'PY'
+from ultralytics import YOLOWorld
+m = YOLOWorld("yolov8s-worldv2.pt")
+m.set_classes(["beverage can", "soda can", "smartphone", "bottle"])
+m.save("yolov8s-worldv2-kz.pt")
+PY
+    weights="yolov8s-worldv2-kz.pt"
+  fi
   [[ "$weights" == *.pt ]] || weights="$model.pt"
   stem="$(basename "${weights%.pt}")"
   echo "== exporting $weights (imgsz $IMGSZ)"

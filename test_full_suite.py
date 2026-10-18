@@ -124,17 +124,120 @@ class PlaintextParsingTests(unittest.TestCase):
     def test_unknown_brand_is_rejected(self):
         with self.assertRaises(taxonomy.MetadataError):
             entity_resolver.resolve("mystery object")
+        with self.assertRaises(taxonomy.MetadataError):
+            entity_resolver.resolve("grapefruit seltzer")  # a flavour alone names no product
+
+    def test_store_brand_flavour_resolution(self):
+        p = entity_resolver.resolve("Kirkland Grapefruit")
+        self.assertEqual((p.class_id, p.brand, p.category, p.flavor), ("kirkland_grapefruit_can", "Kirkland",
+                                                                       "beverage_can", "grapefruit"))
+        plan = cad_harvester.search_plan(p)
+        self.assertEqual(plan[0], ("Kirkland Grapefruit Can", "exact"))
+        self.assertIn(("Kirkland Can", "similar"), plan)
+        self.assertIn(("Grapefruit Seltzer Can", "similar"), plan)
+        self.assertEqual(plan[-1], ("Soda Can", "category"))
+        self.assertFalse(any("coca" in q.lower() or "coke" in q.lower() for q, _ in plan), plan)
+        stored = {"raw_name": "Kirkland Sparkling Water Grapefruit", "category": "beverage_can", "brand": "Kirkland",
+                  "variant": "sparkling water grapefruit", "package_type": "can", "container_volume": ""}
+        s = entity_resolver.resolve_metadata(stored)
+        self.assertEqual((s.class_id, s.drink_type), ("kirkland_sparkling_water_grapefruit_can", "sparkling water"))
+        self.assertEqual(cad_harvester.search_plan(s)[0], ("Kirkland Grapefruit Sparkling Water Can", "exact"))
+        self.assertEqual(entity_resolver.resolve("Pepsi Lime").class_id, "pepsi_lime_can")
+        self.assertEqual(entity_resolver.resolve("Sprite lemon lime can").class_id, "sprite_can")
+        self.assertEqual(entity_resolver.resolve("La Croix lime").brand, "La Croix")
 
 
 class CadRankerTests(unittest.TestCase):
     @staticmethod
-    def model(uid, name, lic="CC Attribution", faces=20000, likes=10, user="Alice", downloadable=True):
+    def model(uid, name, lic="CC Attribution", faces=20000, likes=10, user="Alice", downloadable=True, views=0,
+              staff=False, tags=(), description=""):
         return {"uid": uid, "name": name, "license": {"label": lic, "uid": "x"}, "faceCount": faces, "likeCount": likes,
+                "viewCount": views, "staffpickedAt": "2020-01-01" if staff else None,
+               "tags": [{"name": t, "slug": t} for t in tags], "description": description,
                 "isDownloadable": downloadable, "user": {"displayName": user, "profileUrl": f"https://sketchfab.com/{user}"},
                 "thumbnails": {"images": []}}
 
-    def rank(self, text, *models):
-        return cad_harvester.rank_sketchfab(entity_resolver.resolve(text), list(models))
+    def rank(self, text, *models, level="exact"):
+        return cad_harvester.rank_sketchfab(entity_resolver.resolve(text), list(models), level)
+
+    def test_flavoured_store_brand_never_takes_another_brand_or_flavour(self):
+        live = [  # the real Sketchfab "soda can" results (likes / views as of 2026-10)
+            self.model("orange", "Orange Soda", likes=306, views=15460, staff=True, faces=61878),
+            self.model("cola", "Simple Cola Can", likes=556, views=60626, faces=3290),
+            self.model("coke", "Coca Cola Soda Can", likes=88, views=19251, faces=2406),
+            self.model("soda", "Soda Can", likes=105, views=21151, faces=490),
+            self.model("pack", "Soda Cans 3D pack", likes=223, views=9396, faces=110000),
+            self.model("diet", "Diet Soda", likes=105, views=21151, faces=490),
+        ]
+        out = self.rank("Kirkland Grapefruit", *live, level="category")
+        self.assertEqual(out[0].uid, "soda", [(c.uid, round(c.score, 1)) for c in out])
+        self.assertNotIn("coke", [c.uid for c in out])
+        self.assertNotIn("cola", [c.uid for c in out])  # a cola livery is a different drink, not a sparkling water
+        self.assertNotIn("pack", [c.uid for c in out])
+        self.assertEqual(out[0].extra["likes"], 105)
+        # the same pool for Coke Zero: the same-brand can ranks as "similar"; cola is its own drink type so the popular
+        # cola can beats the (staff-picked) orange soda
+        coke = [c.uid for c in self.rank("coke zero can", *live, level="category")]
+        self.assertEqual(coke[:2], ["coke", "cola"])
+        self.assertLess(coke.index("cola"), coke.index("orange"))
+        exact = self.rank("Kirkland Grapefruit", self.model("a", "Kirkland Lime Sparkling Water Can"),
+                          self.model("b", "Kirkland Grapefruit Sparkling Water Can"))
+        self.assertEqual([c.uid for c in exact], ["b"])
+        similar = self.rank("Kirkland Grapefruit", self.model("a", "Kirkland Lime Sparkling Water Can"),
+                            self.model("g", "Grapefruit Seltzer Can"), self.model("c", "Grapefruit Cola Can"), level="similar")
+        self.assertEqual(sorted(c.uid for c in similar), ["a", "g"])
+
+    def test_brand_hidden_in_tags_or_description_is_rejected(self):
+        live = [  # real Sketchfab "soda can" results whose generic titles hide a branded texture
+            self.model("junhyde", "Soda Can", likes=105, views=21151, faces=490, description="A simple old Pepsi Soda can"),
+            self.model("aisaac", "Soda Can", likes=80, views=9000, faces=1200, tags=("pepsi", "mtdew", "dew", "can")),
+            self.model("youssef", "Soda can", likes=45, views=3000, faces=2000,
+                       tags=("can", "soda", "sodacan", "softdrink", "crushed")),
+            self.model("sunich", "Soda Can", likes=57, views=4000, faces=1500, tags=("orange", "lemon", "can")),
+            self.model("sweetwood", "Soda Can (High Poly)", likes=221, views=30000, faces=2894,
+                       tags=("high", "pop", "can", "cola", "soda")),
+            self.model("plain", "Soda Can", likes=30, views=2000, faces=1000, tags=("can", "aluminium", "drink")),
+        ]
+        out = [c.uid for c in self.rank("Kirkland Grapefruit", *live, level="category")]
+        for bad in ("junhyde", "aisaac", "youssef", "sweetwood"):
+            self.assertNotIn(bad, out)
+        self.assertEqual(out, ["plain", "sunich"])
+        # the product's own brand in the metadata is fine, and a title naming the brand is trusted over its description
+        pepsi = [c.uid for c in self.rank("pepsi can", *live, level="category")]
+        self.assertIn("junhyde", pepsi)
+        self.assertIn("sweetwood", [c.uid for c in self.rank("coke zero can", *live, level="category")])
+        own = self.rank("pepsi can", self.model("p", "Pepsi Can", description="Pepsi vs Coca-Cola comparison"))
+        self.assertEqual([c.uid for c in own], ["p"])
+        phone = self.rank("iphone 15 pro", self.model("x", "Smartphone", tags=("samsung", "galaxy")),
+                          self.model("y", "Smartphone", tags=("iphone", "apple")), level="category")
+        self.assertNotIn("x", [c.uid for c in phone])
+        poly = cad_harvester.rank_polypizza(entity_resolver.resolve("Kirkland Grapefruit"), [
+            {"ID": "p1", "Title": "Soda Can", "Licence": "CC0", "Download": "https://x/p1.glb", "Tags": ["pepsi"]},
+            {"ID": "p2", "Title": "Soda Can", "Licence": "CC0", "Download": "https://x/p2.glb", "Tags": ["can"]},
+        ], level="category")
+        self.assertEqual([c.uid for c in poly], ["p2"])
+
+    def test_popularity_is_log_scaled_and_capped(self):
+        pop = cad_harvester.popularity
+        self.assertLess(pop(10, 1000), pop(100, 1000))
+        self.assertLess(pop(100, 1000) - pop(10, 1000), 6.0)
+        self.assertGreater(pop(10, 1000, True), pop(10, 1000))
+        self.assertEqual(pop(10 ** 9, 10 ** 12, True), cad_harvester.POPULARITY_CAP)
+        out = self.rank("pepsi can", self.model("a", "Pepsi can", likes=2, views=50),
+                        self.model("b", "Pepsi can", likes=400, views=40000))
+        self.assertEqual([c.uid for c in out], ["b", "a"])
+
+    def test_level_pool_downloads_best_ranked_across_providers(self):
+        prod = entity_resolver.resolve("pepsi can")
+        sf = [cad_harvester.Candidate("sketchfab", "Pepsi can", 70.0, uid="s1"),
+              cad_harvester.Candidate("sketchfab", "Pepsi can", 40.0, uid="s2")]
+        pp = [cad_harvester.Candidate("polypizza", "Pepsi Can", 55.0, uid="p1", download_url="https://x/p1.glb")]
+        tried = []
+        with mock.patch.object(cad_harvester, "_search_sketchfab", return_value=sf), \
+                mock.patch.object(cad_harvester, "_search_polypizza", return_value=pp), \
+                mock.patch.object(cad_harvester, "_fetch", side_effect=lambda c, slug: tried.append(c.uid) or c.uid == "p1"):
+            cand, source = cad_harvester._try_online(prod, "x", time.monotonic() + 30, ["Pepsi Can"], "exact")
+        self.assertEqual((cand.uid, source, tried), ("p1", "Poly Pizza", ["s1", "p1"]))
 
     def test_ultra_vs_non_ultra_and_other_generation(self):
         out = self.rank("Samsung Galaxy S24 Ultra",
@@ -170,6 +273,21 @@ class CadRankerTests(unittest.TestCase):
         out = self.rank("pepsi can", self.model("a", "Pepsi can", lic="CC Attribution", likes=1),
                         self.model("b", "Pepsi can", lic="CC0 Public Domain", likes=1))
         self.assertEqual(out[0].uid, "b")
+
+    def test_neutral_placeholder_replaces_red_box(self):
+        import json as _json
+        import struct as _struct
+        import procedural_glb
+        glb = procedural_glb.build_placeholder()
+        self.assertEqual(glb[:4], b"glTF")
+        n = _struct.unpack("<I", glb[12:16])[0]
+        doc = _json.loads(glb[20:20 + n])
+        self.assertEqual(doc["asset"]["extras"]["kind"], procedural_glb.PLACEHOLDER_TAG)
+        for mat in doc["materials"]:
+            r, g, b, _ = mat["pbrMetallicRoughness"]["baseColorFactor"]
+            self.assertLess(max(r, g, b) - min(r, g, b), 0.1, mat)  # grey/silver, never a saturated red box
+        base = doc["materials"][0]["pbrMetallicRoughness"]
+        self.assertEqual((base["metallicFactor"], base["roughnessFactor"]), (0.8, 0.35))
 
 
 class CadCacheTests(unittest.TestCase):
@@ -416,8 +534,7 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         cid = "iphone_13"
         had = cad_harvester.glb_path(cid).exists()
         try:
-            with mock.patch.object(cad_harvester, "_try_sketchfab", return_value=None), \
-                    mock.patch.object(cad_harvester, "_try_polypizza", return_value=None), \
+            with mock.patch.object(cad_harvester, "_try_online", return_value=None), \
                     mock.patch.object(cad_harvester, "_try_khronos", return_value=None):
                 status, out = self.call("POST", "/api/cad/fetch", {"label": cid})
             self.assertEqual(status, 200, out)
@@ -841,10 +958,24 @@ class NpuMathTests(unittest.TestCase):
     def test_default_detector_is_yolo(self):
         self.assertTrue(self.npu.DETECTOR_VARIANT.startswith("yolo") or "KAMIKAZE_DETECTOR" in os.environ)
         self.assertEqual(self.npu.detector_model_path("yolo26n").name, "yolo26n_float32.tflite")
+        self.assertEqual(self.npu.detector_model_path(self.npu.WORLD_VARIANT).name, "yolov8s-worldv2-kz_float32.tflite")
         self.assertEqual(self.npu.detector_model_path("my_cans").name, "my_cans_float32.tflite")
         self.assertEqual(self.npu.detector_model_path("lite2").name, "efficientdet_lite2_int8.tflite")
         with self.assertRaises(FileNotFoundError):
             self.npu.ensure_model(self.npu.yolo_spec("definitely_missing"), Path(tempfile.mkdtemp(prefix="kz_y_")))
+
+    def test_detection_labels_use_domain_vocabulary(self):
+        D, w, h = self.npu.Detection, 1920, 1080
+        self.assertEqual(D("cup", 0.9, (0.4, 0.3, 0.5, 0.6)).to_dict(w, h)["label"], "beverage can")
+        self.assertEqual(D("cup", 0.9, (0.4, 0.3, 0.5, 0.6)).to_dict(w, h)["raw_label"], "cup")
+        self.assertEqual(D("soda can", 0.9, (0.4, 0.3, 0.5, 0.6)).to_dict(w, h)["label"], "beverage can")
+        self.assertEqual(D("cell phone", 0.9, (0.4, 0.3, 0.5, 0.6)).to_dict(w, h)["label"], "smartphone")
+        # bottle box 100 px wide: 200 px tall (H/W 2.0) is can-shaped, 400 px tall (H/W 4.0) stays a bottle
+        self.assertEqual(D("bottle", 0.9, (0.5, 0.3, 0.5 + 100 / w, 0.3 + 200 / h)).to_dict(w, h)["label"], "beverage can")
+        self.assertEqual(D("bottle", 0.9, (0.5, 0.3, 0.5 + 100 / w, 0.3 + 400 / h)).to_dict(w, h)["label"], "bottle")
+        self.assertEqual(D("bottle", 0.9, (0.5, 0.3, 0.6, 0.5)).to_dict()["label"], "bottle")  # no frame size: no remap
+        for raw in ("cup", "bottle", "cell phone"):
+            self.assertNotEqual(device_taxonomy.domain_for(D(raw, 0.9, (0.4, 0.3, 0.5, 0.6)).to_dict(w, h)), None)
 
     def _yolo_head(self, rows, n=8400, nc=80, layout="channels_first"):
         import numpy as np
@@ -1029,7 +1160,7 @@ class HexagonNpuLiveTests(unittest.TestCase):
         bus = glob.glob(str(Path(spec.origin).parent / "assets" / "bus.jpg"))
         if not bus:
             self.skipTest("ultralytics sample image missing")
-        det = self.npu.YoloDetector(all_classes=True)
+        det = self.npu.YoloDetector(self.npu.FALLBACK_DETECTOR, all_classes=True)  # COCO-80 model (person, bus)
         self.assertEqual(det.device, "npu", det.info())
         img = Image.open(bus[0]).convert("RGB")
         found = det.detect(img)
@@ -1040,6 +1171,34 @@ class HexagonNpuLiveTests(unittest.TestCase):
             self.assertTrue(0.0 <= d.box[0] < d.box[2] <= 1.0 and 0.0 <= d.box[1] < d.box[3] <= 1.0, d)
         best_bus = max((d for d in found if d.label == "bus"), key=lambda d: d.score)
         self.assertGreater(best_bus.box[2] - best_bus.box[0], 0.7)  # the bus spans most of the 810x1080 frame width
+
+    def test_yolo_world_vocabulary_on_npu(self):
+        path = self.npu.detector_model_path(self.npu.WORLD_VARIANT)
+        if not self.npu._valid_tflite(path):
+            self.skipTest("YOLO-World export missing (./export_yolo.sh world)")
+        det = self.npu.YoloDetector(self.npu.WORLD_VARIANT)
+        self.assertEqual(det.device, "npu", det.info())
+        self.assertEqual(tuple(det.names), self.npu.WORLD_CLASSES)
+        self.assertEqual(sorted(det.info()["classes"]), sorted(self.npu.WORLD_CLASSES))
+
+    def test_dinov2_pose_embedder_on_npu(self):
+        import time
+        np = self.np
+        if not self.npu._valid_tflite(self.npu.MODELS_DIR / self.npu.DINO_SPEC.file):
+            self.skipTest("DINOv2 export missing (export_dinov2.py)")
+        dino = self.npu.DinoPoseEmbedder()
+        self.assertEqual(dino.device, "npu")
+        x = np.random.default_rng(2).random((1, 224, 224, 3), dtype=np.float32)
+        v = dino.embed_rgb01(x)
+        self.assertEqual(v.shape, (768,))
+        self.assertAlmostEqual(float(np.linalg.norm(v)), 1.0, places=3)
+        self.assertGreater(float(v @ dino.embed_rgb01(x)), 0.999)
+        t0 = time.perf_counter()
+        for _ in range(10):
+            dino.embed_rgb01(x)
+        ms = (time.perf_counter() - t0) * 100
+        print(f"\n  NPU DINOv2 pose: {ms:.2f} ms/frame")
+        self.assertLess(ms, 60.0)
 
 
 class DeviceTaxonomyTests(unittest.TestCase):

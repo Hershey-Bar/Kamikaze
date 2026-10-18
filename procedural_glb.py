@@ -17,6 +17,8 @@ BRAND_COLORS = {
     "red bull": ((0.15, 0.20, 0.45), (0.85, 0.75, 0.10)),
 }
 SILVER = (0.78, 0.79, 0.82)
+NEUTRAL = (0.62, 0.64, 0.68)  # grey-silver PBR baseline (metallic 0.8 / roughness 0.35) for unbranded models
+PLACEHOLDER_TAG = "kamikaze-placeholder-v3"
 
 
 class _Mesh:
@@ -81,7 +83,7 @@ class _Mesh:
                 idx += tri if ny > 0 else [tri[0], tri[2], tri[1]]
         self.add(pos, nrm, idx, color, metallic, rough)
 
-    def to_glb(self) -> bytes:
+    def to_glb(self, extras: dict | None = None) -> bytes:
         bin_data = bytearray()
         views, accessors, meshes_prims, materials = [], [], [], []
         for prim in self.prims:
@@ -114,7 +116,7 @@ class _Mesh:
             meshes_prims.append({"attributes": {"POSITION": entries[0], "NORMAL": entries[1]}, "indices": entries[2],
                                  "material": len(materials) - 1})
         doc = {
-            "asset": {"version": "2.0", "generator": "kamikaze-procedural"},
+            "asset": {"version": "2.0", "generator": "kamikaze-procedural", **({"extras": extras} if extras else {})},
             "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
             "meshes": [{"primitives": meshes_prims}], "materials": materials,
             "accessors": accessors, "bufferViews": views, "buffers": [{"byteLength": len(bin_data)}],
@@ -128,7 +130,25 @@ class _Mesh:
 
 
 def _brand_colors(brand: str) -> tuple:
-    return BRAND_COLORS.get((brand or "").lower(), ((0.55, 0.55, 0.60), (0.9, 0.9, 0.9)))
+    return BRAND_COLORS.get((brand or "").lower(), (NEUTRAL, (0.86, 0.87, 0.89)))
+
+
+def build_placeholder() -> bytes:
+    """Neutral brushed-metal turntable with an unbranded aluminium can, shown before anything is identified.
+
+    A bare 12 mm disc framed side-on by model-viewer reads as an empty stage, so the stand carries a label-less can
+    (never an untextured red box).
+    """
+    m = _Mesh()
+    m.cylinder((0, 0.006, 0), 0.075, 0.012, NEUTRAL, metallic=0.8, rough=0.35, segs=96)
+    m.cylinder((0, 0.0125, 0), 0.068, 0.001, (0.18, 0.19, 0.21), metallic=0.3, rough=0.6, segs=96)
+    m.cylinder((0, 0.0135, 0), 0.060, 0.001, SILVER, metallic=0.9, rough=0.25, segs=96)
+    y0 = 0.014
+    m.cylinder((0, y0 + 0.0575, 0), 0.033, 0.115, NEUTRAL, metallic=0.8, rough=0.35)
+    m.cylinder((0, y0 + 0.1165, 0), 0.0285, 0.003, SILVER, metallic=0.95, rough=0.25, r_top=0.026)
+    m.cylinder((0, y0 + 0.1185, 0), 0.025, 0.001, SILVER, metallic=0.95, rough=0.3)
+    m.box((0, y0 + 0.1203, 0.004), (0.014, 0.0012, 0.008), (0.55, 0.56, 0.6), metallic=0.95, rough=0.35)
+    return m.to_glb({"kind": PLACEHOLDER_TAG})
 
 
 def build_can(brand: str = "", variant: str = "original", bottle: bool = False) -> bytes:
@@ -142,7 +162,8 @@ def build_can(brand: str = "", variant: str = "original", bottle: bool = False) 
         m.cylinder((0, 0.19, 0), 0.016, 0.04, (0.85, 0.92, 0.96), metallic=0.0, rough=0.08, r_top=0.013)
         m.cylinder((0, 0.218, 0), 0.0155, 0.018, accent, metallic=0.1, rough=0.45)
         return m.to_glb()
-    m.cylinder((0, 0.0575, 0), 0.033, 0.115, body, metallic=0.7, rough=0.32)
+    m.cylinder((0, 0.0575, 0), 0.033, 0.115, body, metallic=0.8 if body == NEUTRAL else 0.7,
+               rough=0.35 if body == NEUTRAL else 0.32)
     m.cylinder((0, 0.0575, 0), 0.0333, 0.028, accent, metallic=0.3, rough=0.45)
     m.cylinder((0, 0.1165, 0), 0.0285, 0.003, SILVER, metallic=0.95, rough=0.25, r_top=0.026)
     m.cylinder((0, 0.1185, 0), 0.025, 0.001, SILVER, metallic=0.95, rough=0.3)

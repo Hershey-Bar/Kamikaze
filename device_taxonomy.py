@@ -67,7 +67,7 @@ PHONE_VIEW_WEIGHTS = {"back": 0.65, "side": 0.15, "top": 0.10, "front": 0.10}
 VIEW_RELIABILITY_KAPPA = 0.25
 
 FRONT_CONFIDENCE_CAP = 0.35
-MSG_FRONT_SCREEN = "Front screen detected. Flip phone 180° to expose camera island and sensors."
+MSG_FRONT_SCREEN = "Front screen detected. Flip phone 180° to expose camera island."
 MSG_VERIFY_GEOMETRY = "Verifying object geometry... Hold steady in center."
 MSG_SHOW_BACK = "Show the rear shell and camera island squarely to the camera."
 MSG_IPHONE_LAYOUT = "Hold the camera island flat to the camera: lens layout (stacked pill vs diagonal) separates these iPhones."
