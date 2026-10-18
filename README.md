@@ -24,12 +24,48 @@ pose sync.
 
 **Features:**
 - Guided 4-angle enrollment and a model library with delete.
-- Smart kiosk scan with citrus disambiguation.
+- Zero-touch, five-second Smart Kiosk scan, including products without enrolled prototypes.
 - Offline CAD cache with real 1:1 dummies (e.g. Galaxy S24 Ultra, Printables #733692).
 - Label stitching.
 - MCP tools for CAD and packaging lookup.
 - Hardware telemetry.
-- 317 automated tests.
+- Automated tests for recognition, scan lifecycle, privacy, provenance, camera selection and MCP tools.
+
+### Zero-touch Smart Kiosk
+
+The default `KAMIKAZE_VIEW=smart` requires no enrollment, category selection or text input. A supported YOLO detection
+at confidence 0.65 starts a five-second amber scan. `smart_identity.py` collects scan-local OCR, volume markings,
+HSV/CIELAB colour evidence and up to three sharp crops (320 px maximum, RAM only). It resolves beverage identity from
+brand plus flavour evidence, or phone identity from an explicit model name or a sufficiently separated, corroborated
+camera-island/DINOv2 match. Existing enrolled prototypes still work. Nothing is automatically added to the enrollment bank.
+
+Asset retrieval starts during the scan, and the browser preloads a resolved model. Owned hand scans and the 38-device
+offline cache are checked before online repositories. A previously cached estimate is replaced when a matching hand
+scan or downloaded CAD dummy becomes available; it is never merely relabelled as verified. If online resolution finds
+nothing, autonomous mode may generate geometry **only from published dimensions**, retaining the ESTIMATED badge.
+The HUD distinguishes scanning, resolving, ready and model unavailable. Green means the identity is locked **and** an
+asset is ready; amber remains on while retrieving or guiding. Idle LEDs breathe cyan.
+
+Citrus fusion is 60% colour / 40% OCR with conflicting flavour tokens suppressed. Hue bands are in **OpenCV's 0-180
+scale**, not physical degrees. Can volumes use the existing cited Crown table, not a shared assumed size for 250 and
+330 ml. A volume alone does not prove the package profile; inferred profiles remain labelled as assumptions.
+
+Auto-Orient and Snap to Live Pose use the existing SSE stream (`/api/scan_stream`). Enrolled cardinal views supply
+DINOv2/MobileNet pose; new objects use relative surface-flow yaw plus geometric pitch/roll, explicitly reported as
+`surface-flow-relative` (zero is the first observed view). Circular angle smoothing avoids the -180/180 discontinuity.
+The native model-viewer orientation order is roll/pitch/yaw, so it is not assigned the prompt's pitch/yaw/roll order.
+
+**Limits:** a blank unbranded can cannot reveal its brand, and visually identical phone generations may remain
+inconclusive rather than produce a false exact match. Arbitrary objects outside phones/cans/bottles are not supported.
+The sub-50 ms target concerns **warm local asset lookup**, not internet retrieval or browser decoding of a large GLB.
+The cache contains both attributed downloads and explicitly estimated models; Fold devices include published folded
+and unfolded dimensions, but a closed-state GLB is not a verified unfolded mesh.
+
+```bash
+# Existing tests live at the repository root, not in a tests/ directory.
+.venv/bin/python -m unittest discover -s . -p 'test_*.py'
+./run_receiver.sh --camera auto
+```
 
 Real-time edge AI: a webcam feed is classified on the **Arduino VENTUNO Q** (Qualcomm Dragonwing QCS8275, Hexagon NPU), the
 matching 3D model is fetched and shown in a pose-synchronised `<model-viewer>`, and the **Modulino Pixels** on the STM32H5F5
@@ -294,7 +330,7 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
      circular-mean HSV hue band (OpenCV units, 0-180: lime 36-82, lemon 22-35 with S > ~100, grapefruit 160-180 and
      0-11, orange 12-21 with high S) confirmed by CIELAB (lime a* <= -12, lemon b* > 30, grapefruit a* 10-60, orange
      a* > 10 and b* > 40); the hue band is necessary, LAB only confirms. The flavour decision is
-     `P = 0.55 S_color + 0.45 S_OCR` (OCR: 1.0 for the latest pass, 0.6 for the rolling buffer). When the colour is
+     `P = 0.60 S_color + 0.40 S_OCR` (OCR: 1.0 for the latest pass, 0.6 for the rolling buffer). When the colour is
      strong (>= 0.6) and a flavour read by OCR scores <= 0.15 in colour, that word is a **conflict** and is suppressed
      both in the fusion and in the OCR tokens fed to the lexicon route (OCR *lemon* on a green can -> *lime*, OCR
      *lime* on a pink can -> *grapefruit*). In `_arbitrate`, when the top-1 class is citrus and the decision names a

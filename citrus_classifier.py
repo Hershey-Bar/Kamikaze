@@ -14,7 +14,7 @@ confuses "lime" / "lemon" often enough that text alone cannot decide. This modul
        grapefruit  hue 160-180 or 0-11       a* 10-45 (coral pink / ruby / pastel orange)
        orange      hue 12-21, high S         a* > 10, b* > 40
    S_color(f) = sum over clusters of share x (0.7 band x saturation gate + 0.3 LAB), in [0, 1].
-3. Fusion: P(f) = 0.55 S_color(f) + 0.45 S_OCR(f), S_OCR = 1.0 when the flavour word was read on the latest OCR pass,
+3. Fusion: P(f) = 0.60 S_color(f) + 0.40 S_OCR(f), S_OCR = 1.0 when the flavour word was read on the latest OCR pass,
    0.6 when only in the rolling buffer. When the colour verdict is decisive and the OCR flavour's S_color <= 0.15
    (OCR read "lemon" on a strictly green can) the OCR flavour is a conflict: it is suppressed and colour decides.
 
@@ -36,7 +36,7 @@ WORDS = {
     "grapefruit": {"grapefruit", "grapefruits", "pamplemousse"},
     "orange": {"orange", "oranges", "mandarin", "mandarine", "tangerine", "clementine"},
 }
-W_COLOR, W_OCR = 0.55, 0.45
+W_COLOR, W_OCR = 0.60, 0.40
 S_OCR_RECENT, S_OCR_ROLLING = 1.0, 0.6
 
 SIDE = int(os.environ.get("KAMIKAZE_CITRUS_SIDE", "96"))  # crop is downsampled to this longer side
@@ -216,7 +216,7 @@ def conflicts(evidence: dict | None) -> set[str]:
 
 
 def fuse(evidence: dict | None, ocr: dict[str, float] | None) -> dict:
-    """P(f) = 0.55 S_color + 0.45 S_OCR with conflicting OCR flavours suppressed.
+    """P(f) = 0.60 S_color + 0.40 S_OCR with conflicting OCR flavours suppressed.
     Returns {"flavor", "p", "color", "ocr", "suppressed", "conflict"}; flavor is None without enough evidence."""
     color = dict((evidence or {}).get("scores") or {f: 0.0 for f in FLAVORS})
     ocr = dict(ocr or {f: 0.0 for f in FLAVORS})

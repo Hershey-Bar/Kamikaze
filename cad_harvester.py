@@ -108,7 +108,9 @@ def provenance(attr: dict | None) -> dict:
     """{"type": verified|cad|packaging|scan|online|estimated|"", "text": badge} for an attribution record."""
     attr = attr or {}
     key = str(attr.get("source_key") or "")
-    if key not in PROVENANCE and attr.get("match") == "library":
+    if attr.get("match") == "library" and attr.get("library_id"):
+        key = "library"
+    elif key not in PROVENANCE and attr.get("match") == "library":
         key = "library"
     kind, text = PROVENANCE.get(key, ("", ""))
     if kind == "cad" and attr.get("author"):
@@ -1129,6 +1131,15 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
         attr = read_attribution(product.class_id)
         if mcp.is_valid_glb(dest):
             if attr:
+                if attr.get("source_key") == "spec_generated" and source in ("auto", "local"):
+                    lib = _library_match(product)
+                    if lib is not None:
+                        attr = model_library.install(lib["id"], product.class_id)
+                    else:
+                        dev_id = device_cache.match_product(product)
+                        rec = device_cache.cached(dev_id) if dev_id else None
+                        if rec and rec.get("source_key") != "spec_generated":
+                            attr = _device_cache_match(product) or attr
                 return _result(product, attr, "cached", "local-cache", True)
             try:
                 dest.unlink()  # a GLB without attribution cannot be shown - re-harvest it

@@ -974,11 +974,11 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     renderClasses(s.bank, s.confirmed_label);
     renderSteps(s.multiview);
 
-    const name = s.confirmed_label || s.viewer_label;
+    const name = s.view === 'smart' ? s.viewer_label : (s.confirmed_label || s.viewer_label);
     const glb = name && s.glb_url ? s.glb_url : '';
     const src = glb ? new URL(glb, location.href).href : '';
     if (!preview) {
-      if (src !== lastSrc) { lastSrc = src; if (glb) viewer.setAttribute('src', glb); else viewer.removeAttribute('src'); }
+      if (src !== lastSrc) { lastSrc = src; ori.yaw = null; if (glb) viewer.setAttribute('src', glb); else viewer.removeAttribute('src'); }
       $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${String(s.asset_status || '').replace('_', ' ')}` : 'No model';
       renderCredit(glb ? s.asset_attribution : null);
     }
@@ -1086,18 +1086,31 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
     if ((v === 'smart') !== kiosk) applyView(v);
   }
 
+  let prefetchedModel = '';
   function renderSmart(sm) {
     if (!sm) return;
     const bar = $('smartBar');
     bar.className = 'smart kz ' + sm.status;
-    const pct = sm.status === 'locked' ? 100 : Math.round(100 * (sm.progress || 0));
+    const pct = ['locked', 'resolving', 'not_found'].includes(sm.status) ? 100 : Math.round(100 * (sm.progress || 0));
     $('smMeter').style.width = pct + '%';
     const name = sm.display_name || (sm.label || '').replace(/_/g, ' ');
     $('smTitle').textContent = sm.status === 'scanning' ? `SMART SCAN · ${(sm.elapsed || 0).toFixed(1)} / ${sm.window_s || 5} s`
-      : sm.status === 'locked' ? `LOCKED · ${name}` : sm.status === 'inconclusive' ? 'SCAN INCONCLUSIVE' : 'SMART SCAN · READY';
+      : sm.status === 'locked' ? `LOCKED · ${name}` : sm.status === 'resolving' ? `RESOLVING MODEL · ${name}`
+      : sm.status === 'not_found' ? `MODEL UNAVAILABLE · ${name}`
+      : sm.status === 'inconclusive' ? 'SCAN INCONCLUSIVE' : 'SMART SCAN · READY';
     $('smPill').textContent = sm.status === 'idle' ? 'idle' : `${pct}% · ${sm.frames || 0} frames${sm.confidence ? ' · ' + Math.round(sm.confidence * 100) + '%' : ''}`;
     const auto = sm.auto_label_scan;
     $('smMsg').textContent = (sm.message || '') + (auto ? ` · Auto label scan ${Math.round(100 * (auto.coverage || 0))}% — keep rotating the can slowly.` : '');
+    if (sm.prefetch_url && sm.prefetch_url !== prefetchedModel) {
+      prefetchedModel = sm.prefetch_url;
+      let preload = document.getElementById('scanPreload');
+      if (!preload) {
+        preload = document.createElement('link'); preload.id = 'scanPreload';
+        preload.rel = 'preload'; preload.as = 'fetch'; preload.crossOrigin = 'anonymous';
+        document.head.appendChild(preload);
+      }
+      preload.href = sm.prefetch_url;
+    }
     const chips = $('smChips');
     chips.replaceChildren();
     (sm.votes || []).forEach((v) => {
@@ -1127,7 +1140,7 @@ button.trash { background:transparent; border:1px solid var(--red); color:var(--
   function renderKiosk(s, name, glb) {
     if (!kiosk) return;
     const sm = s.smart_scan || {};
-    const label = sm.status === 'locked' ? (sm.display_name || sm.label) : name ? (s.asset_title || name) : '';
+    const label = ['locked', 'resolving', 'not_found'].includes(sm.status) ? (sm.display_name || sm.label) : name ? (s.asset_title || name) : '';
     $('kName').textContent = label ? String(label).replace(/_/g, ' ') : sm.status === 'scanning' ? 'Scanning…' : 'Show an object to the camera';
     const prov = s.asset_provenance || {};
     $('kBadge').textContent = glb ? (prov.text || '') : name ? String(s.asset_status || '').replace('_', ' ') : '';

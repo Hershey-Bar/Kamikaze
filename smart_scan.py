@@ -21,7 +21,7 @@ import time
 from typing import Callable, Iterable
 
 WINDOW_S = float(os.environ.get("KAMIKAZE_SMART_WINDOW", "5.0"))
-DETECT_MIN = float(os.environ.get("KAMIKAZE_SMART_DETECT", "0.70"))
+DETECT_MIN = float(os.environ.get("KAMIKAZE_SMART_DETECT", "0.65"))
 LOCK_CONF = float(os.environ.get("KAMIKAZE_SMART_LOCK", "0.50"))
 MIN_SHARE = float(os.environ.get("KAMIKAZE_SMART_SHARE", "0.60"))
 LOST_S = float(os.environ.get("KAMIKAZE_SMART_LOST", "1.0"))
@@ -140,7 +140,7 @@ class SmartScan:
         status = LOCKED if ok else INCONCLUSIVE
         msg = (f"Locked: {lab} ({conf:.0%} mean confidence, {share:.0%} of votes)" if ok else
                "Scan inconclusive - hold the object steady and show its branding / camera island" if lab else
-               "Scan inconclusive - no enrolled object matched")
+               "Scan inconclusive - show the brand / model name and rotate for more evidence")
         self._reset(status, msg)
         self.votes.update(votes)
         self.counts.update(counts)

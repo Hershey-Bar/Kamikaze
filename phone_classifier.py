@@ -18,6 +18,7 @@ overrides an enrolled-class identification; it reports agreement / conflict).
 from __future__ import annotations
 
 import math
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ import cv2
 import numpy as np
 
 import device_cache
+
+log = logging.getLogger("kamikaze.phone_classifier")
 
 ROOT = Path(__file__).resolve().parent
 EMB_PATH = ROOT / "models" / "phone_embeddings.npz"
@@ -282,12 +285,14 @@ class PhoneClassifier:
         """Structural evidence from an upright phone crop (RGB). view "front" -> cut-out, otherwise rear cues."""
         out: dict = {"aspect": round(box_aspect, 3) if box_aspect else None}
         h, w = phone_rgb.shape[:2]
-        if view == "front":
-            out["front"] = front_cutout(phone_rgb)
+        cutout = front_cutout(phone_rgb) if view in (None, "front") else "unknown"
+        if view == "front" or cutout != "unknown":
+            out["front"] = cutout
             return out
         isl = island_crop(phone_rgb)
         lenses = find_lenses(isl, w)
         out["lenses"] = len(lenses)
+        out["lens_centres"] = [[round(x / w, 3), round(y / h, 3)] for x, y, _ in lenses]
         out["layout"] = lens_layout(lenses, w)
         hp = housing_present(isl, lenses)
         out["housing"] = None if hp is None else round(hp, 3)
@@ -336,10 +341,10 @@ class PhoneClassifier:
     def classify(self, phone_rgb: np.ndarray, view: str | None = None, box_aspect: float | None = None,
                  top: int = 5) -> dict:
         cues = self.cues(phone_rgb, view, box_aspect)
-        dino = self.dino_scores(phone_rgb) if view != "front" else {}
+        dino = self.dino_scores(phone_rgb) if "front" not in cues else {}
         ranked = self.score(cues, dino)
         best = ranked[0] if ranked else None
-        return {"cues": cues, "dino": bool(dino), "top": ranked[:top],
+        return {"cues": cues, "dino": bool(dino), "raw_dino": dino, "top": ranked[:top],
                 "family": family_of(best["id"], self.entries) if best else None}
 
 
@@ -383,10 +388,17 @@ class ScanAccumulator:
         self.frames = 0
         self.cues: dict[str, dict[str, int]] = {}
         self.dino = False
+        self.raw_totals: dict[str, float] = {}
+        self.rear_frames = 0
 
     def add(self, result: dict) -> None:
         self.frames += 1
         self.dino |= bool(result.get("dino"))
+        raw = result.get("raw_dino") or {}
+        if raw:
+            self.rear_frames += 1
+            for dev, score in raw.items():
+                self.raw_totals[dev] = self.raw_totals.get(dev, 0.0) + score
         for r in result.get("top", []):
             self.totals[r["id"]] = self.totals.get(r["id"], 0.0) + r["score"]
         for k in ("layout", "front"):
@@ -401,6 +413,8 @@ class ScanAccumulator:
         entries = device_cache.devices()
         majority = {k: max(v.items(), key=lambda kv: kv[1])[0] for k, v in self.cues.items()}
         best = ranked[0][0]
+        raw_best = self.raw_totals.get(best, 0.0) / max(1, self.rear_frames)
+        raw_next = max((s / max(1, self.rear_frames) for d, s in self.raw_totals.items() if d != best), default=raw_best)
         return {
             "id": best, "name": f"{entries[best]['brand']} {entries[best]['name']}" if best in entries else best,
             "score": round(ranked[0][1] / self.frames, 3), "frames": self.frames, "dino": self.dino,
@@ -408,6 +422,8 @@ class ScanAccumulator:
             "cues": majority, "family": family_of(best, entries) if best in entries else None,
             "label_device": label_dev, "agrees": (label_dev == best) if label_dev else None,
             "conflicts": family_conflicts(label_dev, majority, entries),
+            "rear_frames": self.rear_frames, "raw_similarity": round(raw_best, 4),
+            "raw_margin": round(raw_best - raw_next, 4),
         }
 
 
@@ -463,7 +479,7 @@ class DeviceMatcher:
             try:
                 t = time.perf_counter()
                 crop, aspect = upright_crop(rgb)
-                res = self.classifier.classify(crop, "front" if view == "front" else "back", aspect)
+                res = self.classifier.classify(crop, view, aspect)
                 self.ms = (time.perf_counter() - t) * 1000.0
                 self.runs += 1
                 with self._cv:
@@ -472,6 +488,8 @@ class DeviceMatcher:
                         self.last = res
             except Exception:
                 self.errors += 1
+                if self.errors <= 3 or self.errors % 50 == 0:
+                    log.exception("Phone classification failed (%d errors)", self.errors)
 
     def reset(self) -> None:
         with self._cv:
@@ -488,4 +506,3 @@ class DeviceMatcher:
         return {"index": len(idx.ids) if idx else 0, "embedder": idx.embedder if idx else None,
                 "dino": bool(idx is not None and self.classifier.embed is not None), "runs": self.runs,
                 "errors": self.errors, "ms": round(self.ms, 1), "rate_hz": round(1.0 / self.period, 1)}
-

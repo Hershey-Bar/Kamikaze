@@ -159,6 +159,7 @@ import packaging
 import phone_classifier
 import pose as pose_mod
 import smart_scan
+import smart_identity
 import ocr_fusion
 import taxonomy
 import telemetry
@@ -1628,6 +1629,7 @@ class AssetManager:
         self._inflight: set[str] = set()
         self._not_found: dict[str, dict] = {}
         self._gen: dict[str, int] = {}
+        self._upgrade_checked: set[str] = set()
         self.offline = bool(offline)
         self.source = source if source in cad_harvester.SOURCES else "auto"
         self._online_source = self.source if self.source not in cad_harvester.OFFLINE_SOURCES else "auto"
@@ -1728,6 +1730,12 @@ class AssetManager:
     def get(self, label: str) -> dict:
         """Current asset; starts one background harvest for a class that has never been searched in this mode."""
         entry = self.peek(label)
+        if entry.get("source_key") == "spec_generated":
+            with self._lock:
+                upgrade = label not in self._upgrade_checked
+                self._upgrade_checked.add(label)
+            if upgrade:
+                self._start(label, False)
         if entry["status"] != "pending":
             return entry
         self._start(label, False)
@@ -1740,6 +1748,9 @@ class AssetManager:
         try:
             meta = self.meta_lookup(label) if self.meta_lookup else None
             result = cad_harvester.retrieve(label, meta, force=force and not offline, offline=offline, source=source)
+            if (not result.get("glb_url") and (meta or {}).get("autonomous") and source == "auto" and not offline):
+                product = cad_harvester.product_for(label, meta)
+                result = cad_harvester.generate_from_specs(product)
             self._land(label, gen, result)
         except Exception as exc:
             log.exception("Asset resolution failed for %s", label)
@@ -2171,14 +2182,16 @@ class Pipeline:
         self.enroller = Enroller(bank)
         self.mv = MultiViewEnroller(bank, on_complete=self._mv_complete)
         self.pose_est = pose_mod.PoseEstimator()
+        self.relative_yaw = pose_mod.RelativeYaw()
         self.stats = SystemStats()
         self._pose: dict = {"pitch": 0.0, "yaw": 0.0, "roll": 0.0, "valid": False, "view": None, "ms": 0.0, "source": None}
         self._best_view: str | None = None
         self._category: str | None = None
+        self._discovered: dict[str, dict] = {}
         self._version = 0
         self._ver_cv = threading.Condition()
         if hasattr(assets, "meta_lookup"):
-            assets.meta_lookup = bank.metadata
+            assets.meta_lookup = self._metadata
             assets.on_resolved = self._cad_resolved
         self.sm = StateMachine()
         self._infer_lock = threading.Lock()
@@ -2188,6 +2201,7 @@ class Pipeline:
         self._label_scan: label_stitch.LabelStitcher | None = None
         self.view = VIEW
         self.smart = smart_scan.SmartScan()
+        self.evidence = smart_identity.ScanEvidence()
         self._auto_scan = False  # the running label scan was started by the SMART scan (not the dashboard button)
         self._auto_scan_tried: set[str] = set()  # labels whose automatic label scan already ran / was refused
         self._auto_finishing = False
@@ -2376,6 +2390,9 @@ class Pipeline:
         self.bank.set_cad(label, info)
         self._bump()  # push the new GLB URL to the 3D viewer even when no frames are streaming
 
+    def _metadata(self, label: str) -> dict | None:
+        return self._discovered.get(label) or self.bank.metadata(label)
+
     def _mv_complete(self, label: str) -> None:
         self.sm.reset()
         self.pose_est.reset()
@@ -2426,8 +2443,11 @@ class Pipeline:
                 box, detect_ms = self._locate(image)
                 crop_box = box or center_crop_box(*image.size)
                 if self.ocr.enabled:
-                    size, left, top = crop_box
-                    self.ocr.submit(np.asarray(image.crop((left, top, left + size, top + size))))
+                    text_crop = phone_crop(image, self._detection.get("target"))
+                    if text_crop is None:
+                        size, left, top = crop_box
+                        text_crop = np.asarray(image.crop((left, top, left + size, top + size)))
+                    self.ocr.submit(text_crop)
                 live_color, self._hue, self._citrus = None, None, None
                 try:
                     pixels = object_pixels(image, crop_box)
@@ -2481,7 +2501,7 @@ class Pipeline:
                     self.leds.set(scan_led_params(st["coverage"], st["complete"]))
                 else:
                     self.leds.set(led_params(state, score))
-            if state == IDENTIFIED and not (self.view == "smart" and self.smart.status == smart_scan.LOCKED):
+            if state == IDENTIFIED and self.view != "smart":
                 self._viewer_label = label
                 self.assets.get(label)
             pose = self._pose
@@ -2503,6 +2523,23 @@ class Pipeline:
                     pose["source"] = pose_src
                 except Exception:
                     log.exception("pose estimation failed")
+            live_label = self.smart.label if self.view == "smart" else frame.label
+            if (self.view == "smart" and self.smart.active and live_label
+                    and not self.bank.has_pose_views(live_label) and arr is not None):
+                target = self._detection.get("target")
+                live_category = smart_identity.detected_category(target) or category
+                try:
+                    pose = self.pose_est.update(image, box or center_crop_box(*image.size), {}, live_label, live_category)
+                    crop = phone_crop(image, target)
+                    if crop is None:
+                        crop = citrus_crop(image, target, box or center_crop_box(*image.size))
+                    pose["yaw"] = round(self.relative_yaw.update(crop), 1)
+                    pose["source"], pose["relative"] = "surface-flow-relative", True
+                except (ValueError, cv2.error):
+                    log.exception("Relative live pose failed")
+                    pose = {**pose, "valid": False}
+            if empty or dark or (self.detector is not None and not self._detection.get("target")):
+                pose = {**pose, "valid": False}
             self._pose, self._best_view, self._category = pose, best_view, category
             self._frames += 1
             now = time.monotonic()
@@ -2660,6 +2697,8 @@ class Pipeline:
         if view != self.view:
             self.view = view
             self.smart.reset()
+            self.evidence.reset()
+            self.relative_yaw.reset()
             self._cancel_auto_scan()
             log.info("dashboard view: %s", view)
             self._bump()
@@ -2670,24 +2709,60 @@ class Pipeline:
                     image: Image.Image | None = None) -> tuple[int, int, int, int, int] | None:
         """Feed the SMART scan one frame; returns the LED tuple it wants (None = regular state machine LEDs)."""
         manual_scan = self._label_scan is not None and not self._auto_scan
-        if self.view != "smart" or manual_scan or self.enroller.active or not self.bank.labels():
+        if self.view != "smart" or manual_scan or self.enroller.active:
             if self.smart.status != smart_scan.IDLE:
                 self.smart.reset()
             return None
         target = self._detection.get("target") or {}
-        det = target.get("score") if target else None
+        detected = smart_identity.detected_category(target)
+        det = target.get("score") if detected else None
         if self.detector is None and frame.label:
             det = frame.c1  # no NPU detector: the identity confidence itself arms the scan
         blank = dark or bool((saliency or {}).get("empty"))  # an empty / unlit reticle is never evidence of the object
         ocr = arb.get("ocr") or {}
-        event = self.smart.update(det_score=None if blank else det, label=None if blank else frame.label,
-                                  confidence=0.0 if blank else frame.c1,
-                                  category=category, tokens=ocr.get("tokens") or (),
+        scan_category = detected or category
+        identity = None
+        label, confidence = frame.label, frame.c1
+        if self.smart.status == smart_scan.LOCKED and self.smart.label in self._discovered:
+            label = self.smart.label if detected and not blank else None
+            confidence = self.smart.confidence if label else 0.0
+        elif self.detector is not None and not detected:
+            label, confidence = None, 0.0
+        if self.smart.status == smart_scan.SCANNING and not blank and (detected or self.detector is None):
+            if self.ocr.enabled:
+                ocr = self.ocr.recent(since=self.smart.started)
+            crop = None
+            if image is not None:
+                crop = phone_crop(image, target)
+                if crop is None:
+                    crop = citrus_crop(image, target, center_crop_box(*image.size))
+            self.evidence.add(ocr, self._citrus if scan_category != "smartphone" else None, crop, best_view)
+            match = self.devices.summary(device_cache.device_id_for(frame.label or "")) if (
+                self.devices is not None and scan_category == "smartphone") else None
+            identity = self.evidence.resolve(scan_category, match)
+            if identity:
+                label, confidence = identity["label"], identity["confidence"]
+                if label not in self._discovered and len(self._discovered) >= 128:
+                    self._discovered.pop(next(iter(self._discovered)))
+                self._discovered[label] = identity["metadata"]
+                self.assets.get(label)  # prefetch during the scan, never block on network or model conversion
+            elif label and scan_category and self.bank.category(label) not in (None, scan_category):
+                label, confidence = None, 0.0
+            elif match and match.get("conflicts"):
+                label, confidence = None, 0.0
+        event = self.smart.update(det_score=None if blank else det, label=None if blank else label,
+                                  confidence=0.0 if blank else confidence,
+                                  category=scan_category, tokens=ocr.get("tokens") or (),
                                   sharpness=(saliency or {}).get("laplacian_var"),
                                   view=best_view if category == "smartphone" else None)
         if event == "started" and self.devices is not None:
             self.devices.reset()
         if event == "started":
+            self.evidence.reset()
+            self.pose_est.reset()
+            self.relative_yaw.reset()
+            self._viewer_label = None
+            self._pose = {**self._pose, "valid": False}
             log.info("SMART scan #%d started (%.0f s window)", self.smart.scans, self.smart.window_s)
             self._bump()
         elif event == "locked":
@@ -2701,16 +2776,25 @@ class Pipeline:
             if event != "inconclusive":
                 self._cancel_auto_scan()
                 self._auto_scan_tried.clear()
+                self.evidence.reset()
+                self._viewer_label = None
+                self._pose = {**self._pose, "valid": False}
             self._bump()
         if self.smart.status == smart_scan.SCANNING:
             self._maybe_auto_label_scan(self.smart.label)
-            if category == "smartphone" and self.devices is not None and image is not None and not blank:
+            if scan_category == "smartphone" and self.devices is not None and image is not None and not blank:
                 crop = phone_crop(image, target)
                 if crop is not None:
                     self.devices.submit(crop, best_view)
         if self._auto_scan and st is not None and st.get("complete") and not self._auto_finishing:
             self._auto_finishing = True
             threading.Thread(target=self._finish_auto_scan, name="auto-label-scan", daemon=True).start()
+        if self.smart.status == smart_scan.IDLE:
+            brightness = round(12 + 6 * math.sin(time.monotonic() * math.pi))
+            return (0, 100, 150, brightness, 1)
+        if self.smart.status == smart_scan.LOCKED:
+            if self.assets.peek(self.smart.label).get("status") not in ("ready", "cached"):
+                return (255, 120, 0, 40, 4)
         return self.smart.led()
 
     def _maybe_auto_label_scan(self, label: str | None) -> None:
@@ -2777,6 +2861,25 @@ class Pipeline:
 
     def smart_status(self) -> dict:
         snap = self.smart.snapshot()
+        if snap["status"] != smart_scan.IDLE:
+            snap["category"] = snap["category"] or self.evidence.category
+        snap["evidence"] = self.evidence.snapshot()
+        snap["asset_status"] = None
+        snap["prefetch_url"] = ""
+        if snap["label"]:
+            asset = self.assets.peek(snap["label"])
+            snap["asset_status"] = asset.get("status")
+            snap["prefetch_url"] = asset.get("glb_url", "")
+            if snap["status"] == smart_scan.LOCKED:
+                if asset.get("status") in ("pending", "resolving"):
+                    snap["status"] = "resolving"
+                    snap["message"] = "Identity resolved. Retrieving the exact model; keep holding the object."
+                elif asset.get("status") in ("not_found", "offline_missing"):
+                    snap["status"] = "not_found"
+                    snap["message"] = asset.get("reason") or "No verified model is available for this product."
+        if snap["status"] in (smart_scan.SCANNING, smart_scan.INCONCLUSIVE) and self.evidence.message:
+            prefix = "Scan inconclusive. " if snap["status"] == smart_scan.INCONCLUSIVE else ""
+            snap["message"] = prefix + self.evidence.message
         scan = self._label_scan
         snap["auto_label_scan"] = scan.status() if scan is not None and self._auto_scan else None
         if snap["label"]:
@@ -2788,7 +2891,7 @@ class Pipeline:
         return snap
 
     def _display_name(self, label: str) -> str:
-        meta = self.bank.metadata(label) or {}
+        meta = self._metadata(label) or {}
         name = meta.get("display_name") or meta.get("raw_name")
         if name:
             return str(name)
@@ -3136,7 +3239,8 @@ class Pipeline:
             "ok": True,
             "state": state,
             "label": last["label"],
-            "confirmed_label": self.sm.label if state == IDENTIFIED else None,
+            "confirmed_label": (self.smart.label if self.smart.status == smart_scan.LOCKED else None)
+            if self.view == "smart" else (self.sm.label if state == IDENTIFIED else None),
             "viewer_label": self._viewer_label,
             "confidence": round(last["confidence"], 3),
             "similarity": round(last["similarity"], 3),

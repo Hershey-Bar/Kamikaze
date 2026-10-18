@@ -391,6 +391,7 @@ class OcrWorker:
             xs = (np.arange(int(w * k)) / k).astype(int)
             crop = crop[ys][:, xs]
         bgr = np.ascontiguousarray(crop[:, :, ::-1])
+        captured_at = time.monotonic()
         t0 = time.perf_counter()
         result, _ = self.engine(bgr, use_cls=False)
         ms = (time.perf_counter() - t0) * 1000.0
@@ -407,7 +408,7 @@ class OcrWorker:
             for item in result or []:
                 text, score = str(item[1]), float(item[2])
                 if score >= MIN_SCORE and text.strip():
-                    self._reads.append((now, text.strip(), score))
+                    self._reads.append((captured_at, text.strip(), score))
 
     def rolling(self, n: int = ROLL_RUNS, max_age: float = ROLL_MAX_AGE) -> dict[str, int]:
         """Rolling token buffer: {corrected token: number of the last `n` OCR passes (each <= max_age s old) that read
@@ -431,10 +432,10 @@ class OcrWorker:
         """Add enrolled class words (brand / flavour / model) to the autocorrect dictionary."""
         self.corrector.set_extra(words)
 
-    def recent(self, window_s: float = WINDOW_S) -> dict:
+    def recent(self, window_s: float = WINDOW_S, since: float = 0.0) -> dict:
         now = time.monotonic()
         with self._cv:
-            reads = [(t, s, c) for t, s, c in self._reads if now - t <= window_s]
+            reads = [(t, s, c) for t, s, c in self._reads if t >= since and now - t <= window_s]
             lat = sorted(self._lat)
             runs = self._runs
         texts: list[str] = []
@@ -456,6 +457,7 @@ class OcrWorker:
         return {
             "enabled": self.enabled, "texts": texts[:8], "corrected": corrected[:8], "corrections": fixes[:8],
             "tokens": sorted(seen), "runs": runs,
+            "last_read_at": max((t for t, _, _ in reads), default=0.0),
             "ms": round(lat[len(lat) // 2], 1) if lat else None, "hz": round(1.0 / self.period, 1),
             "error": self.error, "engine": self.engine_name(), "det": self.det_npu.info() if self.det_npu else None,
         }

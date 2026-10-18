@@ -195,3 +195,37 @@ class PoseEstimator:
             "valid": True, "view": best, "aspect": round(geo["aspect"], 3), "fill": round(geo["fill"], 3),
             "ms": round((time.perf_counter() - t0) * 1000, 2),
         }
+
+
+class RelativeYaw:
+    """Track label-surface motion when no enrolled cardinal views exist. Zero is the first observed view."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.previous = None
+        self.yaw = 0.0
+
+    def update(self, rgb: np.ndarray) -> float:
+        import cv2
+
+        gray = cv2.cvtColor(cv2.resize(rgb, (128, 192)), cv2.COLOR_RGB2GRAY)
+        if self.previous is not None:
+            mask = np.zeros_like(gray)
+            mask[30:162, 32:96] = 255
+            points = cv2.goodFeaturesToTrack(self.previous, 60, 0.03, 5, mask=mask)
+            if points is not None and len(points) >= 6:
+                moved, status, _ = cv2.calcOpticalFlowPyrLK(self.previous, gray, points, None)
+                if moved is not None and status is not None:
+                    returned, reverse, _ = cv2.calcOpticalFlowPyrLK(gray, self.previous, moved, None)
+                    if returned is not None and reverse is not None:
+                        good = (status.ravel() == 1) & (reverse.ravel() == 1)
+                        good &= np.linalg.norm((returned - points).reshape(-1, 2), axis=1) < 1.5
+                        flow = (moved - points).reshape(-1, 2)[good]
+                        if len(flow) >= 6:
+                            dx = float(np.median(flow[:, 0]))
+                            if abs(dx) < 12 and float(np.median(np.abs(flow[:, 0] - dx))) < 3:
+                                self.yaw = _wrap180(self.yaw - math.degrees(dx / 64))
+        self.previous = gray
+        return self.yaw
