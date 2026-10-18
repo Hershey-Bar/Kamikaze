@@ -1,22 +1,27 @@
-"""CAD harvester: find, license-check, download and cache a 3D GLB for a canonical product, with author attribution.
+"""CAD harvester: find, quality-check, license-check, download and cache a 3D GLB for a canonical product, with author
+attribution. It never fabricates geometry: when no verified model exists the result is an explicit NOT_FOUND.
 
     harvest(resolve("samsung galaxy s24 ultra"))  ->  static/models/galaxy_s24_ultra.glb + galaxy_s24_ultra.json
 
 Search queries come from build_search_queries()/search_plan(): colloquial text is resolved to a canonical product and
 expanded into exact -> similar -> category queries ("s25 ultra" -> "Samsung Galaxy S25 Ultra" ... "Galaxy S24 Ultra" ...
-"Smartphone"). Each level is tried against every online source before falling back to the next level.
+"Smartphone").
 
-Source order per level (exact -> similar -> category; the first level that yields a downloadable GLB wins):
-  1. Online pool - Sketchfab Data API (SKETCHFAB_TOKEN) + Poly Pizza API (POLY_PIZZA_API_KEY, header X-Auth-Token).
-     All queries of the level are searched on both services; candidates are relevance-filtered (exact model + tier +
-     flavour, no competing brand), licence-filtered (CC0 / CC-BY / CC-BY-SA / CC-BY-ND / Sketchfab Standard; NonCommercial
-     rejected), single-object and face-count capped, then ranked by
-         relevance + licence + popularity - mesh weight,   popularity = 2.5·ln(1+likes) + 0.75·ln(1+views) + 4·staff_pick
-     (capped at 25; Poly Pizza has no counters, so its own relevance order stands in). The best GLB within the download
-     size cap wins.
-  2. Open repos          - KhronosGroup/glTF-Sample-Assets (exact level only; credits read from each model README).
-  3. Local parametric model (original work, brand/tier aware) built by procedural_glb.py; generic templates live in
-     static/models/base/{soda_can,bottle,smartphone}.glb.
+Automatic harvest (harvest / retrieve) - exact-product level only:
+  Sketchfab Data API (SKETCHFAB_TOKEN) + Poly Pizza API (POLY_PIZZA_API_KEY, header X-Auth-Token) are pooled;
+  candidates are relevance-filtered (exact model + tier + flavour, no competing brand), licence-filtered (CC0 / CC-BY /
+  CC-BY-SA / CC-BY-ND / Sketchfab Standard; NonCommercial rejected), single-object and face-count capped, then ranked by
+      relevance + licence + popularity - mesh weight,   popularity = 2.5*ln(1+likes) + 0.75*ln(1+views) + 4*staff_pick
+  (capped at 25). Each download must pass validate_glb(): binary glTF 2.0, MIN_VERTICES..MAX_VERTICES unique vertices,
+  <= MAX_GLB_MB and at least one material - primitive placeholders and untextured meshes are deleted and the next
+  candidate is tried. If nothing passes, the result is status "not_found" (no substitute model is shown).
+
+User-driven paths (never automatic):
+  candidates()          - top ranked models across exact / similar / category levels for a picker UI (no download);
+  select()              - download one picked candidate;
+  upload_glb()          - install an operator-supplied GLB (same quality gate);
+  generate_from_specs() - dimension-calibrated GLB built only from verified published specs (spec_search.py), badged
+                          "Estimated Model: Dimensionally Calibrated via Spec Search".
 
 Every cached model gets a sidecar static/models/<class_id>.json holding the attribution (title, author, author URL,
 licence, licence URL, source URL, match level, query). credits() / write_credits_md() aggregate them (served at
@@ -31,7 +36,7 @@ import logging
 import math
 import os
 import re
-import shutil
+import struct
 import threading
 import time
 import urllib.error
@@ -39,30 +44,33 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import entity_resolver
 import mcp_server as mcp
 import procedural_glb
+import spec_search
 import taxonomy
 
 log = logging.getLogger("kamikaze.cad")
 
-KHRONOS_INDEX = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/model-index.json"
-KHRONOS_RAW = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models"
-KHRONOS_TREE = "https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models"
 PROJECT_URL = "https://github.com/Hershey-Bar/Kamikaze"
 BUDGET_S = float(os.environ.get("KAMIKAZE_CAD_BUDGET", "40"))
 SEARCH_TIMEOUT_S = float(os.environ.get("KAMIKAZE_CAD_SEARCH_TIMEOUT", "10"))
 MAX_FACES = int(os.environ.get("KAMIKAZE_CAD_MAX_FACES", "150000"))
-MAX_GLB_MB = float(os.environ.get("KAMIKAZE_CAD_MAX_MB", "24"))
+MAX_GLB_MB = float(os.environ.get("KAMIKAZE_CAD_MAX_MB", "35"))
+MIN_VERTICES = int(os.environ.get("KAMIKAZE_CAD_MIN_VERTICES", "200"))
+MAX_VERTICES = int(os.environ.get("KAMIKAZE_CAD_MAX_VERTICES", "350000"))
 ALLOW_NONCOMMERCIAL = os.environ.get("KAMIKAZE_CAD_ALLOW_NC", "0") == "1"
 DOWNLOAD_TRIES = 4
 POPULARITY_CAP = 25.0
 FLAVOR_CONFLICT = 12.0
 TIER_CONFLICT = 6.0
-ALLOW_GENERIC = os.environ.get("KAMIKAZE_CAD_GENERIC", "1") != "0"
 POLY_PIZZA_SEARCH = "https://api.poly.pizza/v1.1/search/{query}"
 LEVEL_SCORE = {"exact": 0.0, "similar": 30.0, "category": 10.0}
+PROVIDERS = ("sketchfab", "polypizza")
+SOURCES = ("auto", "sketchfab", "polypizza", "local")
+SPEC_BADGE = "Estimated Model: Dimensionally Calibrated via Spec Search"
 
 PHONE_TIERS = {"pro", "max", "plus", "ultra", "mini", "fe", "edge", "air", "lite"}
 CAN_TIER_SYNONYMS = {"zero": "zero", "max": "zero", "diet": "diet", "light": "diet", "lite": "diet"}
@@ -109,8 +117,8 @@ LICENSE_URLS = (
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 _blocked_until: dict[str, float] = {}
-_index_lock = threading.Lock()
-_index_cache: list | None = None
+_cand_guard = threading.Lock()
+_cand_cache: dict[str, dict[str, "Candidate"]] = {}
 
 
 @dataclass
@@ -599,7 +607,7 @@ def _record(product, cand: Candidate, source_name: str) -> dict:
         "license_url": cand.license_url, "source": source_name, "source_key": cand.provider, "source_url": cand.source_url,
         "thumbnail_url": cand.thumbnail_url, "attribution_text": cand.attribution_text, "modified": False,
         "faces": cand.faces, "class_id": product.class_id, "canonical_name": product.canonical_name,
-        "match": cand.extra.get("match", "exact" if cand.provider in ("sketchfab", "polypizza", "github") else "parametric"),
+        "match": cand.extra.get("match", "exact"),
         "query": cand.extra.get("query", ""),
         "rank_score": round(cand.score, 2), "popularity": cand.extra.get("popularity"),
         "likes": cand.extra.get("likes"), "views": cand.extra.get("views"),
@@ -680,126 +688,90 @@ def _fetch(cand: Candidate, slug: str) -> bool:
     return bool(cand.download_url and mcp.download_glb(cand.download_url, slug))
 
 
-def _try_online(product, slug: str, deadline: float, queries: list[str], level: str) -> tuple[Candidate, str] | None:
-    """Pool Sketchfab + Poly Pizza candidates for one search level, rank them by relevance + licence + popularity and
-    download the best one that fits the size budget (up to DOWNLOAD_TRIES attempts)."""
-    pool = _search_sketchfab(product, queries, level, deadline) + _search_polypizza(product, queries, level, deadline)
+def _download_and_validate(cand: Candidate, slug: str) -> bool:
+    """Download one candidate and run the quality gate; a rejected file is deleted so the next candidate can be tried."""
+    if not _fetch(cand, slug):
+        return False
+    path = mcp.local_glb_path(slug)
+    ok, why, info = validate_glb(path)
+    cand.extra["quality"] = info
+    if ok:
+        return True
+    log.info("CAD candidate %r (%s) rejected by the quality gate: %s", cand.title, cand.provider, why)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return False
+
+
+def _pool(product, queries: list[str], level: str, deadline: float, providers: tuple[str, ...]) -> list[Candidate]:
+    pool: list[Candidate] = []
+    if "sketchfab" in providers:
+        pool += _search_sketchfab(product, queries, level, deadline)
+    if "polypizza" in providers:
+        pool += _search_polypizza(product, queries, level, deadline)
     pool.sort(key=lambda c: -c.score)
+    return pool
+
+
+def _try_online(product, slug: str, deadline: float, queries: list[str], level: str,
+                providers: tuple[str, ...] = PROVIDERS) -> tuple[Candidate, str] | None:
+    """Pool Sketchfab + Poly Pizza candidates for one search level, rank them by relevance + licence + popularity and
+    download the best one that passes the GLB quality gate (up to DOWNLOAD_TRIES attempts)."""
+    pool = _pool(product, queries, level, deadline, providers)
     if pool:
         log.info("CAD %s [%s] top candidates: %s", product.class_id, level,
                  "; ".join(f"{c.title!r} ({SOURCE_NAMES.get(c.provider, c.provider)}, {c.score:.1f})" for c in pool[:3]))
     for cand in pool[:DOWNLOAD_TRIES]:
         if time.monotonic() > deadline:
             break
-        if _fetch(cand, slug):
+        if _download_and_validate(cand, slug):
             return cand, SOURCE_NAMES.get(cand.provider, cand.provider)
     return None
 
 
-def _khronos_index() -> list:
-    global _index_cache
-    with _index_lock:
-        if _index_cache is None:
-            data = mcp._http_json(KHRONOS_INDEX, timeout=SEARCH_TIMEOUT_S)
-            _index_cache = data if isinstance(data, list) else []
-        return _index_cache
-
-
-def _khronos_credit(name: str) -> tuple[str, str, str]:
-    """(author, license label, license url) from a sample model's README 'Legal' section."""
-    try:
-        req = urllib.request.Request(f"{KHRONOS_RAW}/{name}/README.md", headers={"User-Agent": mcp.USER_AGENT})
-        with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT_S) as resp:
-            text = resp.read().decode("utf-8", "replace")
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
-        return "", "", ""
-    legal = text.split("## Legal", 1)[-1]
-    lic = re.search(r"\[([^\]]+)\]\((https?://[^)]+)\)", legal)
-    authors = re.findall(r"^\s*-\s+(.+?)\s+for\s+", legal, flags=re.M)
-    return ", ".join(authors), (lic.group(1) if lic else ""), (lic.group(2) if lic else "")
-
-
-def _try_khronos(product, slug: str, deadline: float) -> tuple[Candidate, str] | None:
-    try:
-        index = _khronos_index()
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
-        log.warning("CAD source github failed: %s", exc)
-        return None
-    for entry in index:
-        name = str(entry.get("name", ""))
-        if time.monotonic() > deadline or "glTF-Binary" not in (entry.get("variants") or {}):
-            continue
-        if name_score(product, f"{name} {entry.get('label', '')}") is None:
-            continue
-        url = f"{KHRONOS_RAW}/{name}/glTF-Binary/{entry['variants']['glTF-Binary']}"
-        if not mcp.download_glb(url, slug):
-            continue
-        author, lic, lic_url = _khronos_credit(name)
-        return Candidate(
-            provider="github", title=str(entry.get("label") or name), score=0.0, author=author or "see model README",
-            license=lic or "see model README", license_url=lic_url, source_url=f"{KHRONOS_TREE}/{name}",
-            thumbnail_url=f"{KHRONOS_RAW}/{name}/{entry.get('screenshot', 'screenshot/screenshot.jpg')}",
-        ), "KhronosGroup/glTF-Sample-Assets"
-    return None
-
-
 # --------------------------------------------------------------------------------------
-# Local parametric fallback
+# GLB quality gate
 # --------------------------------------------------------------------------------------
 
-BASE_MODELS = {
-    "soda_can": lambda: procedural_glb.build_can("", "original"),
-    "bottle": lambda: procedural_glb.build_can("", "original", bottle=True),
-    "smartphone": lambda: procedural_glb.build_phone("Generic", "standard", 3),
-}
 
-
-def _atomic_write(dest: Path, data: bytes) -> bool:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".part")
-    tmp.write_bytes(data)
-    os.replace(tmp, dest)
-    return mcp.is_valid_glb(dest)
-
-
-def ensure_base_models() -> dict[str, Path]:
-    """Generate the generic parametric templates in static/models/base/ (idempotent)."""
-    out = {}
-    for name, build in BASE_MODELS.items():
-        path = models_dir() / "base" / f"{name}.glb"
-        if not mcp.is_valid_glb(path):
-            try:
-                _atomic_write(path, build())
-            except Exception:
-                log.exception("Could not build base model %s", name)
-                continue
-        out[name] = path
-    return out
-
-
-def _base_for(category: str) -> str:
-    return {"smartphone": "smartphone", "beverage_bottle": "bottle"}.get(category, "soda_can")
-
-
-def _procedural(product, dest: Path) -> Candidate | None:
+def validate_glb(path: Path) -> tuple[bool, str, dict]:
+    """(ok, reason, info) - rejects non-GLB files, primitive placeholder geometry (< MIN_VERTICES unique vertices),
+    meshes too heavy for the dashboard (> MAX_VERTICES or > MAX_GLB_MB) and material-less (untextured) models."""
     try:
-        ok = _atomic_write(dest, procedural_glb.build_for(product.metadata()))
-    except Exception:
-        log.exception("Procedural model failed for %s - using the base template", product.class_id)
-        ok = False
-    if not ok:
-        base = ensure_base_models().get(_base_for(product.category))
-        if not base:
-            return None
-        shutil.copyfile(base, dest)
-        ok = mcp.is_valid_glb(dest)
-    if not ok:
-        return None
-    return Candidate(
-        provider="procedural", title=f"{product.canonical_name} (parametric model)", score=0.0,
-        author="Kamikaze project (procedurally generated, original work)", author_url=PROJECT_URL,
-        license="MIT (project licence)", license_url=f"{PROJECT_URL}/blob/main/LICENSE", source_url=PROJECT_URL,
-    )
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            header = fh.read(20)
+            if len(header) < 20 or header[:4] != b"glTF":
+                return False, "not a binary glTF (GLB)", {}
+            version = struct.unpack("<I", header[4:8])[0]
+            json_len, json_type = struct.unpack("<II", header[12:20])
+            if version != 2 or json_type != 0x4E4F534A or json_len > size:
+                return False, "malformed GLB header", {}
+            doc = json.loads(fh.read(json_len).decode("utf-8"))
+    except (OSError, ValueError, struct.error) as exc:
+        return False, f"unreadable GLB: {exc}", {}
+    accessors = doc.get("accessors") or []
+    seen: set[int] = set()
+    vertices = 0
+    for mesh in doc.get("meshes") or []:
+        for prim in mesh.get("primitives") or []:
+            ref = (prim.get("attributes") or {}).get("POSITION")
+            if isinstance(ref, int) and 0 <= ref < len(accessors) and ref not in seen:
+                seen.add(ref)
+                vertices += int(accessors[ref].get("count") or 0)
+    info = {"vertices": vertices, "size_mb": round(size / 1e6, 2), "materials": len(doc.get("materials") or []),
+            "meshes": len(doc.get("meshes") or []), "textures": len(doc.get("textures") or [])}
+    if size > MAX_GLB_MB * 1024 * 1024:
+        return False, f"{size / 1e6:.1f} MB exceeds the {MAX_GLB_MB:.0f} MB budget", info
+    if vertices < MIN_VERTICES:
+        return False, f"only {vertices} vertices (< {MIN_VERTICES}): primitive / placeholder geometry", info
+    if vertices > MAX_VERTICES:
+        return False, f"{vertices} vertices exceeds the {MAX_VERTICES} budget", info
+    if not info["materials"]:
+        return False, "no materials (would render as an untextured mesh)", info
+    return True, "ok", info
 
 
 # --------------------------------------------------------------------------------------
@@ -827,20 +799,52 @@ def _with_class_id(product: entity_resolver.CanonicalProduct, class_id: str) -> 
     return entity_resolver.CanonicalProduct(**data)
 
 
+def _providers(source: str) -> tuple[str, ...]:
+    source = (source or "auto").lower()
+    if source in ("auto", "online", "all"):
+        return PROVIDERS
+    if source in PROVIDERS:
+        return (source,)
+    if source == "local":
+        return ()
+    raise ValueError(f"unknown CAD source {source!r} (auto, sketchfab, polypizza, local)")
+
+
 def _result(product, attr: dict, status: str, source: str, cached: bool, query: str = "") -> dict:
     return {
         "class_id": product.class_id, "title": attr.get("title") or product.canonical_name, "glb_url": glb_url(product.class_id),
         "status": status, "source": source, "query": query, "cached": cached, "attribution": attr,
         "credit": attribution_line(attr), "thumbnail_url": attr.get("thumbnail_url", ""), "match": attr.get("match", ""),
+        "badge": attr.get("badge", ""),
     }
 
 
-def harvest(product, force: bool = False, offline: bool = False, budget_s: float | None = None) -> dict:
+def not_found(class_id: str, title: str, reason: str) -> dict:
+    """The explicit NOT_FOUND outcome: no model is shown rather than a substitute."""
+    return {"class_id": class_id, "title": title, "glb_url": "", "status": "not_found", "source": "none", "query": "",
+            "cached": False, "attribution": {}, "credit": "", "thumbnail_url": "", "match": "", "badge": "",
+            "reason": reason}
+
+
+def _finish(product, cand: Candidate, source_name: str, status: str, extra: dict | None = None) -> dict:
+    attr = {**_record(product, cand, source_name), **(extra or {})}
+    _write_json(sidecar_path(product.class_id), attr)
+    write_credits_md()
+    log.info("CAD for %s: %s | %s", product.class_id, source_name, attribution_line(attr))
+    return _result(product, attr, status, cand.provider, False, cand.extra.get("query", ""))
+
+
+def harvest(product, force: bool = False, offline: bool = False, budget_s: float | None = None,
+            source: str = "auto") -> dict:
     """Resolve + cache a GLB for `product` (CanonicalProduct | metadata dict | free text) and write its attribution.
 
-    Returns {"class_id", "title", "glb_url", "status": "online"|"cached", "source", "query", "cached", "attribution", "credit"}.
+    Only exact-product matches are accepted automatically; similar / category models are offered through candidates()
+    for an explicit user choice. offline=True (or source="local") only consults the local cache.
+    Returns {"class_id", "title", "glb_url", "status": "online"|"cached"|"not_found", "source", "query", "cached",
+    "attribution", "credit", "reason"?}.
     """
     product = _coerce(product)
+    providers = _providers(source)
     slug = _slug(product.class_id)
     dest = glb_path(product.class_id)
     with _lock_for(slug):
@@ -854,58 +858,150 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
                 dest.unlink()  # a GLB without attribution cannot be shown - re-harvest it
             except OSError:
                 pass
+        if offline or not providers:
+            return not_found(product.class_id, product.canonical_name,
+                             "offline mode: no local 3D model is cached for this class")
         deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
-        found: tuple[Candidate, str] | None = None
-        if not offline:
-            plan = search_plan(product)
-            levels = [lv for lv in entity_resolver.QUERY_LEVELS if lv != "category" or ALLOW_GENERIC]
-            for level in levels:
-                queries = [q for q, lv in plan if lv == level]
-                steps = [("online", _try_online, (queries, level))] if queries else []
-                if level == "exact":
-                    steps.append(("github", _try_khronos, ()))
-                for name, provider, extra in steps:
-                    try:
-                        found = provider(product, slug, deadline, *extra)
-                    except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError) as exc:
-                        log.warning("CAD source %s failed for %s: %s", name, product.class_id, exc)
-                        found = None
-                    if found:
-                        break
-                if found or time.monotonic() > deadline:
-                    break
-        status = "online"
+        queries = [q for q, lv in search_plan(product) if lv == "exact"]
+        found = None
+        if queries:
+            try:
+                found = _try_online(product, slug, deadline, queries, "exact", providers)
+            except (urllib.error.URLError, OSError, ValueError, TimeoutError, KeyError) as exc:
+                log.warning("CAD search failed for %s: %s", product.class_id, exc)
         if not found:
-            status = "cached"
-            cand = _procedural(product, dest)
-            found = (cand, "Kamikaze procedural generator") if cand else None
-        if not found:
-            return {"class_id": product.class_id, "title": product.canonical_name, "glb_url": "", "status": "cached",
-                    "source": "none", "query": "", "cached": False, "attribution": {}, "credit": ""}
+            names = " + ".join(SOURCE_NAMES[p] for p in providers)
+            return not_found(product.class_id, product.canonical_name,
+                             f"no exact-match model on {names} passed the quality gate - browse similar options, "
+                             "upload a GLB or generate one from verified specs")
         cand, source_name = found
-        attr = _record(product, cand, source_name)
+        return _finish(product, cand, source_name, "online")
+
+
+def candidates(product, limit: int = 4, source: str = "auto", budget_s: float | None = None) -> list[dict]:
+    """Top `limit` ranked online models across exact -> similar -> category levels (nothing is downloaded)."""
+    product = _coerce(product)
+    providers = _providers(source)
+    if not providers:
+        return []
+    deadline = time.monotonic() + (BUDGET_S if budget_s is None else budget_s)
+    plan = search_plan(product)
+    picked: list[Candidate] = []
+    seen: set[tuple[str, str]] = set()
+    for level in entity_resolver.QUERY_LEVELS:
+        queries = [q for q, lv in plan if lv == level]
+        if not queries or len(picked) >= limit or time.monotonic() > deadline:
+            continue
+        for cand in _pool(product, queries, level, deadline, providers):
+            if (cand.provider, cand.uid) not in seen:
+                seen.add((cand.provider, cand.uid))
+                picked.append(cand)
+    picked = picked[:max(1, int(limit))]
+    with _cand_guard:
+        _cand_cache[_slug(product.class_id)] = {c.uid: c for c in picked}
+    return [{
+        "uid": c.uid, "provider": c.provider, "source": SOURCE_NAMES.get(c.provider, c.provider), "title": c.title,
+        "thumbnail_url": c.thumbnail_url, "author": c.author, "author_url": c.author_url, "license": c.license,
+        "license_url": c.license_url, "source_url": c.source_url, "faces": c.faces, "likes": c.extra.get("likes"),
+        "views": c.extra.get("views"), "level": c.extra.get("match", ""), "query": c.extra.get("query", ""),
+        "score": round(c.score, 1),
+    } for c in picked]
+
+
+def select(product, uid: str) -> dict:
+    """Download the candidate `uid` (from the last candidates() call for this class) as the class model."""
+    product = _coerce(product)
+    slug = _slug(product.class_id)
+    with _cand_guard:
+        cand = (_cand_cache.get(slug) or {}).get(uid)
+    if cand is None:
+        raise KeyError(f"candidate {uid!r} is not in the last search for {product.class_id}; browse options again")
+    with _lock_for(slug):
+        delete_cached(product.class_id)
+        if not _download_and_validate(cand, slug):
+            why = (cand.extra.get("quality") or {})
+            raise ValueError(f"{cand.title!r} could not be downloaded or failed the quality gate {why or ''}".strip())
+        return _finish(product, cand, SOURCE_NAMES.get(cand.provider, cand.provider), "online", {"selected_by_user": True})
+
+
+def upload_glb(class_id: str, data: bytes, filename: str = "", title: str = "") -> dict:
+    """Install a user-supplied GLB for `class_id` after the quality gate. Raises ValueError when it is rejected."""
+    slug = _slug(class_id)
+    dest = glb_path(class_id)
+    tmp = dest.with_suffix(".upload.part")
+    with _lock_for(slug):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(data)
+        ok, why, info = validate_glb(tmp)
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            raise ValueError(f"upload rejected: {why}")
+        delete_cached(class_id)
+        os.replace(tmp, dest)
+        name = Path(filename or "").name
+        attr = {
+            "title": title or name or class_id, "author": "user upload", "author_url": "", "license": "provided by the user",
+            "license_url": "", "source": "Custom upload", "source_key": "upload", "source_url": "", "thumbnail_url": "",
+            "attribution_text": f"Custom upload{f' ({name})' if name else ''} - supplied by the operator", "modified": False,
+            "class_id": class_id, "match": "user", "quality": info, "filename": name,
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }
+        _write_json(sidecar_path(class_id), attr)
+        write_credits_md()
+    product = SimpleNamespace(class_id=class_id, canonical_name=title or class_id)
+    return _result(product, attr, "cached", "upload", True)
+
+
+def generate_from_specs(product, profile: str | None = None) -> dict:
+    """Build a dimension-calibrated GLB from verified published specs (explicit user action only)."""
+    product = _coerce(product)
+    spec = spec_search.product_specs(product, profile)
+    if not spec.get("verified"):
+        return {**not_found(product.class_id, product.canonical_name, spec.get("reason", "specs not verified")),
+                "spec": spec}
+    data = procedural_glb.build_from_spec(spec, product.raw_query, {"class_id": product.class_id})
+    slug = _slug(product.class_id)
+    dest = glb_path(product.class_id)
+    with _lock_for(slug):
+        delete_cached(product.class_id)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".part")
+        tmp.write_bytes(data)
+        ok, why, info = validate_glb(tmp)
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            raise ValueError(f"generated GLB failed the quality gate: {why}")
+        os.replace(tmp, dest)
+        src = spec["sources"][0]
+        dims = (f"{spec['height_mm']} x {spec['width_mm']} x {spec['depth_mm']} mm, {spec['rear_cameras']} rear cameras"
+                if spec["category"] == "smartphone" else
+                f"{spec['diameter_mm']} x {spec['height_mm']} mm ({spec['volume_ml']} ml {spec['profile']})")
+        attr = {
+            "title": f"{product.canonical_name} (dimensionally calibrated)", "author": "Kamikaze spec generator",
+            "author_url": PROJECT_URL, "license": "MIT (project licence)", "license_url": f"{PROJECT_URL}/blob/main/LICENSE",
+            "source": "Spec search", "source_key": "spec_generated", "source_url": src["url"], "thumbnail_url": "",
+            "attribution_text": f"Generated by Kamikaze from published dimensions ({dims}) - {src['publisher']} ({src['url']})",
+            "modified": False, "class_id": product.class_id, "canonical_name": product.canonical_name, "match": "spec",
+            "badge": SPEC_BADGE, "spec": spec, "quality": info,
+            "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        }
         _write_json(sidecar_path(product.class_id), attr)
         write_credits_md()
-        log.info("CAD for %s: %s | %s", product.class_id, source_name, attribution_line(attr))
-        return _result(product, attr, status, cand.provider, False, cand.extra.get("query", ""))
+    log.info("Spec-generated CAD for %s: %s", product.class_id, attr["attribution_text"])
+    return {**_result(product, attr, "generated", "spec_generated", False), "spec": spec}
 
 
-def retrieve(label: str, meta: dict | None = None, force: bool = False, offline: bool = False) -> dict:
-    """Backwards-compatible entry point: harvest the GLB for bank label `label` (+ optional enrollment metadata)."""
+def retrieve(label: str, meta: dict | None = None, force: bool = False, offline: bool = False,
+             source: str = "auto") -> dict:
+    """Harvest the GLB for bank label `label` (+ optional enrollment metadata). Unparseable labels are NOT_FOUND."""
     try:
         product = entity_resolver.resolve_metadata(meta) if meta else entity_resolver.resolve(label.replace("_", " "))
-    except taxonomy.MetadataError:
-        found = mcp.search_3d_asset(label)
-        if not found.get("glb_url"):
-            return {**found, "source": found.get("status", "cached"), "attribution": {}, "credit": ""}
-        host = urllib.parse.urlparse(found.get("model_url", "")).netloc or "public source"
-        attr = {"title": found.get("title") or label, "author": "see source", "license": "see source",
-                "source": host, "source_key": "fallback", "source_url": found.get("model_url", ""), "modified": False,
-                "attribution_text": found.get("attribution") or "",
-                "thumbnail_url": found.get("thumbnail_url", ""), "class_id": label,
-                "retrieved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
-        _write_json(sidecar_path(label), attr)
-        write_credits_md()
-        return {**found, "class_id": label, "source": found.get("status", "cached"), "attribution": attr,
-                "credit": attribution_line(attr)}
-    return harvest(_with_class_id(product, label), force=force, offline=offline)
+    except taxonomy.MetadataError as exc:
+        return not_found(label, label.replace("_", " "), f"cannot build a CAD query for {label!r}: {exc}")
+    return harvest(_with_class_id(product, label), force=force, offline=offline, source=source)
+
+
+def product_for(label: str, meta: dict | None = None) -> entity_resolver.CanonicalProduct:
+    """CanonicalProduct for a bank label (raises taxonomy.MetadataError when it cannot be parsed)."""
+    product = entity_resolver.resolve_metadata(meta) if meta else entity_resolver.resolve(label.replace("_", " "))
+    return _with_class_id(product, label)

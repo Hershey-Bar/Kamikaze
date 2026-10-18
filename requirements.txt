@@ -2,6 +2,8 @@ mcp>=1.2.0,<2
 msgpack>=1.0.8
 numpy>=1.26
 Pillow>=10.0
+# On-device OCR for text/vision fusion (ocr_fusion.py); optional - recognition runs without it.
+rapidocr-onnxruntime>=1.3
 # Hexagon NPU runtime (npu.py). The QNN delegate comes from Qualcomm's PPA on the board:
 #   sudo add-apt-repository ppa:ubuntu-qcom-iot/qcom-ppa && sudo apt install qairt-libs qairt-dsp-binaries
 ai-edge-litert>=2.0; sys_platform == "linux" and platform_machine == "aarch64"

@@ -174,7 +174,10 @@ def test_http(base: str) -> bool:
     code, _ = http("GET", base, "/static/../receiver.py")
     check("static path traversal blocked", code == 404, f"{code}")
     code, body = http("GET", base, "/static/models/default.glb")
-    check("GET /static/models/default.glb (GLB served)", code == 200 and body[:4] == b"glTF", f"{code}, {len(body)} bytes")
+    check("no substitute default.glb is served", code == 404, f"{code}")
+    code, body = http("GET", base, "/api/settings/mode")
+    mode = json.loads(body) if code == 200 else {}
+    check("GET /api/settings/mode", code == 200 and mode.get("mode") in ("online", "offline"), str(mode))
     return True
 
 

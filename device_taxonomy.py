@@ -57,8 +57,9 @@ PHONE_STRUCTURAL_TAXONOMY = {
     }
 }
 
-# S_phone = 0.65 S_back + 0.15 S_side + 0.10 S_top + 0.10 S_front: the rear shell / camera island dominates identity.
-PHONE_VIEW_WEIGHTS = {"back": 0.65, "side": 0.15, "top": 0.10, "front": 0.10}
+# S_phone = 0.65 S_back + 0.15 S_edge + 0.10 S_top + 0.10 S_front: the rear shell / camera island dominates identity;
+# the right / left edges (and the legacy single "side" view) carry the button-rail / frame weight.
+PHONE_VIEW_WEIGHTS = {"back": 0.65, "right": 0.15, "left": 0.15, "side": 0.15, "top": 0.10, "front": 0.10}
 
 # A weighted *average* of view similarities can never be high for a single physical pose (the camera sees one side at
 # a time), so the weights are applied as per-view reliability: the back view is trusted fully and every other view is

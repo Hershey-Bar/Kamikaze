@@ -10,6 +10,7 @@ Online CAD tests need SKETCHFAB_TOKEN and network access and skip themselves oth
 import json
 import os
 import shutil
+import struct
 import tempfile
 import threading
 import time
@@ -24,6 +25,8 @@ import cad_harvester
 import device_taxonomy
 import entity_resolver
 import mcp_server
+import procedural_glb
+import spec_search
 import taxonomy
 import telemetry
 
@@ -235,7 +238,8 @@ class CadRankerTests(unittest.TestCase):
         tried = []
         with mock.patch.object(cad_harvester, "_search_sketchfab", return_value=sf), \
                 mock.patch.object(cad_harvester, "_search_polypizza", return_value=pp), \
-                mock.patch.object(cad_harvester, "_fetch", side_effect=lambda c, slug: tried.append(c.uid) or c.uid == "p1"):
+                mock.patch.object(cad_harvester, "_download_and_validate",
+                                  side_effect=lambda c, slug: tried.append(c.uid) or c.uid == "p1"):
             cand, source = cad_harvester._try_online(prod, "x", time.monotonic() + 30, ["Pepsi Can"], "exact")
         self.assertEqual((cand.uid, source, tried), ("p1", "Poly Pizza", ["s1", "p1"]))
 
@@ -274,20 +278,103 @@ class CadRankerTests(unittest.TestCase):
                         self.model("b", "Pepsi can", lic="CC0 Public Domain", likes=1))
         self.assertEqual(out[0].uid, "b")
 
-    def test_neutral_placeholder_replaces_red_box(self):
-        import json as _json
-        import struct as _struct
-        import procedural_glb
-        glb = procedural_glb.build_placeholder()
-        self.assertEqual(glb[:4], b"glTF")
-        n = _struct.unpack("<I", glb[12:16])[0]
-        doc = _json.loads(glb[20:20 + n])
-        self.assertEqual(doc["asset"]["extras"]["kind"], procedural_glb.PLACEHOLDER_TAG)
-        for mat in doc["materials"]:
-            r, g, b, _ = mat["pbrMetallicRoughness"]["baseColorFactor"]
-            self.assertLess(max(r, g, b) - min(r, g, b), 0.1, mat)  # grey/silver, never a saturated red box
-        base = doc["materials"][0]["pbrMetallicRoughness"]
-        self.assertEqual((base["metallicFactor"], base["roughnessFactor"]), (0.8, 0.35))
+
+def glb_doc(data: bytes) -> dict:
+    n = struct.unpack("<I", data[12:16])[0]
+    return json.loads(data[20:20 + n])
+
+
+def check_glb_bytes(data: bytes) -> tuple[bool, str, dict]:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "x.glb"
+        path.write_bytes(data)
+        return cad_harvester.validate_glb(path)
+
+
+class SpecGlbTests(unittest.TestCase):
+    """Generated models only exist for verified published dimensions; primitive placeholders fail the quality gate."""
+    S25U = {"verified": True, "category": "smartphone", "maker": "Samsung", "name": "Samsung Galaxy S25 Ultra",
+            "height_mm": 162.8, "width_mm": 77.6, "depth_mm": 8.2, "rear_cameras": 4,
+            "sources": [{"url": "https://www.gsmarena.com/samsung_galaxy_s25_ultra-13322.php", "publisher": "GSMArena"}]}
+
+    def test_can_from_crown_dimensions(self):
+        spec = spec_search.can_specs("coke zero can 330ml")
+        data = procedural_glb.build_from_spec(spec, "coke zero can 330ml")
+        ok, why, info = check_glb_bytes(data)
+        self.assertTrue(ok, why)
+        extras = glb_doc(data)["asset"]["extras"]
+        self.assertEqual(extras["kind"], procedural_glb.SPEC_TAG)
+        self.assertEqual((extras["dimensions_mm"]["diameter"], extras["dimensions_mm"]["height"]), (66.0, 115.2))
+        self.assertTrue(extras["sources"][0]["url"].startswith("https://www.crowncork.com/"))
+
+    def test_phone_from_gsmarena_dimensions(self):
+        data = procedural_glb.build_from_spec(self.S25U, "galaxy s25 ultra")
+        ok, why, info = check_glb_bytes(data)
+        self.assertTrue(ok, why)
+        extras = glb_doc(data)["asset"]["extras"]
+        self.assertEqual((extras["rear_cameras"], extras["dimensions_mm"]["height"]), (4, 162.8))
+
+    def test_primitive_box_and_non_glb_are_rejected(self):
+        m = procedural_glb._Mesh()
+        m.box((0, 0, 0), (0.07, 0.15, 0.008), procedural_glb.NEUTRAL)
+        ok, why, _ = check_glb_bytes(m.to_glb({}))
+        self.assertFalse(ok)
+        self.assertIn("vertices", why)
+        self.assertFalse(check_glb_bytes(b"<html>not a model</html>")[0])
+
+    def test_unverified_spec_never_builds(self):
+        with self.assertRaises(ValueError):
+            procedural_glb.build_from_spec({"verified": False, "category": "beverage_can", "reason": "volume unknown"})
+
+
+class SpecSearchTests(unittest.TestCase):
+    PAGE = ('<td class="nfo" data-spec="dimensions">162.8 x 77.6 x 8.2 mm (6.41 x 3.06 x 0.32 in)</td>'
+            '<td class="nfo" data-spec="weight">218 g (7.69 oz)</td>'
+            '<td class="nfo" data-spec="cam1modules">200 MP, f/1.7 (wide)<br>50 MP, f/1.9 (periscope telephoto)<br>'
+            '10 MP, f/2.4 (telephoto)<br>50 MP, f/1.9 (ultrawide)</td>')
+    INDEX = ({9: "Samsung", 48: "Apple"},
+             [[9, 13322, "Galaxy S25 Ultra", ""], [9, 13324, "Galaxy S25", ""], [48, 13064, "iPhone 16 Pro Max", ""]])
+
+    def test_parse_phone_page(self):
+        spec = spec_search.parse_phone_page(self.PAGE)
+        self.assertEqual((spec["height_mm"], spec["width_mm"], spec["depth_mm"], spec["rear_cameras"], spec["weight_g"]),
+                         (162.8, 77.6, 8.2, 4, 218.0))
+        with self.assertRaises(spec_search.SpecError):
+            spec_search.parse_phone_page("<html>no specs</html>")
+
+    def test_find_phone_exact_tier_only(self):
+        self.assertEqual(spec_search.find_phone("Samsung", "Galaxy S25 Ultra", self.INDEX), ("Samsung", 13322, "Galaxy S25 Ultra"))
+        self.assertEqual(spec_search.find_phone("Samsung", "Galaxy S25", self.INDEX)[1], 13324)
+        self.assertEqual(spec_search.find_phone("Apple", "iPhone 16 Pro Max", self.INDEX)[1], 13064)
+        self.assertIsNone(spec_search.find_phone("Apple", "iPhone 16 Pro", self.INDEX))
+        self.assertIsNone(spec_search.find_phone("Samsung", "Galaxy S24 Ultra", self.INDEX))
+        self.assertEqual(spec_search.phone_page_url("Samsung", 13322, "Galaxy S25 Ultra"),
+                         "https://www.gsmarena.com/samsung_galaxy_s25_ultra-13322.php")
+
+    def test_volume_parsing(self):
+        vol = spec_search.volume_ml
+        self.assertEqual((vol("330ml"), vol("12 oz"), vol("0.5l"), vol("33cl")), (330, 355, 500, 330))
+        self.assertIsNone(vol("400ml"))
+        self.assertIsNone(vol("coke zero can"))
+
+    def test_can_specs(self):
+        std = spec_search.can_specs("coke zero can 330ml")
+        self.assertTrue(std["verified"])
+        self.assertEqual((std["diameter_mm"], std["height_mm"], std["neck_diameter_mm"], std["profile_assumed"]),
+                         (66.0, 115.2, 54.0, True))
+        self.assertEqual(spec_search.can_specs("330ml sleek can")["diameter_mm"], 58.0)
+        self.assertFalse(spec_search.can_specs("coke zero can")["verified"])
+        self.assertIn("volume", spec_search.can_specs("coke zero can")["reason"])
+        self.assertFalse(spec_search.can_specs("330ml slim can")["verified"])
+
+    def test_phone_specs_verified_only_from_gsmarena(self):
+        with mock.patch.object(spec_search, "_quicksearch_index", return_value=self.INDEX), \
+                mock.patch.object(spec_search, "_get", return_value=self.PAGE.encode()):
+            spec = spec_search.phone_specs("Samsung", "Galaxy S25 Ultra")
+            self.assertTrue(spec["verified"], spec)
+            self.assertEqual(spec["sources"][0]["url"], "https://www.gsmarena.com/samsung_galaxy_s25_ultra-13322.php")
+            self.assertFalse(spec_search.phone_specs("Samsung", "Galaxy S24 Ultra")["verified"])
+            self.assertFalse(spec_search.phone_specs("Google", "Pixel 9")["verified"])
 
 
 class CadCacheTests(unittest.TestCase):
@@ -303,50 +390,93 @@ class CadCacheTests(unittest.TestCase):
         self.ids.append(cid)
         return cad_harvester._with_class_id(entity_resolver.resolve(text), cid)
 
-    def test_offline_fallback_is_cached_into_static_models_with_attribution(self):
+    GOOD = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.GOOD = procedural_glb.build_can_spec(66.0, 115.2, 54.0)
+
+    def assert_no_model(self, cid):
+        self.assertFalse(cad_harvester.glb_path(cid).exists())
+        self.assertIsNone(cad_harvester.read_attribution(cid))
+
+    def test_offline_without_cache_is_not_found(self):
         prod = self.product("coke zero can 330ml", "offline_can")
-        first = cad_harvester.harvest(prod, offline=True)
+        out = cad_harvester.harvest(prod, offline=True)
+        self.assertEqual((out["status"], out["glb_url"]), ("not_found", ""))
+        self.assertIn("offline", out["reason"])
+        self.assert_no_model(prod.class_id)
+        self.assertEqual(cad_harvester.harvest(prod, source="local")["status"], "not_found")
+
+    def test_upload_is_cached_with_attribution(self):
+        prod = self.product("iphone 13", "upload")
+        out = cad_harvester.upload_glb(prod.class_id, self.GOOD, "my_iphone13.glb", "Apple iPhone 13")
+        self.assertEqual((out["status"], out["source"], out["glb_url"]), ("cached", "upload", f"/static/models/{prod.class_id}.glb"))
+        attr = cad_harvester.read_attribution(prod.class_id)
+        self.assertEqual((attr["author"], attr["filename"]), ("user upload", "my_iphone13.glb"))
         glb = cad_harvester.glb_path(prod.class_id)
         self.assertEqual(glb.parent.resolve(), (ROOT / "static" / "models").resolve() if "KAMIKAZE_MODELS_DIR" not in os.environ
                          else Path(os.environ["KAMIKAZE_MODELS_DIR"]).resolve())
-        self.assertTrue(mcp_server.is_valid_glb(glb))
-        self.assertEqual(first["glb_url"], f"/static/models/{prod.class_id}.glb")
-        attr = cad_harvester.read_attribution(prod.class_id)
-        self.assertTrue(attr and attr["author"] and attr["license"])
-        self.assertIn("Kamikaze", attr["author"])
-        second = cad_harvester.harvest(prod, offline=True)
-        self.assertEqual((second["status"], second["source"], second["cached"]), ("cached", "local-cache", True))
-        self.assertTrue(second["credit"])
+        again = cad_harvester.harvest(prod, offline=True)
+        self.assertEqual((again["status"], again["source"], again["cached"]), ("cached", "local-cache", True))
+        self.assertTrue(again["credit"])
+
+    def test_bad_upload_is_rejected_and_keeps_existing_model(self):
+        prod = self.product("iphone 13", "bad_upload")
+        cad_harvester.upload_glb(prod.class_id, self.GOOD, "good.glb")
+        before = cad_harvester.glb_path(prod.class_id).read_bytes()
+        with self.assertRaises(ValueError):
+            cad_harvester.upload_glb(prod.class_id, b"<html>nope</html>", "bad.glb")
+        m = procedural_glb._Mesh()
+        m.box((0, 0, 0), (0.07, 0.15, 0.008), procedural_glb.NEUTRAL)
+        with self.assertRaisesRegex(ValueError, "vertices"):
+            cad_harvester.upload_glb(prod.class_id, m.to_glb({}), "box.glb")
+        self.assertEqual(cad_harvester.glb_path(prod.class_id).read_bytes(), before)
+        self.assertEqual(cad_harvester.read_attribution(prod.class_id)["filename"], "good.glb")
 
     def test_delete_cached_removes_glb_and_sidecar(self):
         prod = self.product("iphone 13", "delete_cad")
-        cad_harvester.harvest(prod, offline=True)
+        cad_harvester.upload_glb(prod.class_id, self.GOOD, "x.glb")
         self.assertTrue(cad_harvester.glb_path(prod.class_id).exists())
         self.assertTrue(cad_harvester.delete_cached(prod.class_id))
-        self.assertFalse(cad_harvester.glb_path(prod.class_id).exists())
-        self.assertIsNone(cad_harvester.read_attribution(prod.class_id))
+        self.assert_no_model(prod.class_id)
         self.assertFalse(cad_harvester.delete_cached(prod.class_id))
 
-    def test_glb_without_attribution_is_reharvested(self):
+    def test_glb_without_attribution_is_never_shown(self):
         prod = self.product("iphone 14", "no_sidecar")
-        cad_harvester.harvest(prod, offline=True)
+        cad_harvester.upload_glb(prod.class_id, self.GOOD, "x.glb")
         cad_harvester.sidecar_path(prod.class_id).unlink()
         out = cad_harvester.harvest(prod, offline=True)
-        self.assertFalse(out["cached"])
-        self.assertTrue(cad_harvester.read_attribution(prod.class_id))
+        self.assertEqual(out["status"], "not_found")
+        self.assertFalse(cad_harvester.glb_path(prod.class_id).exists())
 
     def test_credits_listing_includes_author_and_licence(self):
         prod = self.product("pepsi can", "credits")
-        cad_harvester.harvest(prod, offline=True)
+        cad_harvester.upload_glb(prod.class_id, self.GOOD, "pepsi.glb")
         row = next(c for c in cad_harvester.credits() if c.get("class_id") == prod.class_id)
         self.assertTrue(row["author"] and row["license"])
-        credits_md = cad_harvester.models_dir() / "CREDITS.md"
-        self.assertTrue(credits_md.exists())
+        self.assertTrue((cad_harvester.models_dir() / "CREDITS.md").exists())
+
+    def test_generate_from_verified_specs_only(self):
+        prod = self.product("coke zero can 330ml", "spec_can")
+        out = cad_harvester.generate_from_specs(prod)
+        self.assertEqual((out["status"], out["badge"]), ("generated", cad_harvester.SPEC_BADGE))
+        self.assertTrue(cad_harvester.validate_glb(cad_harvester.glb_path(prod.class_id))[0])
+        attr = cad_harvester.read_attribution(prod.class_id)
+        self.assertIn("crowncork.com", attr["source_url"])
+        self.assertEqual(cad_harvester.harvest(prod, offline=True)["badge"], cad_harvester.SPEC_BADGE)
+        vague = self.product("coke zero can", "spec_vague")
+        out = cad_harvester.generate_from_specs(vague)
+        self.assertEqual(out["status"], "not_found")
+        self.assertIn("volume", out["reason"])
+        self.assert_no_model(vague.class_id)
 
     @unittest.skipUnless(online(), "needs SKETCHFAB_TOKEN and network access")
     def test_live_sketchfab_download_records_original_author(self):
         prod = self.product("Samsung Galaxy S24 Ultra", "live_s24u")
         out = cad_harvester.harvest(prod, force=True)
+        if out["status"] == "not_found":
+            self.skipTest(f"no exact-match model online right now: {out['reason']}")
         self.assertTrue(mcp_server.is_valid_glb(cad_harvester.glb_path(prod.class_id)))
         attr = out["attribution"]
         self.assertTrue(attr["author"] and attr["license"] and attr["source"], attr)
@@ -410,8 +540,10 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         self.assertEqual(st["phase"], "done", st)
         return st
 
-    def test_views_are_front_back_side_top(self):
-        self.assertEqual(tuple(taxonomy.VIEWS), ("front", "back", "side", "top"))
+    def test_views_are_front_right_back_left_top(self):
+        self.assertEqual(tuple(taxonomy.VIEWS), ("front", "right", "back", "left", "top"))
+        self.assertEqual(taxonomy.canonical_view("side"), "right")
+        self.assertEqual(taxonomy.canonical_view("detail"), "top")
 
     def test_fresh_empty_database_serves_state_and_classes(self):
         status, state = self.call("GET", "/api/state")
@@ -473,7 +605,7 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         if keep:
             self.skipTest("a real cached model for iphone_15_pro exists; not deleting it in tests")
         try:
-            cad_harvester.harvest(entity_resolver.resolve("iphone 15 pro"), offline=True)
+            cad_harvester.upload_glb(cid, procedural_glb.build_can_spec(66.0, 115.2, 54.0), "test.glb")
             self.assertTrue(cad_harvester.glb_path(cid).exists())
             self.assertTrue(cad_harvester.sidecar_path(cid).exists())
             status, out = self.call("DELETE", f"/api/classes/{cid}")
@@ -489,7 +621,7 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         assets = self.receiver.AssetManager()
         started, release = threading.Event(), threading.Event()
 
-        def slow_retrieve(label, meta=None, force=False, offline=False):
+        def slow_retrieve(label, meta=None, force=False, offline=False, source="auto"):
             started.set()
             release.wait(5)
             path = cad_harvester.glb_path(label)
@@ -533,13 +665,29 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         self.assertEqual((status, out["class_id"], out["sub_tier"]), (200, "galaxy_s23_plus", "plus"))
         cid = "iphone_13"
         had = cad_harvester.glb_path(cid).exists()
+        if had:
+            self.skipTest("a real iphone_13 model is cached in this checkout")
+        cand = cad_harvester.Candidate(provider="sketchfab", title="Apple iPhone 13", score=99.0, author="Test Author",
+                                       author_url="https://sketchfab.com/test", license="CC Attribution",
+                                       source_url="https://sketchfab.com/3d-models/x", uid="abc")
+
+        def found(product, slug, deadline, queries, level, providers=cad_harvester.PROVIDERS):
+            mcp_server.local_glb_path(slug).write_bytes(procedural_glb.build_can_spec(66.0, 115.2, 54.0))
+            return cand, "Sketchfab"
+
         try:
-            with mock.patch.object(cad_harvester, "_try_online", return_value=None), \
-                    mock.patch.object(cad_harvester, "_try_khronos", return_value=None):
+            with mock.patch.object(cad_harvester, "_try_online", return_value=None):
                 status, out = self.call("POST", "/api/cad/fetch", {"label": cid})
             self.assertEqual(status, 200, out)
+            self.assertEqual((out["status"], out["glb_url"]), ("not_found", ""), out)
+            self.assertTrue(out["reason"])
+            row = next(p for p in self.call("GET", "/api/classes")[1]["prototypes"] if p["class_id"] == cid)
+            self.assertEqual(row["cad_status"], "missing")
+            with mock.patch.object(cad_harvester, "_try_online", side_effect=found):
+                status, out = self.call("POST", "/api/cad/fetch", {"label": cid})
+            self.assertEqual((status, out["status"]), (200, "online"), out)
             self.assertTrue(out["glb_url"].endswith(f"{cid}.glb"))
-            self.assertTrue(out["credit"])
+            self.assertIn("Test Author", out["credit"])
             row = next(p for p in self.call("GET", "/api/classes")[1]["prototypes"] if p["class_id"] == cid)
             self.assertEqual(row["cad_status"], "ready")
             self.assertEqual(row["cad_model_url"], out["glb_url"])
@@ -547,9 +695,8 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
             proto = torch.load(self.db, map_location="cpu", weights_only=True)["prototypes"][cid]
             self.assertEqual(proto["cad_model_url"], out["glb_url"])
         finally:
-            if not had:
-                cad_harvester.delete_cached(cid)
-                cad_harvester.write_credits_md()
+            cad_harvester.delete_cached(cid)
+            cad_harvester.write_credits_md()
 
     def test_telemetry_endpoint_reports_real_stats(self):
         self.enroll("Pepsi can", 19, frames=3)
@@ -1205,9 +1352,10 @@ class DeviceTaxonomyTests(unittest.TestCase):
     """Phone tiers, rear-weighted view reliability, front-screen detection and the detector domain gate."""
 
     def test_view_reliability_ranks_back_first(self):
-        rel = {v: device_taxonomy.view_reliability(v) for v in ("back", "side", "top", "front")}
+        rel = {v: device_taxonomy.view_reliability(v) for v in ("back", "right", "top", "front")}
         self.assertEqual(rel["back"], 1.0)
-        self.assertGreater(rel["side"], rel["top"])
+        self.assertGreater(rel["right"], rel["top"])
+        self.assertEqual(device_taxonomy.view_reliability("left"), rel["right"])
         self.assertAlmostEqual(rel["top"], rel["front"])
         self.assertEqual(device_taxonomy.view_reliability(None), 1.0)
         self.assertEqual(device_taxonomy.view_reliability("global"), 1.0)

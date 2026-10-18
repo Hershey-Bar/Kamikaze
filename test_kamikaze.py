@@ -178,29 +178,59 @@ class OnboardCameraTests(unittest.TestCase):
 
 
 class FallbackTests(unittest.TestCase):
-    def test_every_target_has_cached_model(self):
-        for label in mcp_server.TARGET_LABELS:
-            entry = mcp_server.resolve_fallback(label)
-            self.assertIsNotNone(entry, label)
-            self.assertTrue(entry["model_url"].endswith(".glb"), label)
+    """The offline catalog only ever returns a verified model of the *same* product - never a generic stand-in."""
 
-    def test_variant_kept_in_title(self):
-        self.assertEqual(mcp_server.resolve_fallback("iPhone 15 Pro Max")["title"], "Apple iPhone 15 Pro Max")
-        self.assertEqual(mcp_server.resolve_fallback("Samsung Galaxy S24 Ultra")["title"], "Samsung Galaxy S24 Ultra")
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.patches = [mock.patch.object(mcp_server, "MODELS_DIR", self.dir),
+                        mock.patch.object(mcp_server, "FALLBACK_MODELS", {}),
+                        mock.patch.object(mcp_server, "_search_online", return_value=None)]
+        for p in self.patches:
+            p.start()
 
-    def test_enrolled_class_labels_resolve(self):
-        for label in ("coke_can", "pepsi_can", "s25_ultra"):
-            entry = mcp_server.resolve_fallback(label)
-            self.assertIsNotNone(entry, label)
-            self.assertTrue(entry["model_url"].endswith(".glb"), label)
-        self.assertEqual(mcp_server.resolve_fallback("s25_ultra")["title"], "Samsung Galaxy S25 Ultra")
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmp.cleanup()
 
-    def test_lookup_uses_cache_without_credentials(self):
-        env = {k: v for k, v in os.environ.items() if k not in ("SKETCHFAB_TOKEN", "POLY_PIZZA_API_KEY")}
-        with mock.patch.dict(os.environ, env, clear=True):
-            res = mcp_server.lookup_3d_asset("Sprite")
-        self.assertEqual(res["status"], "cached")
+    def cache(self, stem, canonical):
+        (self.dir / f"{stem}.glb").write_bytes(b"glTF" + b"\x02\x00\x00\x00" + b"\x00" * 64)
+        (self.dir / f"{stem}.json").write_text(json.dumps({"canonical_name": canonical, "attribution_text": "by someone"}))
+
+    def test_product_key_separates_tiers(self):
+        key = mcp_server.product_key
+        self.assertEqual(key("iPhone 15 Pro Max"), "iphone15promax")
+        self.assertEqual(key("apple_iphone_15_pro"), "iphone15pro")
+        self.assertNotEqual(key("iPhone 15 Pro"), key("iPhone 15 Pro Max"))
+        self.assertEqual(key("Samsung Galaxy S24 Ultra"), "galaxys24ultra")
+        self.assertEqual(key("s25_ultra"), "galaxys25ultra")
+        self.assertEqual(key("Galaxy S22+"), "galaxys22plus")
+        self.assertEqual(key("coke zero can"), "can:coke:zero")
+
+    def test_unknown_product_has_no_stand_in(self):
+        for label in ("Sprite", "Apple iPhone 15 Pro Max", "s25_ultra"):
+            self.assertIsNone(mcp_server.resolve_fallback(label), label)
+        res = mcp_server.lookup_3d_asset("Sprite")
         self.assertEqual(set(res), {"title", "model_url", "thumbnail_url", "status"})
+        self.assertEqual((res["status"], res["model_url"]), ("not_found", ""))
+
+    def test_cached_model_matches_only_same_product(self):
+        self.cache("galaxy_s24_ultra", "Samsung Galaxy S24 Ultra")
+        hit = mcp_server.resolve_fallback("Samsung Galaxy S24 Ultra")
+        self.assertEqual(hit["model_url"], "/static/models/galaxy_s24_ultra.glb")
+        self.assertEqual(mcp_server.resolve_fallback("s24_ultra")["title"], "Samsung Galaxy S24 Ultra")
+        self.assertIsNone(mcp_server.resolve_fallback("Samsung Galaxy S24"))
+        self.assertIsNone(mcp_server.resolve_fallback("Samsung Galaxy S25 Ultra"))
+        self.assertEqual(mcp_server.lookup_3d_asset("s24 ultra")["status"], "cached")
+        (self.dir / "galaxy_s24_ultra.json").unlink()  # no attribution sidecar: not a verified model
+        self.assertIsNone(mcp_server.resolve_fallback("Samsung Galaxy S24 Ultra"))
+
+    def test_curated_fallback_matches_same_product(self):
+        entry = {"title": "S25 Ultra", "model_url": "https://example.org/s25u.glb", "thumbnail_url": "", "attribution": "x"}
+        with mock.patch.dict(mcp_server.FALLBACK_MODELS, {"samsung galaxy s25 ultra": entry}):
+            self.assertEqual(mcp_server.resolve_fallback("s25_ultra")["model_url"], entry["model_url"])
+            self.assertIsNone(mcp_server.resolve_fallback("s24_ultra"))
 
     def test_online_result_marked_online(self):
         fake = {"title": "T", "model_url": "u.glb", "thumbnail_url": "t.jpg"}
@@ -224,20 +254,39 @@ class AssetCacheTests(unittest.TestCase):
         def __exit__(self, *exc):
             return False
 
+    CURATED = {"coke can": {"title": "Coca-Cola can", "model_url": "https://example.org/coke.glb", "thumbnail_url": "",
+                            "attribution": "\u201cCoca-Cola can\u201d by tester (CC-BY)"}}
+
     def test_search_downloads_and_caches_glb(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mcp_server, "MODELS_DIR", Path(tmp)), \
+                mock.patch.object(mcp_server, "FALLBACK_MODELS", self.CURATED), \
                 mock.patch.object(mcp_server, "_search_online", return_value=None), \
-                mock.patch.object(mcp_server.urllib.request, "urlopen", lambda *a, **k: self.FakeResp(self.GLB)) as _:
+                mock.patch.object(mcp_server.urllib.request, "urlopen", lambda *a, **k: self.FakeResp(self.GLB)):
             res = mcp_server.search_3d_asset("coke_can")
             self.assertEqual(res["glb_url"], "/static/models/coke_can.glb")
+            self.assertEqual(res["status"], "cached")
             self.assertTrue((Path(tmp) / "coke_can.glb").is_file())
             self.assertEqual(set(res) & {"title", "model_url", "thumbnail_url", "status"}, {"title", "model_url", "thumbnail_url", "status"})
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mcp_server, "MODELS_DIR", Path(tmp)), \
+                mock.patch.object(mcp_server, "FALLBACK_MODELS", self.CURATED), \
                 mock.patch.object(mcp_server, "_search_online", return_value=None), \
                 mock.patch.object(mcp_server.urllib.request, "urlopen", lambda *a, **k: self.FakeResp(b"<html>nope</html>")):
             res = mcp_server.search_3d_asset("coke_can")
             self.assertNotIn("glb_url", res)
             self.assertFalse((Path(tmp) / "coke_can.glb").exists())
+
+    def test_search_without_verified_source_is_not_found(self):
+        def never(*a, **k):
+            raise AssertionError("nothing to download")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(mcp_server, "MODELS_DIR", Path(tmp)), \
+                mock.patch.object(mcp_server, "FALLBACK_MODELS", {}), \
+                mock.patch.object(mcp_server, "_search_online", return_value=None), \
+                mock.patch.object(mcp_server.urllib.request, "urlopen", never):
+            res = mcp_server.search_3d_asset("Pepsi can")
+            self.assertEqual((res["status"], res["model_url"]), ("not_found", ""))
+            self.assertNotIn("glb_url", res)
+            self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_slugify(self):
         self.assertEqual(mcp_server.slugify("Apple iPhone 15 Pro!"), "apple_iphone_15_pro")
@@ -472,17 +521,17 @@ class BankTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bank.pt"
             bank = receiver.EmbeddingBank(path)
-            info = bank.add_multiview("coke_can", {"front": [unit(1)] * 2, "side": [unit(2)] * 2, "back": [unit(3)] * 2},
+            info = bank.add_multiview("coke_can", {"front": [unit(1)] * 2, "right": [unit(2)] * 2, "back": [unit(3)] * 2},
                                       {"category": "beverage_can"},
-                                      {"front": [desc(0)] * 2, "side": [desc(1)] * 2, "top": [desc(3)]})
-            self.assertEqual(info["pose_views"], ["front", "side"])  # "top" has no MobileNet view: dropped
+                                      {"front": [desc(0)] * 2, "right": [desc(1)] * 2, "top": [desc(3)]})
+            self.assertEqual(info["pose_views"], ["front", "right"])  # "top" has no MobileNet view: dropped
             self.assertTrue(bank.has_pose_views("coke_can"))
             again = receiver.EmbeddingBank(path)
             again.load()
             sims = again.pose_view_sims("coke_can", desc(1))
-            self.assertAlmostEqual(sims["side"], 1.0, places=5)
+            self.assertAlmostEqual(sims["right"], 1.0, places=5)
             self.assertAlmostEqual(sims["front"], 0.0, places=5)
-            self.assertEqual(again.info()[0]["pose_views"], ["front", "side"])
+            self.assertEqual(again.info()[0]["pose_views"], ["front", "right"])
             again.add_multiview("pepsi_can", {"front": [unit(4)]}, {"category": "beverage_can"})
             self.assertFalse(again.has_pose_views("pepsi_can"))
             self.assertEqual(again.pose_view_sims("pepsi_can", desc(0)), {})
@@ -522,11 +571,11 @@ class PoseWorkerTests(unittest.TestCase):
     @needs_torch
     def test_worker_scores_latest_crop_against_view_centroids(self):
         bank = receiver.EmbeddingBank(None)
-        side = np.array([0, 1, 0, 0], np.float32)
-        bank.add_multiview("coke_can", {"front": [unit(1)], "side": [unit(2)], "back": [unit(3)]}, {"category": "beverage_can"},
-                           {"front": [np.array([1, 0, 0, 0], np.float32)], "side": [side],
+        right = np.array([0, 1, 0, 0], np.float32)
+        bank.add_multiview("coke_can", {"front": [unit(1)], "right": [unit(2)], "back": [unit(3)]}, {"category": "beverage_can"},
+                           {"front": [np.array([1, 0, 0, 0], np.float32)], "right": [right],
                             "back": [np.array([0, 0, 1, 0], np.float32)]})
-        emb = FakePoseEmbedder(side)
+        emb = FakePoseEmbedder(right)
         worker = receiver.PoseWorker(emb, bank, hz=1000)
         arr = receiver.preprocess(Image.new("RGB", (64, 64), (10, 20, 30)))
         self.assertIsNone(worker.latest("coke_can"))
@@ -535,11 +584,11 @@ class PoseWorkerTests(unittest.TestCase):
         while worker.latest("coke_can") is None and time.monotonic() < deadline:
             time.sleep(0.01)
         sims = worker.latest("coke_can")
-        self.assertEqual(max(sims, key=sims.get), "side")
+        self.assertEqual(max(sims, key=sims.get), "right")
         self.assertIsNone(worker.latest("pepsi_can"))  # results are tied to the class they were computed for
         yaw, _, best = receiver.pose_mod.PoseEstimator._view_yaw(sims, 0.0)
-        self.assertEqual(best, "side")
-        self.assertAlmostEqual(yaw, 90.0, delta=1.0)  # atan2(w_side, w_front - w_back)
+        self.assertEqual(best, "right")
+        self.assertAlmostEqual(yaw, 90.0, delta=1.0)  # atan2(w_right - w_left, w_front - w_back)
         worker.reset()
         self.assertIsNone(worker.latest("coke_can"))
         slow = receiver.PoseWorker(emb, bank, hz=0.5)

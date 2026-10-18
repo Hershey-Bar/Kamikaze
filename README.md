@@ -13,7 +13,9 @@ Logitech Brio (USB 3.0 on the board, /dev/video0, V4L2 MJPG 1920x1080 @ 30 fps) 
                 MobileNetV3-Large embedder (Hexagon NPU) -> 1280-d unit vector -> few-shot multi-view prototypes
                 DINOv2 ViT-S/14 pose worker (Hexagon NPU, own thread, 10 Hz) -> per-view centroids -> continuous yaw
                 pose.py (OpenCV/NumPy + view matching)   -> pitch/yaw/roll for the 3D viewer
-                cad_harvester.py (Sketchfab + Poly Pizza pooled and popularity-ranked, Khronos)
+                ocr_fusion.py (RapidOCR worker, CPU, ~3 Hz) -> brand/flavour words -> 0.65 vision + 0.35 text
+                cad_harvester.py (Sketchfab + Poly Pizza exact matches, quality gate; else NOT_FOUND ->
+                                  browse / upload / generate from verified specs)
                                                          -> static/models/<class>.glb + attribution
                 /var/run/arduino-router.sock (MessagePack-RPC set_pixels) -> STM32 -> Wire1 (I2C4) -> Modulino Pixels
 ```
@@ -139,10 +141,16 @@ make inference faster; it is always off in deployment mode.
 2. For each view, hold the object inside the reticle and click **Capture [view] & Next**. The server samples the next
    10 frames, keeps only the embedding vectors (no images are written to disk) and advances:
    - **Front (0°)**: upright, label or screen facing the camera
+   - **Right (90°)**: turned a quarter clockwise (phone volume rail, can right profile)
    - **Back (180°)**: turned around (phone camera island, can nutrition panel)
-   - **Side (90°)**: turned a quarter (phone button rail, can profile)
-   - **Top (tilt 30–45°)**: tilted toward the camera (can pull-tab, lens cluster)
+   - **Left (270°)**: turned a further quarter (phone power rail, can left profile)
+   - **Top (tilt 30–45°)**: tilted toward the camera (can pull-tab, lens cluster) - used for pitch
 3. Click **Done** to save. CAD retrieval runs in the background and never blocks enrollment.
+
+Four cardinal views make the yaw unambiguous over the full 360° (a single "side" view cannot tell left from right).
+Databases enrolled with the older 4-view wizard still load: their `side` view is treated as `right` and `detail` as `top`.
+Captures are paused by the lighting gate (below); a view whose frames keep failing it for 3 × frames-per-view (min 30)
+frames is aborted with *capture failed: ...* so the operator can fix the light and retry.
 
 Tips: plain background, even light, object filling about 60–70% of the reticle. Use the red **Delete** button (or
 **Reset all classes**) to remove a bad run; its vectors, `enrolled_classes.pt` entry and cached CAD model are removed at once.
@@ -157,6 +165,10 @@ kept as `enrolled_classes.<embedder>.bak.pt` and the objects must be re-enrolled
 
 Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` / `_arbitrate`):
 
+0. **Lighting gate.** Mean luma and the fraction of blown-out pixels (≥ 250) of the reticle crop (128 px grayscale,
+   < 0.2 ms). Mean < 42 → *Lighting too low. Increase illumination.*; glare fraction > 18% → *Severe glare. Tilt object
+   away from direct light.* The frame is not classified (amber guidance, LEDs amber) and not used for enrollment.
+   `KAMIKAZE_LIGHT_GATE=0` disables it; `KAMIKAZE_LIGHT_MIN_LUMA` / `KAMIKAZE_GLARE_LEVEL` / `KAMIKAZE_GLARE_MAX` tune it.
 1. **Empty-scene gate.** The 75% reticle crop is scored for structure (Laplacian variance and Canny edge density, Canny
    10/30 after a 3×3 blur so dim, soft outlines still register). Only when **both** are low — Laplacian below
    `KAMIKAZE_LAPLACIAN_MIN` (default 8, so smooth metallic cans pass) *and* edge density below `KAMIKAZE_EDGE_MIN` (0.002) — is the frame a blank wall /
@@ -176,7 +188,13 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
    with an EMA `C̄ₜ = 0.25·Cₜ + 0.75·C̄ₜ₋₁` (`KAMIKAZE_EMA_ALPHA`). **IDENTIFIED** needs `C ≥ 0.70` *and* margin `Δ ≥ 0.15`
    for 3 consecutive frames (green, LEDs 1–8 by confidence); `0.25 ≤ C < 0.70` or `Δ < 0.15` is **GUIDING** (amber
    `(255,120,0)`, 4 LEDs); `C < 0.25` is **SEARCHING** (dim cyan `(0,100,150)`, 1 LED).
-4. **Smartphones.** Views are weighted back 0.65 / side 0.15 / top 0.10 / front 0.10 (`device_taxonomy.py`). Because the camera
+   **OCR fusion.** RapidOCR (ONNX Runtime, CPU) reads the crop in its own worker at ~3 Hz (`KAMIKAZE_OCR_HZ`; ~170 ms per
+   read on the QCS8275 CPU, so it never runs in the frame path). Words read in the last 1.5 s are matched against each
+   candidate's brand / flavour / variant words: `S = 0.65·S_vision + 0.35·S_text` on the raw cosine, before calibration,
+   for the top 5 candidates. `S_text` is 1.0 for brand + detail, 0.6 for brand only, 0.4 for detail only and 0.0 when
+   another brand's name is in view; classes with no informative words (or sizes such as `330ml`, printed on every brand)
+   keep their pure vision score, so text alone can never identify an object. `KAMIKAZE_OCR=0` disables it.
+4. **Smartphones.** Views are weighted back 0.65 / right 0.15 / left 0.15 / top 0.10 / front 0.10 (`device_taxonomy.py`). Because the camera
    sees one face at a time, the weights act as per-view reliability (back × 1.00, side × 0.81, top/front × 0.79): only the rear
    shell can push a phone over the IDENTIFIED floor. If the live frame matches a phone's screen better than its back,
    confidence is capped at 35%, LEDs go amber and the banner says *Front screen detected. Flip phone 180° to expose camera
@@ -184,49 +202,64 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
    (Pro LiDAR aperture, Ultra boxy corners + periscope, iPhone lens layout, Apple vs Samsung island).
 5. **Pose.** A separate pose worker thread runs DINOv2 ViT-S/14 on the NPU (rate-capped at `KAMIKAZE_POSE_HZ`, 10 Hz) on
    the identified crop. During enrollment each view also stores a 768-d DINOv2 centroid ([CLS | mean patch]); live, the
-   cosines to the Front / Side / Back centroids give `w = max(0, cos)` weights and `yaw = atan2(w_side, w_front − w_back)`;
-   pitch comes from the Top-view weight plus the perspective taper of the object outline. Classes enrolled before the pose worker existed fall back to MobileNet view centroids
+   descriptor is compared with the view centroids after subtracting their mean (the shared object identity cancels, so
+   neighbouring views separate), the similarities are soft-maxed and blended on the yaw circle (front 0°, right +90°,
+   back 180°, left −90°): a continuous, unambiguous 360° yaw. Pitch comes from the Top-view weight plus the perspective taper of the object outline. Classes enrolled before the pose worker existed fall back to MobileNet view centroids
    (`pose.source` = `mobilenet-views` instead of `dinov2-npu`); re-enroll them for DINOv2 pose. `KAMIKAZE_POSE_DINO=0`
    disables the worker.
 
 ## Dashboard
 
 Two columns. **Left**, top to bottom: live camera (16:9) with the 75% corner-bracket reticle, status pill and guidance
-banner; the guided 4-angle training console (name + category, Capture Front 0° → Back 180° → Side 90° → Top); a 2×2 grid
+banner (plus a lighting pill); the guided 5-view training console (name + category, Capture Front 0° → Right 90° →
+Back 180° → Left 270° → Top); a 2×2 grid
 of telemetry cards — Host QCS8275 (junction °C, per-core GHz, load), Memory (16 GB LPDDR5 used/total), STM32H5F5 bridge
 (`set_pixels` RPC ms, LEDs, router socket) and Edge-AI pipeline (NPU runtime, embed/detect ms, DINOv2 pose ms, fps,
-calibrated similarity %, margin %, scene-gate values, active detector domain).
+calibrated similarity %, margin %, scene-gate values, active detector domain, OCR words read and the fused score).
 **Right** (sticky): the interactive 3D CAD stage (`<model-viewer>`, ≥ 620 px tall, `environment-image="neutral"`,
 `exposure="1.0"`, `shadow-intensity="1.2"`, `tone-mapping="aces"`; Auto Rotate / **Sync Physical Pose** / Re-Fetch CAD
 for Active; author + licence badge), then the enrolled classes table (Name · Category · Views · CAD · Re-Fetch CAD ·
 Delete) and **PURGE DATABASE**. Sync Physical Pose drives `camera-orbit` from the live yaw/pitch; the pill shows the
-pose and its source. Until a model is found the stage shows a neutral brushed-metal placeholder (grey-silver PBR,
-metallic 0.8, roughness 0.35), never an untextured red box.
+pose and its source. An **Online / Offline** toggle and a source selector (Auto, Sketchfab, Poly Pizza, Local cache)
+sit above the stage. A class without a verified model shows an empty stage with a **3D MODEL NOT FOUND** overlay and
+the reason, plus three explicit choices: **Browse options** (top ranked online candidates with thumbnail, author,
+licence and score; one click downloads, validates and attaches the chosen one), **Upload GLB** (validated like any
+download, credited as a user upload) and **Generate from specs** (below). Nothing is ever substituted automatically.
 
 ## 3D models and attribution
 
+**Policy: no made-up models.** The stage only ever shows a model that is a verified match for the class, a model the
+operator picked or uploaded, or a model generated from verified published dimensions (and labelled as such). Otherwise
+the class is **NOT_FOUND**.
+
 `cad_harvester.build_search_queries()` turns plain text into a cascade of queries, most specific first
-(`s25 ultra` -> `Samsung Galaxy S25 Ultra`, `Samsung S25 Ultra`, `Galaxy S25 Ultra`, `Galaxy S24 Ultra`, `Smartphone`).
-At each level (exact → similar → category) every query is sent to Sketchfab (downloadable, non-NC licences) and Poly
-Pizza (`https://api.poly.pizza/v1.1/search/{query}`, `X-Auth-Token`); the results are pooled, de-duplicated and ranked by
+(`s25 ultra` -> `Samsung Galaxy S25 Ultra`, `Samsung S25 Ultra`, `Galaxy S25 Ultra`, ...). The automatic harvest sends
+only the **exact** level to Sketchfab (downloadable, non-NC licences) and Poly Pizza (`X-Auth-Token`); results are
+pooled and ranked by
 
     RankScore = relevance(title, level) + popularity
     popularity = min(25, 2.5·ln(1 + likes) + 0.75·ln(1 + views) + 4·staff_pick)     (Sketchfab)
     popularity = 6 − 0.5·rank position                                               (Poly Pizza: no counts exposed)
 
-and the best four are tried for download. Neither API returns download counts, and raw `likes × 3` would let a famous
-but wrong model beat an exact title match, so popularity is log-scaled and capped below the gap between relevance
-levels. Relevance rejects any title naming another brand or drink type (a Kirkland sparkling water never becomes a
-Coca-Cola or "Cola Can") and penalises another flavour or phone tier. Generic titles hide liveries, so tags and
-descriptions are checked too: a "Soda Can" described as "A simple old Pepsi Soda can", or tagged `pepsi` / `cola`, is
-rejected for every other brand, as are `crushed` / `grenade` variants. Plain text such as `Kirkland Grapefruit` resolves
-to brand *Kirkland*, flavour *grapefruit*, drink type *sparkling water* (`kirkland_grapefruit_can`) and searches
-`Kirkland Grapefruit Can` → `Kirkland Can`, `Grapefruit Sparkling Water Can`, `Grapefruit Seltzer Can` → `Soda Can`; on
-the live APIs this picks the most-liked unbranded soda can (Sketchfab "Soda Can" by sunich, CC-BY). After the online
-sources come Khronos sample assets,
-then a procedural model (neutral grey-silver for unknown brands). Every downloaded model gets a JSON sidecar
-with title, author, author URL, licence and source; credits are shown in the dashboard and written to
-`static/models/CREDITS.md`.
+Neither API returns download counts, and raw `likes × 3` would let a famous but wrong model beat an exact title match,
+so popularity is log-scaled and capped. Relevance rejects any title, tag or description naming another brand or drink
+type (a Kirkland sparkling water never becomes a Coca-Cola) and penalises another flavour or phone tier. The similar
+and category levels (`Grapefruit Seltzer Can`, `Soda Can`, `Smartphone`) are only offered through **Browse options**.
+
+Every download passes a **quality gate** (`validate_glb`): valid GLB 2.0 container, ≥ 200 unique vertices (rejects
+boxes and placeholder primitives), ≤ 350k vertices, ≤ 35 MB, at least one material. Rejected files are deleted and the
+next candidate is tried. A GLB without its attribution sidecar is never shown.
+
+**Generate from specs** (`spec_search.py` + `procedural_glb.py`) builds a dimension-calibrated GLB only from published
+numbers: smartphones from the GSMArena spec page (height × width × depth in mm; Apple and Samsung), cans from Crown's
+standard can table (the class must state its volume, e.g. `330ml`, snapped to a Crown size within 3%; 330 ml standard
+= Ø 66 mm × 115.2 mm, neck 54 mm). Corner radius, bezels, lens layout and can neck shape are approximations and are
+listed in the sidecar; the model is neutral (no brand graphics) and the stage shows the badge *Estimated Model:
+Dimensionally Calibrated via Spec Search*. If no verified spec is found it stays NOT_FOUND.
+
+In **Offline** mode (or source *Local cache*) only cached, attributed models are used; browse and spec generation need
+online mode. Every model has a JSON sidecar with title, author, author URL, licence and source; credits are shown in the
+dashboard and written to `static/models/CREDITS.md`.
 
 ## API
 
@@ -246,7 +279,12 @@ with title, author, author URL, licence and source; credits are shown in the das
 | POST | `/api/classes/<id>/fetch_cad` | force a background CAD re-harvest for one class (202; 404 if not enrolled) |
 | POST | `/api/classes/purge` | wipe all classes, delete `enrolled_classes.pt` and the CAD cache (`{"delete_cad": false}` keeps models) |
 | POST | `/api/classes/reset` | delete all classes and their CAD cache |
-| POST | `/api/resolve`, `/api/cad/fetch` | plain-text resolution, CAD retrieval |
+| POST | `/api/resolve`, `/api/cad/fetch` | plain-text resolution, CAD retrieval (`status: not_found` + `reason` when nothing verified exists) |
+| GET, POST | `/api/settings/mode` | `{"mode": "online"\|"offline", "source": "auto"\|"sketchfab"\|"polypizza"\|"local"}` |
+| GET | `/api/classes/<id>/cad_candidates?source=&limit=4` | ranked online candidates, nothing downloaded (409 offline, 404 not enrolled) |
+| POST | `/api/classes/<id>/cad_select` `{"uid": ...}` | download + validate + attach a browsed candidate |
+| POST | `/api/classes/<id>/upload_cad?filename=x.glb` | raw GLB body (≤ `KAMIKAZE_CAD_UPLOAD_MB`, 35); 422 when it fails the quality gate |
+| POST | `/api/classes/<id>/generate_spec` | dimension-calibrated GLB from verified specs (404 + reason when no spec is found) |
 | GET | `/api/credits`, `/api/db/export`; POST `/api/db/save` | attribution, database export/save |
 
 `mcp_server.py` exposes the same capabilities as FastMCP tools over stdio (`search_3d_asset`, `actuate_modulino`,

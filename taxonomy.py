@@ -8,28 +8,33 @@ from __future__ import annotations
 import re
 
 CATEGORIES = ("beverage_can", "beverage_bottle", "smartphone")
-VIEWS = ("front", "back", "side", "top")
-VIEW_YAW = {"front": 0.0, "side": 90.0, "back": 180.0}
-LEGACY_VIEW_ALIASES = {"detail": "top"}
+# Four cardinal yaw views (front 0, right 90, back 180, left 270) make the yaw circle unambiguous - a single "side"
+# view cannot tell a +90 from a -90 turn - and "top" (tilted 30-45 deg) anchors pitch.
+VIEWS = ("front", "right", "back", "left", "top")
+VIEW_YAW = {"front": 0.0, "right": 90.0, "back": 180.0, "left": 270.0}
+LEGACY_VIEW_ALIASES = {"detail": "top", "side": "right"}
 
 VIEW_STEPS = {
     "beverage_can": {
-        "front": ("Front (0°)", "Face the main label / branding toward the camera."),
-        "back": ("Back (180°)", "Rotate the can to show the barcode and nutrition facts."),
-        "side": ("Side (90°)", "Turn the can a quarter-turn to show its profile and seam."),
-        "top": ("Top / detail", "Tilt the can toward the camera to show the pull-tab."),
+        "front": ("Front (0?)", "Face the main label / branding toward the camera."),
+        "right": ("Right (90?)", "Turn the can a quarter-turn clockwise (seen from above)."),
+        "back": ("Back (180?)", "Keep turning to show the barcode and nutrition facts."),
+        "left": ("Left (270?)", "One more quarter-turn clockwise to show the other side."),
+        "top": ("Top (tilt 30-45?)", "Tilt the can toward the camera to show the pull-tab."),
     },
     "beverage_bottle": {
-        "front": ("Front (0°)", "Face the main label toward the camera."),
-        "back": ("Back (180°)", "Rotate the bottle to show the barcode and nutrition facts."),
-        "side": ("Side (90°)", "Turn the bottle a quarter-turn to show its profile."),
-        "top": ("Cap / detail", "Hold the bottle so the cap and neck fill the box."),
+        "front": ("Front (0?)", "Face the main label toward the camera."),
+        "right": ("Right (90?)", "Turn the bottle a quarter-turn clockwise (seen from above)."),
+        "back": ("Back (180?)", "Keep turning to show the barcode and nutrition facts."),
+        "left": ("Left (270?)", "One more quarter-turn clockwise to show the other side."),
+        "top": ("Cap (tilt 30-45?)", "Tilt the bottle so the cap and neck face the camera."),
     },
     "smartphone": {
-        "front": ("Front (0°)", "Show the screen side facing the camera."),
-        "back": ("Back (180°)", "Flip the phone to show the rear shell and camera island."),
-        "side": ("Side (90°)", "Show the phone edge-on to expose the button rails and frame."),
-        "top": ("Camera island", "Bring the rear camera island close, filling the box."),
+        "front": ("Front (0?)", "Show the screen side facing the camera."),
+        "right": ("Right edge (90?)", "Turn the phone a quarter-turn to show its right edge / button rail."),
+        "back": ("Back (180?)", "Keep turning to show the rear shell and camera island."),
+        "left": ("Left edge (270?)", "One more quarter-turn to show the left edge."),
+        "top": ("Camera island (tilt)", "Tilt the back 30-45? toward the camera so the lens island fills the box."),
     },
 }
 

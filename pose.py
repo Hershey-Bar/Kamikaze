@@ -2,9 +2,10 @@
 
 NumPy only (no OpenCV needed), ~1-2 ms per frame on 72x72 pixels:
   * roll  - principal-axis angle of the foreground mask (image moments), 0 = upright, + = clockwise.
-  * yaw   - view matching: the live descriptor is compared with the enrolled front/side/back centroids and the matches
-            are blended on the yaw circle (front 0, side +/-90, back 180), i.e. yaw = atan2(w_side, w_front - w_back)
-            with softmax view weights. The descriptor is DINOv2 ViT-S/14 (NPU pose worker in receiver.py) when the class
+  * yaw   - view matching: the live descriptor is compared with the enrolled cardinal centroids and the matches are
+            blended on the yaw circle (front 0, right 90, back 180, left 270 = -90), i.e.
+            yaw = atan2(w_right - w_left, w_front - w_back) with softmax view weights - unambiguous over 360 degrees.
+            Legacy banks with a single "side" view fall back to +/-90 with the last known side. The descriptor is DINOv2 ViT-S/14 (NPU pose worker in receiver.py) when the class
             was enrolled with DINOv2 view centroids, else the MobileNet embedding. For phones the apparent width/height
             ratio (oriented-box foreshortening) refines the magnitude.
   * pitch - top-view weight plus the perspective taper of the mask along its major axis.
@@ -24,7 +25,7 @@ BORDER = 4
 MIN_FILL, MAX_FILL = 0.03, 0.92
 MIN_CONTRAST = 18.0
 VIEW_TEMPERATURE = 0.06
-YAW_ANGLES = {"front": 0.0, "side": 90.0, "back": 180.0}
+YAW_ANGLES = {"front": 0.0, "right": 90.0, "back": 180.0, "left": -90.0, "side": 90.0}
 
 
 def _wrap180(deg: float) -> float:
@@ -128,7 +129,8 @@ class PoseEstimator:
         norm = sum(weights.values())
         weights = {v: w / norm for v, w in weights.items()}
         best = max(weights, key=weights.get)
-        side_sign = -1.0 if prev_yaw < -10.0 else 1.0  # the embedding cannot tell left from right: keep the last side
+        # a legacy single "side" view cannot tell left from right: keep the last side (right/left banks never need this)
+        side_sign = -1.0 if prev_yaw < -10.0 and not ({"right", "left"} & weights.keys()) else 1.0
         x = y = 0.0
         for view, w in weights.items():
             if view in YAW_ANGLES:
@@ -152,12 +154,12 @@ class PoseEstimator:
         mask = segment(small)
         prev = self._pose or {"pitch": 0.0, "yaw": 0.0, "roll": 0.0}
         if mask is None:
-            out = {**prev, "valid": False, "view": None, "aspect": None, "fill": 0.0}
+            out = {**prev, "valid": False, "view": None, "aspect": None, "fill": 0.0, "yaw360": round(prev["yaw"] % 360.0, 1)}
             out["ms"] = round((time.perf_counter() - t0) * 1000, 2)
             return out
         geo = measure(mask)
 
-        roll = geo["roll"] if geo["elongation"] > 0.12 else 0.0
+        roll = max(-45.0, min(45.0, geo["roll"])) if geo["elongation"] > 0.12 else 0.0
         yaw_view, top_w, best = self._view_yaw(view_sims or {}, prev["yaw"])
         yaw = yaw_view if yaw_view is not None else prev["yaw"]
 
@@ -185,6 +187,7 @@ class PoseEstimator:
         self._pose = sm
         return {
             "pitch": round(sm["pitch"], 1), "yaw": round(sm["yaw"], 1), "roll": round(sm["roll"], 1),
+            "yaw360": round(sm["yaw"] % 360.0, 1),
             "valid": True, "view": best, "aspect": round(geo["aspect"], 3), "fill": round(geo["fill"], 3),
             "ms": round((time.perf_counter() - t0) * 1000, 2),
         }

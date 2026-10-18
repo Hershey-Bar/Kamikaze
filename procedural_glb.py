@@ -1,24 +1,31 @@
-"""Offline procedural GLB generator: brand-coloured soda can / bottle and tier-aware smartphone meshes.
+"""Dimension-calibrated GLB builder for products whose real measurements were verified by spec_search.py.
 
-Used as the last-resort CAD fallback so the 3D viewer always shows a category-appropriate model, even with
-no network. Pure Python (struct + json); output is a valid glTF 2.0 binary with PBR materials.
+There is no generic / placeholder / guessed model here: build_phone_spec() and build_can_spec() only take measured
+dimensions (GSMArena for phones, Crown Holdings for cans), and are only called on an explicit user request for a class
+that has no downloadable CAD. Pure Python (struct + json); output is a valid glTF 2.0 binary with PBR materials, in
+metres, Y up, the phone screen / can label facing +Z (model-viewer's default front view).
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 import struct
 
-BRAND_COLORS = {
-    "coca-cola": ((0.80, 0.05, 0.07), (0.95, 0.95, 0.95)),
-    "pepsi": ((0.05, 0.22, 0.60), (0.80, 0.10, 0.15)),
-    "sprite": ((0.05, 0.55, 0.20), (0.85, 0.95, 0.30)),
-    "red bull": ((0.15, 0.20, 0.45), (0.85, 0.75, 0.10)),
+NEUTRAL = (0.62, 0.64, 0.68)  # grey-silver PBR baseline (metallic 0.8 / roughness 0.35) when no colour is named
+ALUMINIUM = (0.80, 0.81, 0.84)
+GLASS = (0.02, 0.02, 0.03)
+LENS = (0.03, 0.03, 0.04)
+SPEC_TAG = "kamikaze-spec-v1"
+# colour words a user may put in the class name ("s25 ultra titanium black"); only used to tint the frame
+NAMED_COLORS = {
+    "black": (0.08, 0.08, 0.09), "graphite": (0.20, 0.21, 0.23), "titanium": (0.55, 0.55, 0.57),
+    "silver": (0.80, 0.81, 0.84), "white": (0.90, 0.90, 0.91), "gray": (0.45, 0.46, 0.48), "grey": (0.45, 0.46, 0.48),
+    "blue": (0.20, 0.33, 0.55), "navy": (0.10, 0.14, 0.30), "green": (0.25, 0.42, 0.32), "pink": (0.88, 0.70, 0.74),
+    "purple": (0.48, 0.40, 0.60), "violet": (0.48, 0.40, 0.60), "gold": (0.85, 0.74, 0.52), "red": (0.70, 0.08, 0.10),
+    "yellow": (0.95, 0.85, 0.40), "cream": (0.92, 0.89, 0.80), "lavender": (0.72, 0.68, 0.85),
 }
-SILVER = (0.78, 0.79, 0.82)
-NEUTRAL = (0.62, 0.64, 0.68)  # grey-silver PBR baseline (metallic 0.8 / roughness 0.35) for unbranded models
-PLACEHOLDER_TAG = "kamikaze-placeholder-v3"
 
 
 class _Mesh:
@@ -129,85 +136,146 @@ class _Mesh:
                 + struct.pack("<II", len(bin_data), 0x004E4942) + bytes(bin_data))
 
 
-def _brand_colors(brand: str) -> tuple:
-    return BRAND_COLORS.get((brand or "").lower(), (NEUTRAL, (0.86, 0.87, 0.89)))
+def _rounded_outline(w: float, h: float, r: float, segs: int) -> list[tuple[float, float, float, float]]:
+    """Counter-clockwise outline of a w x h rounded rectangle: [(x, y, nx, ny)] with outward normals."""
+    r = max(0.0, min(r, w / 2, h / 2))
+    pts = []
+    for cx, cy, a0 in ((w / 2 - r, h / 2 - r, 0.0), (-w / 2 + r, h / 2 - r, 90.0), (-w / 2 + r, -h / 2 + r, 180.0),
+                       (w / 2 - r, -h / 2 + r, 270.0)):
+        for i in range(segs + 1):
+            a = math.radians(a0 + 90.0 * i / segs)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a), math.cos(a), math.sin(a)))
+    return pts
 
 
-def build_placeholder() -> bytes:
-    """Neutral brushed-metal turntable with an unbranded aluminium can, shown before anything is identified.
-
-    A bare 12 mm disc framed side-on by model-viewer reads as an empty stage, so the stand carries a label-less can
-    (never an untextured red box).
-    """
-    m = _Mesh()
-    m.cylinder((0, 0.006, 0), 0.075, 0.012, NEUTRAL, metallic=0.8, rough=0.35, segs=96)
-    m.cylinder((0, 0.0125, 0), 0.068, 0.001, (0.18, 0.19, 0.21), metallic=0.3, rough=0.6, segs=96)
-    m.cylinder((0, 0.0135, 0), 0.060, 0.001, SILVER, metallic=0.9, rough=0.25, segs=96)
-    y0 = 0.014
-    m.cylinder((0, y0 + 0.0575, 0), 0.033, 0.115, NEUTRAL, metallic=0.8, rough=0.35)
-    m.cylinder((0, y0 + 0.1165, 0), 0.0285, 0.003, SILVER, metallic=0.95, rough=0.25, r_top=0.026)
-    m.cylinder((0, y0 + 0.1185, 0), 0.025, 0.001, SILVER, metallic=0.95, rough=0.3)
-    m.box((0, y0 + 0.1203, 0.004), (0.014, 0.0012, 0.008), (0.55, 0.56, 0.6), metallic=0.95, rough=0.35)
-    return m.to_glb({"kind": PLACEHOLDER_TAG})
-
-
-def build_can(brand: str = "", variant: str = "original", bottle: bool = False) -> bytes:
-    body, accent = _brand_colors(brand)
-    if variant in ("diet", "zero"):
-        body = (0.10, 0.10, 0.12) if variant == "zero" else (0.72, 0.72, 0.76)
-    m = _Mesh()
-    if bottle:
-        m.cylinder((0, 0.085, 0), 0.032, 0.17, (0.85, 0.92, 0.96), metallic=0.0, rough=0.08)
-        m.cylinder((0, 0.100, 0), 0.0325, 0.07, body, metallic=0.1, rough=0.5)
-        m.cylinder((0, 0.19, 0), 0.016, 0.04, (0.85, 0.92, 0.96), metallic=0.0, rough=0.08, r_top=0.013)
-        m.cylinder((0, 0.218, 0), 0.0155, 0.018, accent, metallic=0.1, rough=0.45)
-        return m.to_glb()
-    m.cylinder((0, 0.0575, 0), 0.033, 0.115, body, metallic=0.8 if body == NEUTRAL else 0.7,
-               rough=0.35 if body == NEUTRAL else 0.32)
-    m.cylinder((0, 0.0575, 0), 0.0333, 0.028, accent, metallic=0.3, rough=0.45)
-    m.cylinder((0, 0.1165, 0), 0.0285, 0.003, SILVER, metallic=0.95, rough=0.25, r_top=0.026)
-    m.cylinder((0, 0.1185, 0), 0.025, 0.001, SILVER, metallic=0.95, rough=0.3)
-    m.cylinder((0, 0.0015, 0), 0.026, 0.003, SILVER, metallic=0.95, rough=0.3)
-    m.box((0, 0.1203, 0.004), (0.014, 0.0012, 0.008), (0.55, 0.56, 0.6), metallic=0.95, rough=0.35)
-    return m.to_glb()
-
-
-def build_phone(maker: str = "Apple", tier: str = "standard", lenses: int = 2) -> bytes:
-    apple = maker.lower() == "apple"
-    w, h, d = (0.0715, 0.1467, 0.0078) if apple else (0.0766, 0.1623 if tier == "ultra" else 0.1470, 0.0086)
-    body = (0.22, 0.23, 0.26) if tier in ("pro", "ultra") else (0.45, 0.55, 0.70)
-    m = _Mesh()
-    m.box((0, 0, 0), (w, h, d), body, metallic=0.85 if tier != "standard" else 0.4, rough=0.35)
-    m.box((0, 0, d / 2 + 0.0002), (w - 0.004, h - 0.004, 0.0004), (0.02, 0.02, 0.03), metallic=0.1, rough=0.05)
-    lens_r = 0.0085 if tier != "standard" else 0.0065
-    rear = -d / 2 - 0.0012
-    if apple:
-        island = (0.034, 0.034, 0.0022)
-        ix, iy = -w / 2 + 0.0225, h / 2 - 0.0225
-        m.box((ix, iy, rear + 0.0001), island, (0.12, 0.12, 0.13) if tier == "pro" else (0.35, 0.45, 0.6), metallic=0.5, rough=0.3)
-        spots = ([(-0.009, 0.009), (0.009, 0.009), (0.0, -0.009)] if lenses >= 3 else [(-0.008, 0.008), (0.008, -0.008)])
-        for dx, dy in spots:
-            m.cylinder((ix + dx, iy + dy, rear - 0.0014), lens_r, 0.0022, (0.03, 0.03, 0.04), axis="z", metallic=0.9, rough=0.1)
-        if tier == "pro":
-            m.cylinder((ix + 0.011, iy - 0.011, rear - 0.0014), 0.0028, 0.002, (0.02, 0.02, 0.02), axis="z", metallic=0.2, rough=0.2)
-    else:
-        n = 4 if tier == "ultra" else 3
-        y0 = h / 2 - 0.016
+def rounded_prism(m, c: tuple, w: float, h: float, d: float, r: float, color: tuple, metallic: float, rough: float,
+                  segs: int = 10) -> None:
+    """Rounded-rectangle slab (w along X, h along Y, d along Z) centred on c."""
+    cx, cy, cz = c
+    outline = _rounded_outline(w, h, r, segs)
+    pos, nrm, idx = [], [], []
+    n = len(outline)
+    for x, y, nx, ny in outline:
+        for z in (-d / 2, d / 2):
+            pos.append((cx + x, cy + y, cz + z))
+            nrm.append((nx, ny, 0.0))
+    for i in range(n):
+        j = (i + 1) % n
+        a, b, c2, e = 2 * i, 2 * i + 1, 2 * j, 2 * j + 1
+        idx += [a, c2, b, b, c2, e]
+    for z, nz in ((d / 2, 1.0), (-d / 2, -1.0)):
+        base = len(pos)
+        pos.append((cx, cy, cz + z))
+        nrm.append((0.0, 0.0, nz))
+        for x, y, _, _ in outline:
+            pos.append((cx + x, cy + y, cz + z))
+            nrm.append((0.0, 0.0, nz))
         for i in range(n):
-            y = y0 - i * (0.0205 if tier == "ultra" else 0.0185)
-            m.cylinder((-w / 2 + 0.0135, y, rear - 0.0012), 0.0072 if tier == "ultra" else 0.0068, 0.0022, (0.03, 0.03, 0.04),
-                       axis="z", metallic=0.9, rough=0.1)
-        if tier == "ultra":
-            m.box((w / 2 - 0.016, h / 2 - 0.012, rear), (0.01, 0.008, 0.0012), (0.1, 0.1, 0.1), metallic=0.3, rough=0.3)
-    return m.to_glb()
+            tri = [base, base + 1 + i, base + 1 + (i + 1) % n]
+            idx += tri if nz > 0 else [tri[0], tri[2], tri[1]]
+    m.add(pos, nrm, idx, color, metallic, rough)
 
 
-def build_for(meta: dict) -> bytes:
-    """Pick a procedural model for an enrollment metadata dict."""
-    category = meta.get("category")
-    if category == "smartphone":
-        from taxonomy import phone_profile
+def color_for(text: str) -> tuple | None:
+    low = (text or "").lower()
+    for word, rgb in NAMED_COLORS.items():
+        if re.search(rf"\b{word}\b", low):
+            return rgb
+    return None
 
-        p = phone_profile(meta)
-        return build_phone(p["maker"], p["tier"], p["lenses"])
-    return build_can(meta.get("brand", ""), meta.get("variant", "original"), bottle=category == "beverage_bottle")
+
+def _generation(name: str) -> int:
+    m = re.search(r"(?:iphone|galaxy s|\bs)\s?(\d{1,2})", name.lower())
+    return int(m.group(1)) if m else 0
+
+
+def build_phone_spec(width_mm: float, height_mm: float, depth_mm: float, rear_cameras: int, maker: str,
+                     name: str = "", color: tuple | None = None, extras: dict | None = None) -> bytes:
+    """Phone body at its published outer dimensions with the published number of rear camera modules.
+
+    Approximations (flagged by spec_search): corner radius 11 % of width, 2 % bezel, lens / island size scaled to
+    the width, island layout per maker generation (Apple square island; Samsung S23+ separate lens column, S20-S22
+    rectangular camera housing).
+    """
+    if min(width_mm, height_mm, depth_mm) <= 0 or rear_cameras < 1:
+        raise ValueError("phone dimensions and rear camera count must be positive")
+    w, h, d = width_mm / 1000.0, height_mm / 1000.0, depth_mm / 1000.0
+    body = color or NEUTRAL
+    m = _Mesh()
+    rounded_prism(m, (0, 0, 0), w, h, d, 0.11 * w, body, 0.8, 0.35)
+    bezel = 0.02 * w
+    rounded_prism(m, (0, 0, d / 2 + 0.0002), w - 2 * bezel, h - 2 * bezel, 0.0004, 0.11 * w - bezel, GLASS, 0.1, 0.05)
+    rear = -d / 2
+    gen = _generation(name)
+    n = int(rear_cameras)
+    if maker.lower() == "apple":
+        side = (0.45 if n >= 3 else 0.42) * w
+        bump = 0.0015
+        ix, iy = -w / 2 + 0.045 * w + side / 2, h / 2 - 0.045 * w - side / 2
+        rounded_prism(m, (ix, iy, rear - bump / 2), side, side, bump, 0.22 * side, body, 0.6, 0.25)
+        lr = 0.19 * side
+        q = side * 0.24
+        if n >= 3:
+            spots = [(-q, q), (-q, -q), (q, 0.0)]
+        elif gen in (12, 16):
+            spots = [(-q, q), (-q, -q)]
+        else:
+            spots = [(-q, q), (q, -q)][:n]
+        for dx, dy in spots:
+            m.cylinder((ix + dx, iy + dy, rear - bump - 0.0011), lr, 0.0022, LENS, axis="z", metallic=0.9, rough=0.1)
+            m.cylinder((ix + dx, iy + dy, rear - bump - 0.0023), lr * 0.62, 0.0002, GLASS, axis="z", metallic=0.2, rough=0.02)
+    else:
+        lr = 0.072 * w
+        pitch = 2.75 * lr
+        x = -w / 2 + 0.06 * w + lr
+        y0 = h / 2 - 0.06 * w - lr
+        if gen and gen < 23:
+            hw, hh = 2 * lr + 0.012 * w, (n - 1) * pitch + 2 * lr + 0.024 * w
+            rounded_prism(m, (x, y0 - (n - 1) * pitch / 2, rear - 0.0008), hw, hh, 0.0016, 0.3 * hw, body, 0.6, 0.3)
+            base = rear - 0.0016
+        else:
+            base = rear
+        for i in range(n):
+            y = y0 - i * pitch
+            m.cylinder((x, y, base - 0.0011), lr, 0.0022, LENS, axis="z", metallic=0.9, rough=0.1)
+            m.cylinder((x, y, base - 0.0023), lr * 0.62, 0.0002, GLASS, axis="z", metallic=0.2, rough=0.02)
+    return m.to_glb({"kind": SPEC_TAG, "category": "smartphone",
+                     "dimensions_mm": {"width": width_mm, "height": height_mm, "depth": depth_mm},
+                     "rear_cameras": n, **(extras or {})})
+
+
+def build_can_spec(diameter_mm: float, height_mm: float, neck_diameter_mm: float, neck_height_mm: float = 10.0,
+                   color: tuple | None = None, extras: dict | None = None) -> bytes:
+    """Necked aluminium beverage can at its published overall diameter and height (bottom at y = 0).
+
+    Approximations (flagged by spec_search): lid diameter from the standard end size, straight neck taper.
+    """
+    if min(diameter_mm, height_mm, neck_diameter_mm, neck_height_mm) <= 0 or neck_height_mm >= height_mm:
+        raise ValueError("can dimensions must be positive and the neck shorter than the can")
+    r, h, rn, hn = diameter_mm / 2000.0, height_mm / 1000.0, neck_diameter_mm / 2000.0, neck_height_mm / 1000.0
+    body_h = h - hn
+    shell = color or ALUMINIUM
+    m = _Mesh()
+    m.cylinder((0, body_h / 2, 0), r, body_h, shell, metallic=0.85, rough=0.3, segs=96)
+    m.cylinder((0, body_h + (hn - 0.002) / 2, 0), r, hn - 0.002, ALUMINIUM, metallic=0.85, rough=0.3, segs=96, r_top=rn)
+    m.cylinder((0, h - 0.001, 0), rn, 0.002, ALUMINIUM, metallic=0.9, rough=0.25, segs=96)
+    m.cylinder((0, h + 0.0001, 0), rn * 0.9, 0.0002, (0.70, 0.71, 0.74), metallic=0.9, rough=0.35, segs=96)
+    m.box((0, h + 0.0004, rn * 0.25), (rn * 0.5, 0.0006, rn * 0.55), (0.70, 0.71, 0.74), metallic=0.9, rough=0.35)
+    return m.to_glb({"kind": SPEC_TAG, "category": "beverage_can",
+                     "dimensions_mm": {"diameter": diameter_mm, "height": height_mm, "neck_diameter": neck_diameter_mm},
+                     **(extras or {})})
+
+
+def build_from_spec(spec: dict, label_text: str = "", extras: dict | None = None) -> bytes:
+    """GLB for a verified spec_search result. Raises ValueError when the spec is not verified."""
+    if not spec.get("verified"):
+        raise ValueError(spec.get("reason") or "spec not verified")
+    color = color_for(label_text)
+    meta = {"sources": spec.get("sources", []), "approximations": spec.get("approximations", []), **(extras or {})}
+    if spec["category"] == "smartphone":
+        return build_phone_spec(spec["width_mm"], spec["height_mm"], spec["depth_mm"], spec["rear_cameras"],
+                                spec.get("maker", ""), spec.get("name", ""), color, meta)
+    if spec["category"] == "beverage_can":
+        return build_can_spec(spec["diameter_mm"], spec["height_mm"], spec["neck_diameter_mm"],
+                              spec.get("neck_height_mm", 10.0), color, meta)
+    raise ValueError(f"no spec builder for category {spec['category']!r}")

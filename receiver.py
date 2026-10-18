@@ -21,6 +21,12 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
   POST /api/classes/reset            {"delete_cad": true} drop every enrolled class (and their cached GLBs)
   POST /api/classes/purge            {"delete_cad": true} hard reset: drop every class AND delete enrolled_classes.pt
   POST /api/classes/<id>/fetch_cad   202: re-harvest that class's CAD model in the background and show it in the viewer
+  GET  /api/classes/<id>/cad_candidates[?source=auto|sketchfab|polypizza&limit=4]   ranked online models (no download):
+                                     title, thumbnail, likes, views, faces, author, licence, match level
+  POST /api/classes/<id>/cad_select  {"uid": "..."} download + quality-check the picked candidate as the class model
+  POST /api/classes/<id>/upload_cad  raw GLB body (model/gltf-binary, <= KAMIKAZE_CAD_UPLOAD_MB): operator-supplied model
+  POST /api/classes/<id>/generate_spec   dimension-calibrated GLB from verified published specs (GSMArena / Crown)
+  GET|POST /api/settings/mode        {"mode": "online"|"offline", "source": "auto"|"sketchfab"|"polypizza"|"local"}
   POST /api/resolve                  {"text": "coke zero can 330ml"} -> canonical product (class_id, brand, tier, CAD terms)
   GET  /api/telemetry                SoC identity, thermals, per-core freq/load, RAM, uptime, router IPC, bridge latency,
                                      Wire1/Modulino status, NPU (cDSP/NSP), detector + embedder median/p95, cosine/margin, FPS
@@ -30,7 +36,7 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
   POST /api/unenroll                 {"label": "coke_can"}
   POST /api/enroll/start             multi-view guided enrollment: {"raw_name", "category", "brand", "variant",
                                      "package_type", "container_volume", "frames_per_view": 10}
-  POST /api/enroll/capture           {"view": "front|back|side|top", "wait": false} capture the current/named view
+  POST /api/enroll/capture           {"view": "front|right|back|left|top", "wait": false} capture the current/named view
   POST /api/enroll/finish | /cancel  finish early with the captured views / abort the session
   GET  /api/enroll/status            wizard state (current view, per-view progress + stability)
   GET  /api/pose                     smoothed physical pose {"pitch", "yaw", "roll"}
@@ -45,9 +51,12 @@ COCO fallback) object detection on the Hexagon NPU (npu.py) ->
 square crop around the target inside the central 75% box (temporally smoothed; the fixed center-75% crop when nothing
 is detected) -> 224x224 -> 1280-d MobileNetV3-Large embedding on the NPU (QNN TFLite delegate; ExecuTorch/XNNPACK or
 torch on the Arm CPU as fallbacks) -> L2-normalised vector -> cosine similarity against the multi-view prototypes
-(front/back/side/top centroids + global centroid) -> 5-frame temporal state machine -> Modulino Pixels via the Arduino
-Router socket (STM32 firmware untouched), background 3D CAD retrieval and physical pose estimation (pose.py; yaw from
-DINOv2 ViT-S/14 viewpoint descriptors on the NPU in a separate pose worker thread when the class was enrolled with them).
+(front/right/back/left/top centroids + global centroid), fused 0.65/0.35 with on-device OCR text evidence (ocr_fusion.py,
+RapidOCR on the CPU in its own ~3 Hz worker) -> 5-frame temporal state machine -> Modulino Pixels via the Arduino Router
+socket (STM32 firmware untouched), background 3D CAD retrieval (exact-match + GLB quality gate; NOT_FOUND instead of
+any substitute model) and 360-degree physical pose estimation (pose.py; yaw from DINOv2 ViT-S/14 viewpoint descriptors
+on the NPU in a separate pose worker thread when the class was enrolled with them). A lighting gate (mean luma / specular
+glare of the reticle crop) pauses recognition and enrollment capture under unusable lighting.
 
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
 KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolov8s-worldv2-kz|yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE,
@@ -56,6 +65,8 @@ KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_SLOPE
 EMA_ALPHA (calibrated confidence), KAMIKAZE_CROP_FRACTION (0.75), KAMIKAZE_POSE_DINO (1|0, DINOv2 pose worker),
 KAMIKAZE_POSE_HZ (10, pose worker rate cap),
 KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
+KAMIKAZE_LIGHT_GATE (1|0) / LIGHT_MIN_LUMA (42) / GLARE_LEVEL (250) / GLARE_MAX (0.18), KAMIKAZE_OCR (1|0) / OCR_HZ (3),
+KAMIKAZE_CAD_MODE (online|offline), KAMIKAZE_CAD_SOURCE (auto|sketchfab|polypizza|local), KAMIKAZE_CAD_UPLOAD_MB (35),
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
 KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0),
 KAMIKAZE_CAMERA (auto|/dev/videoN|none), KAMIKAZE_CAM_WIDTH/HEIGHT/FPS (1920/1080/30), KAMIKAZE_DECODE_MAX (default 960:
@@ -111,7 +122,7 @@ import entity_resolver
 import npu as npu_mod
 import onboard_camera
 import pose as pose_mod
-import procedural_glb
+import ocr_fusion
 import taxonomy
 import telemetry
 from mcp_server import (
@@ -170,8 +181,17 @@ SALIENCY_SIZE = 256
 ENROLL_FRAMES = 12
 ENROLL_STALE_S = 15.0
 
-INITIAL_CLASSES = ("coke_can", "pepsi_can", "s25_ultra")
-DEFAULT_GLB_URL = "/static/models/default.glb"
+CAD_OFFLINE_DEFAULT = os.environ.get("KAMIKAZE_CAD_MODE", "online").strip().lower() == "offline"
+CAD_SOURCE_DEFAULT = os.environ.get("KAMIKAZE_CAD_SOURCE", "auto").strip().lower()
+CAD_BROWSE_BUDGET_S = float(os.environ.get("KAMIKAZE_CAD_BROWSE_BUDGET", "25"))
+MAX_UPLOAD_BYTES = int(float(os.environ.get("KAMIKAZE_CAD_UPLOAD_MB", "35")) * 1024 * 1024)
+LIGHT_GATE = os.environ.get("KAMIKAZE_LIGHT_GATE", "1") != "0"
+LIGHT_MIN_LUMA = float(os.environ.get("KAMIKAZE_LIGHT_MIN_LUMA", "42"))
+GLARE_LEVEL = int(os.environ.get("KAMIKAZE_GLARE_LEVEL", "250"))
+GLARE_MAX = float(os.environ.get("KAMIKAZE_GLARE_MAX", "0.18"))
+LIGHT_SIZE = 128
+MSG_LOW_LIGHT = "Lighting too low. Increase illumination."
+MSG_GLARE = "Severe glare. Tilt object away from direct light."
 CAMERA_ORBIT = "45deg 75deg 1.5m"
 MODEL_VIEWER_URL = "https://ajax.googleapis.com/ajax/libs/model-viewer/3.4.0/model-viewer.min.js"
 MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -346,6 +366,26 @@ def scene_saliency(image: Image.Image) -> dict:
     # edge contour, and a false "empty" would block recognition entirely (a false "object" is only scored as background).
     return {"laplacian_var": round(lap, 2), "edge_density": round(edges, 5),
             "empty": lap < LAPLACIAN_MIN and edges < EDGE_MIN}
+
+
+def lighting_check(image: Image.Image) -> dict:
+    """Mean luma + specular-glare fraction of the reticle crop (grayscale, LIGHT_SIZE px). ok=False with a user message
+    when the scene is too dark or blown out to give a trustworthy embedding (recognition and enrollment pause)."""
+    size, left, top = center_crop_box(*image.size)
+    crop = image.crop((left, top, left + size, top + size)).convert("L")
+    if size != LIGHT_SIZE:
+        crop = crop.resize((LIGHT_SIZE, LIGHT_SIZE), Image.BILINEAR)
+    gray = np.asarray(crop, dtype=np.uint8)
+    mean = float(gray.mean())
+    glare = float(np.count_nonzero(gray >= GLARE_LEVEL)) / gray.size
+    issue, message = None, ""
+    if LIGHT_GATE:
+        if mean < LIGHT_MIN_LUMA:
+            issue, message = "low_light", MSG_LOW_LIGHT
+        elif glare > GLARE_MAX:
+            issue, message = "glare", MSG_GLARE
+    return {"ok": issue is None, "issue": issue, "message": message, "mean_luma": round(mean, 1),
+            "glare_fraction": round(glare, 4), "gate": LIGHT_GATE}
 
 
 def build_eager_model():
@@ -664,10 +704,24 @@ class EmbeddingBank:
             return bool(label) and bool(self.pose_views.get(label))
 
     def pose_view_sims(self, label: str, desc: np.ndarray) -> dict[str, float]:
-        """Cosine of a DINOv2 descriptor with the label's per-view DINOv2 centroids ({} if none were enrolled)."""
+        """Similarity of a DINOv2 descriptor with the label's per-view DINOv2 centroids ({} if none were enrolled).
+
+        With >= 3 views the cosine is centred on the mean view centroid: the shared object identity cancels out and only
+        the viewpoint-specific component is compared, which separates neighbouring cardinals (right vs left) far better."""
         with self._lock:
             table = self.pose_views.get(label) or {}
-            return {view: float(np.dot(c.numpy(), desc)) for view, c in table.items()}
+            if not table:
+                return {}
+            views = list(table)
+            cents = np.stack([table[v].numpy().astype(np.float32) for v in views])
+            live = np.asarray(desc, dtype=np.float32)
+            live = live / (np.linalg.norm(live) + 1e-8)
+            if len(views) >= 3:
+                mean = cents.mean(axis=0)
+                cents, live = cents - mean, live - mean
+                cents /= np.linalg.norm(cents, axis=1, keepdims=True) + 1e-8
+                live = live / (np.linalg.norm(live) + 1e-8)
+            return {view: float(np.dot(cents[i], live)) for i, view in enumerate(views)}
 
     def metadata(self, label: str) -> dict | None:
         with self._lock:
@@ -871,7 +925,7 @@ class Enroller:
 
 
 class MultiViewEnroller:
-    """Guided 4-angle enrollment wizard: front -> back -> side -> top, N frames per view.
+    """Guided 360-degree enrollment wizard: front -> right -> back -> left -> top, N frames per view.
 
     Phases: idle -> ready (waiting for the user to present the current view) -> capturing -> ready (next view)
     ... -> done. A view can be re-captured, and the session can be finished early once a view exists.
@@ -895,6 +949,8 @@ class MultiViewEnroller:
         self.warnings: dict[str, str] = {}
         self._buf: list = []
         self._pose_buf: list = []
+        self.rejected = 0
+        self.reject_reason = ""
         self.result: dict | None = None
         self.error: str | None = None
         self._touched = time.monotonic()
@@ -930,10 +986,12 @@ class MultiViewEnroller:
             if self.phase not in ("ready", "capturing"):
                 raise EnrollmentBusy("no multi-view enrollment in progress - call /api/enroll/start first")
             if view is not None:
+                view = taxonomy.canonical_view(view)
                 if view not in taxonomy.VIEWS:
                     raise ValueError(f"view must be one of {', '.join(taxonomy.VIEWS)}")
                 self.current = view
             self._buf, self._pose_buf, self.error, self.phase = [], [], None, "capturing"
+            self.rejected, self.reject_reason = 0, ""
             self._touched = time.monotonic()
             self._cond.notify_all()
         return self.status()
@@ -973,6 +1031,22 @@ class MultiViewEnroller:
                 return "view_done"
             self._finalize()
             return "complete" if self.error is None else None
+
+    def reject(self, reason: str) -> bool:
+        """A capturing frame failed the lighting gate: not fed. Aborts the view capture (back to "ready", with the
+        reason as error) after max(3 x frames_per_view, 30) consecutive rejects. Returns True when it aborted."""
+        with self._cond:
+            if self.phase != "capturing":
+                return False
+            self.rejected += 1
+            self.reject_reason = reason
+            self._touched = time.monotonic()
+            if self.rejected < max(3 * self.per_view, 30):
+                return False
+            self._buf, self._pose_buf, self.phase = [], [], "ready"
+            self.error = f"capture failed: {reason}"
+            self._cond.notify_all()
+            return True
 
     def _finalize(self) -> None:
         try:
@@ -1032,6 +1106,7 @@ class MultiViewEnroller:
                 "current_title": current["title"] if current else None,
                 "current_instruction": current["instruction"] if current else None,
                 "collected": len(self._buf), "views": views, "pose_views": sorted(self.pose_captured),
+                "rejected": self.rejected, "reject_reason": self.reject_reason,
                 "done": self.phase == "done", "ok": self.phase == "done", "error": self.error, "result": self.result,
             }
 
@@ -1281,23 +1356,50 @@ class LedDriver:
 
 
 class AssetManager:
-    RETRY_AFTER_S = 60.0
+    """Per-class CAD state for the 3D viewer. Never substitutes a model: a class without a verified GLB is "not_found"
+    (the dashboard then offers Browse options / Upload GLB / Generate from verified specs)."""
 
-    def __init__(self) -> None:
+    def __init__(self, offline: bool = CAD_OFFLINE_DEFAULT, source: str = CAD_SOURCE_DEFAULT) -> None:
         self._lock = threading.Lock()
         self._info: dict[str, dict] = {}
         self._inflight: set[str] = set()
-        self._failed_at: dict[str, float] = {}
+        self._not_found: dict[str, dict] = {}
         self._gen: dict[str, int] = {}
+        self.offline = bool(offline)
+        self.source = source if source in cad_harvester.SOURCES else "auto"
         self.meta_lookup: Callable[[str], dict | None] | None = None
         self.on_resolved: Callable[[str, dict | None], None] | None = None
+
+    # -- settings ------------------------------------------------------------------------
+
+    def mode(self) -> dict:
+        return {"mode": "offline" if self.offline else "online", "offline": self.offline, "source": self.source,
+                "sources": list(cad_harvester.SOURCES)}
+
+    def set_mode(self, mode: str | None = None, source: str | None = None) -> dict:
+        if mode is not None:
+            mode = str(mode).lower()
+            if mode not in ("online", "offline"):
+                raise ValueError("mode must be 'online' or 'offline'")
+        if source is not None and source not in cad_harvester.SOURCES:
+            raise ValueError(f"source must be one of {', '.join(cad_harvester.SOURCES)}")
+        with self._lock:
+            if mode is not None:
+                self.offline = mode == "offline"
+            if source is not None:
+                self.source = source
+            self._not_found.clear()  # new mode / source: every missing class may be searched again
+        log.info("CAD retrieval mode: %s, source %s", "offline" if self.offline else "online", self.source)
+        return self.mode()
+
+    # -- state ---------------------------------------------------------------------------
 
     def forget(self, label: str, delete_files: bool = True) -> bool:
         """Drop all state for a deleted class; an in-flight background harvest is discarded when it lands."""
         with self._lock:
             self._gen[label] = self._gen.get(label, 0) + 1
             self._info.pop(label, None)
-            self._failed_at.pop(label, None)
+            self._not_found.pop(label, None)
         return cad_harvester.delete_cached(label) if delete_files else False
 
     def peek(self, label: str) -> dict:
@@ -1305,86 +1407,130 @@ class AssetManager:
         with self._lock:
             info = dict(self._info.get(label, {}))
             busy = label in self._inflight
+            missing = dict(self._not_found.get(label) or {})
         glb = local_glb_path(slug)
         if is_valid_glb(glb):
             attr = cad_harvester.read_attribution(label) or {}
-            try:
-                version = glb.stat().st_mtime_ns
-            except OSError:
-                version = 0
-            return {"glb_url": f"/static/models/{slug}.glb?v={version}", "status": "ready",
-                    "title": attr.get("title") or info.get("title", label), "attribution": attr or None,
-                    "credit": cad_harvester.attribution_line(attr) if attr else ""}
-        return {"glb_url": DEFAULT_GLB_URL, "status": "resolving" if busy else "pending", "title": info.get("title", label),
-                "attribution": None, "credit": ""}
+            if attr:
+                try:
+                    version = glb.stat().st_mtime_ns
+                except OSError:
+                    version = 0
+                return {"glb_url": f"/static/models/{slug}.glb?v={version}", "status": "ready",
+                        "title": attr.get("title") or info.get("title", label), "attribution": attr,
+                        "credit": cad_harvester.attribution_line(attr), "badge": attr.get("badge", ""),
+                        "source_key": attr.get("source_key", ""), "spec": attr.get("spec")}
+        if busy:
+            status = "resolving"
+        elif missing:
+            status = "not_found"
+        else:
+            status = "pending"
+        return {"glb_url": "", "status": status, "title": info.get("title", label), "attribution": None, "credit": "",
+                "badge": "", "reason": missing.get("reason", ""), "offline": self.offline}
 
-    def refetch(self, label: str) -> bool:
-        """Force a fresh CAD harvest for `label` in the background (replaces static/models/<label>.glb).
-        Returns False when a harvest for that class is already running."""
+    def _start(self, label: str, force: bool) -> bool:
         with self._lock:
             if label in self._inflight:
                 return False
             self._inflight.add(label)
-            self._failed_at.pop(label, None)
-        threading.Thread(target=self._resolve, args=(label, True), name=f"refetch-{label}", daemon=True).start()
+            self._not_found.pop(label, None)
+        threading.Thread(target=self._resolve, args=(label, force), name=f"cad-{label}", daemon=True).start()
         return True
 
+    def refetch(self, label: str) -> bool:
+        """Force a fresh CAD harvest for `label` in the background (replaces static/models/<label>.glb).
+        Returns False when a harvest for that class is already running."""
+        return self._start(label, True)
+
     def get(self, label: str) -> dict:
+        """Current asset; starts one background harvest for a class that has never been searched in this mode."""
         entry = self.peek(label)
-        if entry["status"] == "ready":
+        if entry["status"] != "pending":
             return entry
-        with self._lock:
-            recently_failed = time.monotonic() - self._failed_at.get(label, -1e9) < self.RETRY_AFTER_S
-            if label in self._inflight or recently_failed:
-                return entry
-            self._inflight.add(label)
-        threading.Thread(target=self._resolve, args=(label,), name=f"asset-{label}", daemon=True).start()
+        self._start(label, False)
         return {**entry, "status": "resolving"}
 
     def _resolve(self, label: str, force: bool = False) -> None:
         with self._lock:
             gen = self._gen.get(label, 0)
+            offline, source = self.offline, self.source
         try:
             meta = self.meta_lookup(label) if self.meta_lookup else None
-            result = cad_harvester.retrieve(label, meta, force=force)
-            with self._lock:
-                if self._gen.get(label, 0) != gen:
-                    log.info("Discarding CAD result for %s: the class was deleted while harvesting", label)
-                    cad_harvester.delete_cached(label)
-                elif result.get("glb_url"):
-                    self._info[label] = {"title": result.get("title", label), "source": result.get("source") or result.get("status")}
-                    self._failed_at.pop(label, None)
-                    if self.on_resolved:
-                        self.on_resolved(label, {k: result.get(k) for k in
-                                                 ("title", "glb_url", "source", "status", "query", "attribution", "credit", "match")})
-                else:
-                    self._failed_at[label] = time.monotonic()
-        except Exception:
+            result = cad_harvester.retrieve(label, meta, force=force and not offline, offline=offline, source=source)
+            self._land(label, gen, result)
+        except Exception as exc:
             log.exception("Asset resolution failed for %s", label)
             with self._lock:
-                self._failed_at[label] = time.monotonic()
+                self._not_found[label] = {"reason": f"CAD search failed: {exc}", "at": time.time()}
+        finally:
+            with self._lock:
+                self._inflight.discard(label)
+                deleted = self._gen.get(label, 0) != gen
+            if self.on_resolved and not deleted and not is_valid_glb(local_glb_path(slugify(label))):
+                self.on_resolved(label, None)  # NOT_FOUND / failure: push the new status to the dashboard
+
+    def _land(self, label: str, gen: int, result: dict) -> None:
+        with self._lock:
+            if self._gen.get(label, 0) != gen:
+                log.info("Discarding CAD result for %s: the class was deleted while harvesting", label)
+                cad_harvester.delete_cached(label)
+                return
+            if result.get("glb_url"):
+                self._info[label] = {"title": result.get("title", label), "source": result.get("source") or result.get("status")}
+                self._not_found.pop(label, None)
+            else:
+                self._not_found[label] = {"reason": result.get("reason") or "no verified 3D model found", "at": time.time()}
+                log.info("CAD NOT_FOUND for %s: %s", label, self._not_found[label]["reason"])
+        if result.get("glb_url") and self.on_resolved:
+            self.on_resolved(label, {k: result.get(k) for k in
+                                     ("title", "glb_url", "source", "status", "query", "attribution", "credit", "match", "badge")})
+
+    # -- explicit user actions -----------------------------------------------------------
+
+    def _product(self, label: str):
+        meta = self.meta_lookup(label) if self.meta_lookup else None
+        return cad_harvester.product_for(label, meta)
+
+    def candidates(self, label: str, limit: int = 4, source: str | None = None) -> list[dict]:
+        src = source or self.source
+        if src == "local":
+            src = "auto"
+        return cad_harvester.candidates(self._product(label), limit=limit, source=src, budget_s=CAD_BROWSE_BUDGET_S)
+
+    def _explicit(self, label: str, action: Callable[[], dict]) -> dict:
+        with self._lock:
+            if label in self._inflight:
+                raise RuntimeError(f"a CAD search for {label} is already running")
+            self._inflight.add(label)
+            gen = self._gen.get(label, 0)
+        try:
+            result = action()
+            self._land(label, gen, result)
+            return result
         finally:
             with self._lock:
                 self._inflight.discard(label)
 
-    def prepare_static(self, labels: tuple[str, ...] = INITIAL_CLASSES) -> None:
-        """Background: default model, vendored <model-viewer>, and GLBs for the initial classes."""
+    def select(self, label: str, uid: str) -> dict:
+        return self._explicit(label, lambda: cad_harvester.select(self._product(label), uid))
+
+    def upload(self, label: str, data: bytes, filename: str = "") -> dict:
+        title = self._product(label).canonical_name if self.meta_lookup else label
+        return self._explicit(label, lambda: cad_harvester.upload_glb(label, data, filename, title))
+
+    def generate(self, label: str) -> dict:
+        return self._explicit(label, lambda: cad_harvester.generate_from_specs(self._product(label)))
+
+    def prepare_static(self, labels: tuple[str, ...] = ()) -> None:
+        """Background: vendored <model-viewer> and the cached / harvested GLBs of the enrolled classes."""
 
         def work() -> None:
-            default = local_glb_path("default")
-            try:
-                current = default.read_bytes()[:4096] if default.is_file() else b""
-            except OSError:
-                current = b""
-            if not is_valid_glb(default) or procedural_glb.PLACEHOLDER_TAG.encode() not in current:
-                try:  # replaces older placeholders (the legacy untextured red box)
-                    default.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = default.with_suffix(".part")
-                    tmp.write_bytes(procedural_glb.build_placeholder())
-                    os.replace(tmp, default)
-                except OSError as exc:
-                    log.warning("Could not write the default placeholder model: %s", exc)
-            cad_harvester.ensure_base_models()
+            for stale in ("default.glb",):
+                try:  # placeholder geometry from older builds is never shown
+                    (STATIC_DIR / "models" / stale).unlink()
+                except OSError:
+                    pass
             vendor = STATIC_DIR / "vendor" / "model-viewer.min.js"
             if not vendor.is_file() or vendor.stat().st_size < 50_000:
                 try:
@@ -1676,11 +1822,18 @@ def extract_frame(body: bytes, content_type: str = "", depth: int = 0) -> tuple[
     raise ValueError("not a JPEG frame: send raw image/jpeg bytes, multipart/form-data, or JSON {\"image\": <base64>}")
 
 
+class NotEnrolled(LookupError):
+    """The class id in a /api/classes/<id>/... request is not enrolled."""
+
+
 class Pipeline:
     def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager, detector=None,
-                 pose_embedder=None) -> None:
+                 pose_embedder=None, ocr: ocr_fusion.OcrWorker | None = None) -> None:
         self.extractor, self.bank, self.leds, self.assets = extractor, bank, leds, assets
         self.detector = detector
+        self.ocr = ocr if ocr is not None else ocr_fusion.OcrWorker(None)
+        self._lighting: dict = {"ok": True, "issue": None, "message": "", "mean_luma": None, "glare_fraction": None,
+                                "gate": LIGHT_GATE}
         self.pose_worker = PoseWorker(pose_embedder, bank) if pose_embedder is not None else None
         self.camera = None  # onboard_camera.LocalBrioCapture when the on-board camera is the video source
         self.crop_tracker = npu_mod.CropTracker()
@@ -1729,7 +1882,7 @@ class Pipeline:
             "label": None, "similarity": 0.0, "confidence": 0.0, "margin": 0.0, "top2": None, "frame_confidence": 0.0,
             "embed_ms": 0.0, "detect_ms": 0.0, "total_ms": 0.0, "state": SEARCHING, "guidance": MSG_SEARCHING,
             "hint": None, "empty": False, "saliency": None, "domain": None, "conflict": False, "front_dominant": False,
-            "raw_top1": None,
+            "raw_top1": None, "ocr": None, "lighting": None,
         }
 
     @property
@@ -1892,20 +2045,29 @@ class Pipeline:
         with self._infer_lock:
             enrolling = self.mv.capturing or self.enroller.active
             saliency = scene_saliency(image) if SCENE_GATE else {"laplacian_var": None, "edge_density": None, "empty": False}
-            empty = bool(saliency["empty"]) and not enrolling
+            light = lighting_check(image)
+            self._lighting = light
+            dark = not light["ok"]
+            empty = bool(saliency["empty"]) and not enrolling and not dark
             capturing = self.mv.capturing
-            if empty:
-                # Nothing inside the reticle: skip the detector + embedder entirely (no background noise scoring).
+            if dark and capturing and self.mv.reject(light["message"]):
+                capturing = False
+            if empty or dark:
+                # Nothing inside the reticle, or lighting too poor to trust an embedding: skip the detector + embedder
+                # entirely (no background-noise scoring, no enrollment frames captured under bad light).
                 t1 = t2 = time.perf_counter()
                 box, detect_ms = None, 0.0
                 self.crop_tracker.reset()
                 self._detection = {"target": None, "objects": [], "crop": None, "crop_source": "center", "ms": 0.0,
-                                   "skipped": "empty_scene"}
-                frame, views, best_view, category = FrameScore(None, 0.0, empty=True), {}, None, None
-                arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None}
+                                   "skipped": "empty_scene" if empty else light["issue"]}
+                frame, views, best_view, category = FrameScore(None, 0.0, empty=empty), {}, None, None
+                arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None, "ocr": None}
                 arr = None
             else:
                 box, detect_ms = self._locate(image)
+                if self.ocr.enabled and not enrolling:
+                    size, left, top = box or center_crop_box(*image.size)
+                    self.ocr.submit(np.asarray(image.crop((left, top, left + size, top + size))))
                 arr = preprocess(image, box)
                 t1 = time.perf_counter()
                 vec = self.extractor.embed_array(arr)
@@ -1926,6 +2088,8 @@ class Pipeline:
             state, label, score = snap["state"], snap["label"], snap["score"]
             hint = frame.hint if state == GUIDING else None
             message = guidance_message(state, label, score, hint, category, frame.prompt, frame.empty)
+            if dark:
+                hint, message = light["issue"], light["message"]
             if self.mv.active:
                 mv = self.mv.status()
                 self.leds.set(capture_led_params(mv["collected"], mv["frames_per_view"]) if capturing else led_params(SEARCHING, 0.0))
@@ -1967,6 +2131,7 @@ class Pipeline:
                     "top2": {"label": frame.top2, "score": frame.s2, "confidence": frame.c2} if frame.top2 else None,
                     "embed_ms": (t2 - t1) * 1000.0, "detect_ms": detect_ms, "total_ms": total_ms, "state": state,
                     "guidance": message, "hint": hint, "empty": frame.empty, "saliency": saliency, **arb,
+                    "lighting": light,
                 }
             frames_seen = self._frames
         if LOG_FRAMES:
@@ -1983,6 +2148,7 @@ class Pipeline:
             "similarity": round(frame.s1, 3), "margin": round(snap["margin"], 3), "hint": hint, "empty": frame.empty,
             "embed_ms": round((t2 - t1) * 1000, 1), "detect_ms": round(detect_ms, 1), "latency_ms": round(total_ms, 1),
             "detection": self._detection["target"], "saliency": saliency, "domain": arb["domain"],
+            "lighting": light, "ocr": arb.get("ocr"),
         }
 
     def _arbitrate(self, vec) -> tuple[FrameScore, dict, str | None, str | None, dict]:
@@ -1993,7 +2159,9 @@ class Pipeline:
         ranked_all = self.bank.rank(vec)
         ranked = self.bank.rank(vec, domain) if domain else ranked_all
         info = {"domain": list(domain) if domain else None, "conflict": False, "front_dominant": False,
-                "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None}
+                "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None,
+                "ocr": None}
+        ranked, info["ocr"] = self._fuse_text(ranked)
         lead = ranked_all[0] if ranked_all else None
         lead_cat = self.bank.category(lead[0]) if lead else None
         conflict = bool(domain and lead and lead_cat and lead_cat not in domain and calibrate(lead[1]) >= C_SEARCH)
@@ -2022,6 +2190,30 @@ class Pipeline:
                 frame.hint = "tilt"
                 frame.prompt = device_taxonomy.disambiguation_prompt(self.bank.metadata(label), self.bank.metadata(top2))
         return frame, views, best_view, category, info
+
+    def _fuse_text(self, ranked: list) -> tuple[list, dict | None]:
+        """Late fusion S = 0.65 S_vision + 0.35 S_text over the top candidates, using the words OCR read on the crop
+        in the last WINDOW_S. Classes whose printed words were not seen keep their pure vision score; a different
+        brand's name in view pulls a class down. Text alone can never identify (it caps at 0.35 of the score)."""
+        if not self.ocr.enabled:
+            return ranked, None
+        recent = self.ocr.recent()
+        seen = set(recent["tokens"])
+        info = {"texts": recent["texts"], "tokens": recent["tokens"][:16], "ms": recent["ms"], "applied": False,
+                "s_text": None, "s_vision": None}
+        if not seen or not ranked:
+            return ranked, info
+        head, tail = ranked[:5], ranked[5:]
+        scored = []
+        for lab, s, view in head:
+            st = ocr_fusion.text_score(ocr_fusion.class_words(self.bank.metadata(lab), lab), seen)
+            scored.append((lab, ocr_fusion.fuse(s, st), view, st, s))
+        scored.sort(key=lambda r: -r[1])
+        top = scored[0]
+        info.update(applied=any(r[3] is not None for r in scored), s_text=top[3], s_vision=round(top[4], 4),
+                    fused=round(top[1], 4), label=top[0])
+        merged = [(lab, s, view) for lab, s, view, _, _ in scored] + list(tail)
+        return sorted(merged, key=lambda r: -r[1]), info
 
     def _locate(self, image: Image.Image) -> tuple[tuple[int, int, int] | None, float]:
         """NPU object detection -> smoothed square crop around the target inside the reticle (None = center crop)."""
@@ -2120,6 +2312,47 @@ class Pipeline:
         return {"ok": True, "label": label, "started": started, "status": "resolving" if started else "busy",
                 "asset": self.assets.peek(label)}
 
+    def _cad_label(self, label: str) -> str:
+        if label not in self.bank.centroids:
+            raise NotEnrolled(label)
+        self._viewer_label = label
+        return label
+
+    def cad_candidates(self, label: str, source: str | None = None, limit: int = 4) -> dict:
+        """Ranked online CAD candidates for an enrolled class (Browse options). Online only."""
+        self._cad_label(label)
+        if self.assets.offline:
+            raise PermissionError("offline mode: switch to online search to browse 3D models")
+        items = self.assets.candidates(label, limit=limit, source=source)
+        return {"ok": True, "label": label, "source": source or self.assets.source, "candidates": items}
+
+    def cad_action(self, label: str, action: str, **kw) -> dict:
+        """select / upload / generate: explicit operator actions that set a class's 3D model (or report NOT_FOUND)."""
+        self._cad_label(label)
+        if action == "select":
+            if self.assets.offline:
+                raise PermissionError("offline mode: switch to online search to download a model")
+            result = self.assets.select(label, kw["uid"])
+        elif action == "upload":
+            result = self.assets.upload(label, kw["data"], kw.get("filename", ""))
+        elif action == "generate":
+            if self.assets.offline:
+                raise PermissionError("offline mode: spec lookup needs online access")
+            result = self.assets.generate(label)
+        else:
+            raise ValueError(action)
+        self._bump()
+        ok = bool(result.get("glb_url"))
+        return {"ok": ok, "label": label, "status": result.get("status"), "reason": result.get("reason", ""),
+                "result": {k: v for k, v in result.items() if k not in ("path",)}, "asset": self.assets.peek(label)}
+
+    def set_cad_mode(self, mode: str | None, source: str | None) -> dict:
+        out = self.assets.set_mode(mode, source)
+        if self._viewer_label and self._viewer_label in self.bank.centroids:
+            self.assets.get(self._viewer_label)  # the new mode may find a model for the class on screen
+        self._bump()
+        return {"ok": True, **out}
+
     def snapshot(self) -> dict:
         with self._snap_lock:
             last = dict(self._last)
@@ -2128,7 +2361,7 @@ class Pipeline:
         viewer = (
             self.assets.peek(self._viewer_label)
             if self._viewer_label
-            else {"glb_url": DEFAULT_GLB_URL, "status": "default", "title": ""}
+            else {"glb_url": "", "status": "none", "title": ""}
         )
         state = last["state"]
         return {
@@ -2148,6 +2381,12 @@ class Pipeline:
             "asset_title": viewer.get("title", ""),
             "asset_credit": viewer.get("credit", ""),
             "asset_attribution": viewer.get("attribution"),
+            "asset_badge": viewer.get("badge", ""),
+            "asset_reason": viewer.get("reason", ""),
+            "asset_spec": viewer.get("spec"),
+            "cad_mode": self.assets.mode() if hasattr(self.assets, "mode") else None,
+            "ocr": last.get("ocr"),
+            "lighting": last.get("lighting") or self._lighting,
             "mode": MODE,
             "privacy": self.privacy(),
             "latency_ms": {"embed": round(last["embed_ms"], 1), "detect": round(last["detect_ms"], 1), "total": round(last["total_ms"], 1)},
@@ -2183,7 +2422,10 @@ class Pipeline:
                            "searching_raw_cosine": round(T_SEARCH, 4), "phone_margin": PHONE_AMBIG_MARGIN,
                            "front_cap": device_taxonomy.FRONT_CONFIDENCE_CAP, "scene_gate": SCENE_GATE,
                            "laplacian_min": LAPLACIAN_MIN, "edge_min": EDGE_MIN, "canny": [CANNY_LO, CANNY_HI],
-                           "detector_gate": device_taxonomy.DETECTOR_GATE_MIN},
+                           "detector_gate": device_taxonomy.DETECTOR_GATE_MIN,
+                           "lighting": {"gate": LIGHT_GATE, "min_luma": LIGHT_MIN_LUMA, "glare_level": GLARE_LEVEL,
+                                        "glare_max": GLARE_MAX},
+                           "fusion": {"w_vision": ocr_fusion.W_VISION, "w_text": ocr_fusion.W_TEXT}},
         }
 
     def privacy(self) -> dict:
@@ -2242,7 +2484,9 @@ class Pipeline:
                     "embedder": self.extractor.info() if hasattr(self.extractor, "info") else {"runtime": self.extractor.name},
                     "detector": self.detector.info() if self.detector is not None else None,
                     "pose": self.pose_worker.info() if self.pose_worker is not None else None,
+                    "ocr": self.ocr.recent(),
                 },
+                "ocr": last.get("ocr"), "lighting": last.get("lighting") or self._lighting,
                 "detection": self._detection,
             },
             "privacy": self.privacy(),
@@ -2265,6 +2509,10 @@ class Pipeline:
             "title": snap["asset_title"],
             "credit": snap["asset_credit"],
             "attribution": snap["asset_attribution"],
+            "badge": snap["asset_badge"],
+            "reason": snap["asset_reason"],
+            "spec": snap["asset_spec"],
+            "cad_mode": snap["cad_mode"],
         }
 
 
@@ -2296,13 +2544,14 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict) -> None:
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json")
 
-    def _read_body(self) -> bytes | None:
+    def _read_body(self, limit: int = MAX_FRAME_BYTES) -> bytes | None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = -1
-        if length < 0 or length > MAX_FRAME_BYTES:
-            self._json(400, {"ok": False, "error": "missing or oversized body"})
+        if length < 0 or length > limit:
+            self._json(413 if length > limit else 400,
+                       {"ok": False, "error": f"missing or oversized body (limit {limit // (1024 * 1024)} MB)"})
             self.close_connection = True
             return None
         return self.rfile.read(length)
@@ -2324,6 +2573,27 @@ class Handler(BaseHTTPRequestHandler):
                                     "prototypes": p.bank.info(), "db_path": str(p.bank.path) if p.bank.path else None})
         if path == "/api/telemetry":
             return self._json(200, p.telemetry_snapshot())
+        if path == "/api/settings/mode":
+            return self._json(200, {"ok": True, **p.assets.mode()})
+        parts = [urllib.parse.unquote(s) for s in path.split("/") if s]
+        if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] == "cad_candidates":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            try:
+                label = normalize_label(parts[2])
+                source = query.get("source", [None])[0]
+                if source is not None and source not in cad_harvester.SOURCES:
+                    raise ValueError(f"source must be one of {', '.join(cad_harvester.SOURCES)}")
+                limit = max(1, min(12, int(query.get("limit", ["4"])[0])))
+                return self._json(200, p.cad_candidates(label, source, limit))
+            except NotEnrolled:
+                return self._json(404, {"ok": False, "error": f"class {parts[2]!r} is not enrolled"})
+            except PermissionError as exc:
+                return self._json(409, {"ok": False, "error": str(exc), "offline": True})
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                log.exception("CAD candidate search failed")
+                return self._json(502, {"ok": False, "error": f"CAD search failed: {exc}"})
         if path == "/api/telemetry/stream":
             return self._telemetry_sse()
         if path == "/api/credits":
@@ -2477,6 +2747,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._json(400, {"ok": False, "error": str(exc)})
             return True
+        if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] in ("cad_select", "upload_cad", "generate_spec"):
+            return self._cad_post(parts[2], parts[3], body)
+        if path == "/api/settings/mode":
+            try:
+                req = self._json_body(body)
+                self._json(200, p.set_cad_mode(req.get("mode"), req.get("source")))
+            except (TypeError, ValueError) as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            return True
         if path not in ("/api/enroll/start", "/api/enroll/capture", "/api/enroll/finish", "/api/enroll/cancel",
                         "/api/db/save", "/api/cad/fetch", "/api/classes/reset", "/api/classes/purge", "/api/resolve"):
             return False
@@ -2524,17 +2803,20 @@ class Handler(BaseHTTPRequestHandler):
                                                   str(req.get("package_type", "")), str(req.get("container_volume", "")))
                 self._json(200, {"ok": True, **product.to_dict()})
             else:
+                offline, source = bool(getattr(p.assets, "offline", False)), getattr(p.assets, "source", "auto")
                 if req.get("label"):
                     label = normalize_label(req.get("label"))
                     meta = p.bank.metadata(label) or (taxonomy.parse_metadata(req) if req.get("raw_name") else None)
-                    result = cad_harvester.retrieve(label, meta, force=bool(req.get("force")))
+                    result = cad_harvester.retrieve(label, meta, force=bool(req.get("force")), offline=offline,
+                                                    source=source)
                 else:
                     product = entity_resolver.resolve(str(req.get("raw_name") or req.get("text") or ""), str(req.get("category", "")),
                                                       str(req.get("brand", "")), str(req.get("variant", "")))
                     label = normalize_label(product.class_id)
-                    result = cad_harvester.harvest(product, force=bool(req.get("force")))
-                keys = ("title", "glb_url", "source", "status", "query", "attribution", "credit", "match")
-                p.bank.set_cad(label, {k: result.get(k) for k in keys})
+                    result = cad_harvester.harvest(product, force=bool(req.get("force")), offline=offline,
+                                                   source=source)
+                keys = ("title", "glb_url", "source", "status", "query", "attribution", "credit", "match", "badge")
+                p.bank.set_cad(label, {k: result.get(k) for k in keys} if result.get("glb_url") else None)
                 if label == p._viewer_label:
                     p._bump()
                 self._json(200, {"ok": True, "label": label, **result})
@@ -2545,6 +2827,37 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             log.exception("API call %s failed", path)
             self._json(500, {"ok": False, "error": str(exc)})
+        return True
+
+    def _cad_post(self, raw_id: str, action: str, body: bytes) -> bool:
+        p = self.pipeline
+        try:
+            label = normalize_label(raw_id)
+            if action == "cad_select":
+                uid = str(self._json_body(body).get("uid") or "").strip()
+                if not uid:
+                    raise ValueError("uid is required")
+                result = p.cad_action(label, "select", uid=uid)
+            elif action == "upload_cad":
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                name = query.get("filename", [self.headers.get("X-Filename", "")])[0]
+                result = p.cad_action(label, "upload", data=body, filename=name)
+            else:
+                result = p.cad_action(label, "generate")
+            self._json(200 if result["ok"] else 404, result)
+        except NotEnrolled:
+            self._json(404, {"ok": False, "error": f"class {raw_id!r} is not enrolled"})
+        except PermissionError as exc:
+            self._json(409, {"ok": False, "error": str(exc), "offline": True})
+        except RuntimeError as exc:
+            self._json(409, {"ok": False, "error": str(exc)})
+        except KeyError as exc:
+            self._json(409, {"ok": False, "error": str(exc.args[0]) if exc.args else "unknown candidate"})
+        except (TypeError, ValueError) as exc:
+            self._json(422 if action == "upload_cad" else 400, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            log.exception("CAD action %s failed for %s", action, raw_id)
+            self._json(502, {"ok": False, "error": str(exc)})
         return True
 
     def _static(self, rel: str) -> None:
@@ -2566,7 +2879,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         url = urllib.parse.urlsplit(self.path)
         path = url.path.rstrip("/") or "/"
-        body = self._read_body()
+        body = self._read_body(MAX_UPLOAD_BYTES if path.endswith("/upload_cad") else MAX_FRAME_BYTES)
         if body is None:
             return
         if path in INGEST_ROUTES or path in SYNC_FRAME_ROUTES:
@@ -2697,8 +3010,9 @@ def main() -> None:
     loaded = bank.load()
     leds = LedDriver()
     assets = AssetManager()
-    pipeline = Pipeline(extractor, bank, leds, assets, detector, pose_embedder)
-    assets.prepare_static()
+    ocr = ocr_fusion.OcrWorker.create()
+    pipeline = Pipeline(extractor, bank, leds, assets, detector, pose_embedder, ocr)
+    assets.prepare_static(tuple(bank.labels()))
     threading.Thread(target=lambda: log.info("RAM asset cache: %d static files preloaded (%s)", pipeline.static_cache.preload(STATIC_DIR),
                                              pipeline.static_cache.info()), name="asset-preload", daemon=True).start()
     if pipeline.ring.enabled:
@@ -2717,11 +3031,12 @@ def main() -> None:
         log.info("No USB camera found for --camera auto; waiting for HTTP ingest (stream_cam.py)")
     server = make_server(pipeline, args.host, args.port)
     log.info(
-        "Kamikaze receiver on %s:%d | camera %s | embedder %s | detector %s | %s | ready in %.1fs | %d enrolled classes %s | "
-        "dashboard http://localhost:%d/",
+        "Kamikaze receiver on %s:%d | camera %s | embedder %s | detector %s | %s | OCR %s | CAD %s/%s | ready in %.1fs | "
+        "%d enrolled classes %s | dashboard http://localhost:%d/",
         args.host, args.port, f"{device} ({camera.actual_w}x{camera.actual_h} {camera.fourcc} @ {camera.actual_fps:.0f})"
         if camera is not None else "http-ingest", extractor.name, detector.info()["runtime"] if detector else "off",
-        pipeline.accelerator(), time.perf_counter() - t0, loaded, bank.labels(), args.port,
+        pipeline.accelerator(), "on" if ocr.enabled else (ocr.error or "off"), assets.mode()["mode"], assets.source,
+        time.perf_counter() - t0, loaded, bank.labels(), args.port,
     )
     try:
         server.serve_forever()

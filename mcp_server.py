@@ -4,7 +4,8 @@
 Run over stdio:   python mcp_server.py
 Import directly:  from mcp_server import set_leds, search_3d_asset, actuate_modulino, trigger_guidance
 
-Tools: search_3d_asset, actuate_modulino, trigger_guidance, enroll_object, get_guidance.
+Tools: search_3d_asset, search_product_specs, actuate_modulino, trigger_guidance, enroll_object, get_guidance,
+enroll_multiview, fetch_cad_asset, resolve_product, get_telemetry, get_pose_telemetry.
 enroll_object / get_guidance talk to the running receiver.py (the single owner of the prototype bank)
 over its local HTTP API, so an agent can drive the same live state the dashboard shows.
 
@@ -15,7 +16,7 @@ Environment (all optional):
   KAMIKAZE_ROUTER_SOCK   Router socket path (default /var/run/arduino-router.sock)
   KAMIKAZE_RECEIVER_URL  Receiver base URL (default http://127.0.0.1:5000)
   KAMIKAZE_MODELS_DIR    GLB cache directory (default static/models next to this file)
-  KAMIKAZE_FALLBACKS     JSON file overriding/extending the cached model table
+  KAMIKAZE_FALLBACKS     JSON file of operator-curated direct GLB URLs per product
                          (default: fallback_models.json next to this file)
   KAMIKAZE_HTTP_TIMEOUT  Per-request network timeout in seconds (default 3.0)
 
@@ -81,7 +82,7 @@ ROUTER_SOCK_PATH = os.environ.get("KAMIKAZE_ROUTER_SOCK", "/var/run/arduino-rout
 RECEIVER_URL = os.environ.get("KAMIKAZE_RECEIVER_URL", "http://127.0.0.1:5000").rstrip("/")
 HTTP_TIMEOUT = float(os.environ.get("KAMIKAZE_HTTP_TIMEOUT", "3.0"))
 DOWNLOAD_TIMEOUT = float(os.environ.get("KAMIKAZE_DOWNLOAD_TIMEOUT", "30"))
-MAX_GLB_BYTES = 64 * 1024 * 1024
+MAX_GLB_BYTES = int(float(os.environ.get("KAMIKAZE_CAD_MAX_MB", "35")) * 1024 * 1024)
 RPC_TIMEOUT = 1.0
 ONLINE_CACHE_TTL = 600.0
 USER_AGENT = "kamikaze-edge/1.0"
@@ -121,138 +122,104 @@ def label_category(label: str) -> str | None:
 
 
 # --------------------------------------------------------------------------------------
-# Cached fallback model table (direct public .glb URLs, always reachable offline of APIs)
+# Verified local model catalog (offline fallback - never a substitute shape)
 # --------------------------------------------------------------------------------------
-# Khronos glTF-Sample-Assets are stable, public, CORS-enabled GLBs hosted on GitHub raw.
-# Each target category has its own entry so any product can be swapped for a real model
-# by editing fallback_models.json without touching code.
+# Entries come from (1) GLBs already in the model cache that carry an attribution sidecar (downloaded from Sketchfab /
+# Poly Pizza, uploaded by the operator or generated from verified specs) and (2) operator-curated direct GLB URLs in
+# fallback_models.json ({"<product name>": {"title", "model_url", "thumbnail_url", "attribution"}}). A query only matches
+# an entry for the same product (same model generation + tier, or same can brand/flavour); there is no generic
+# box / bottle stand-in, so an unknown product returns None instead of a misleading model.
 
-_KHRONOS = "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models"
-
-
-def _khronos(name: str) -> str:
-    return f"{_KHRONOS}/{name}/glTF-Binary/{name}.glb"
-
-
-_PHONE_GLB = _khronos("Box")
-_CAN_GLB = _khronos("WaterBottle")
-
-
-def _thumb(name: str) -> str:
-    ext = "png" if name == "Box" else "jpg"
-    return f"{_KHRONOS}/{name}/screenshot/screenshot.{ext}"
+_IPHONE_RE = re.compile(r"iphone\s*(\d{1,2})\s*(pro\s*max|pro|plus|mini|e)?\b")
+_GALAXY_RE = re.compile(r"(?:galaxy\s*)?\bs\s?(\d{2})\s*(\+|plus|ultra|fe|edge)?(?![a-z0-9])")
+_CAN_FLAVOURS = (("zero", "zero"), ("diet", "diet"), ("cherry", "cherry"), ("vanilla", "vanilla"), ("lime", "lime"),
+                 ("lemon", "lemon"), ("max", "zero"))
+_CAN_BRANDS = (("pepsi", "pepsi"), ("sprite", "sprite"), ("fanta", "fanta"), ("coca", "coke"), ("coke", "coke"),
+               ("cola", "coke"))
 
 
-def _build_default_fallbacks() -> dict[str, dict[str, str]]:
-    table: dict[str, dict[str, str]] = {}
-    for gen in IPHONE_GENERATIONS:
-        table[f"iphone {gen}"] = {
-            "title": f"Apple iPhone {gen}",
-            "model_url": _PHONE_GLB,
-            "thumbnail_url": _thumb("Box"),
-        }
-    for gen in GALAXY_GENERATIONS:
-        table[f"galaxy s{gen}"] = {
-            "title": f"Samsung Galaxy S{gen}",
-            "model_url": _PHONE_GLB,
-            "thumbnail_url": _thumb("Box"),
-        }
-    for key, title in (
-        ("coca-cola", "Coca-Cola Classic Can"),
-        ("diet coke", "Diet Coke Can"),
-        ("coke zero", "Coke Zero Can"),
-        ("pepsi", "Pepsi Can"),
-        ("sprite", "Sprite Can"),
-    ):
-        table[key] = {
-            "title": title,
-            "model_url": _CAN_GLB,
-            "thumbnail_url": _thumb("WaterBottle"),
-        }
-    table["_generic_phone"] = {
-        "title": "Smartphone",
-        "model_url": _PHONE_GLB,
-        "thumbnail_url": _thumb("Box"),
-    }
-    table["_generic_can"] = {
-        "title": "Beverage Can",
-        "model_url": _CAN_GLB,
-        "thumbnail_url": _thumb("WaterBottle"),
-    }
-    return table
+def product_key(text: str) -> str:
+    """Canonical identity key used to match catalog entries: 'iphone15promax', 'galaxys24ultra', 'can:coke:zero'."""
+    q = re.sub(r"\s+", " ", (text or "").lower().replace("_", " ").replace("-", " ")).strip()
+    m = _IPHONE_RE.search(q)
+    if m:
+        return f"iphone{m.group(1)}{re.sub(r'\s+', '', m.group(2) or '')}"
+    if "galaxy" in q or "samsung" in q or re.search(r"\bs\s?\d{2}\b", q):
+        m = _GALAXY_RE.search(q)
+        if m:
+            tier = {"+": "plus"}.get(m.group(2) or "", m.group(2) or "")
+            return f"galaxys{m.group(1)}{tier}"
+    tokens = set(re.findall(r"[a-z0-9]+", q))
+    brand = next((b for word, b in _CAN_BRANDS if any(t.startswith(word) for t in tokens)), "")
+    if brand and ({"can", "soda", "drink", "cola", "coke", "pepsi", "sprite", "fanta"} & tokens):
+        flavour = next((f for word, f in _CAN_FLAVOURS if word in tokens), "")
+        return f"can:{brand}:{flavour}"
+    return slugify(q)
 
 
 def _load_fallbacks() -> dict[str, dict[str, str]]:
-    table = _build_default_fallbacks()
+    """Operator-curated direct GLB URLs (fallback_models.json); empty when the file is absent."""
+    table: dict[str, dict[str, str]] = {}
     path = Path(os.environ.get("KAMIKAZE_FALLBACKS", Path(__file__).with_name("fallback_models.json")))
-    if path.is_file():
-        try:
-            overrides = json.loads(path.read_text(encoding="utf-8"))
-            for key, entry in overrides.items():
-                if isinstance(entry, dict) and entry.get("model_url"):
-                    base = table.get(key.lower(), {})
-                    table[key.lower()] = {
-                        "title": entry.get("title", base.get("title", key)),
-                        "model_url": entry["model_url"],
-                        "thumbnail_url": entry.get("thumbnail_url", base.get("thumbnail_url", "")),
-                    }
-            log.info("Loaded fallback overrides from %s", path)
-        except (OSError, ValueError) as exc:
-            log.warning("Ignoring unreadable fallback file %s: %s", path, exc)
+    if not path.is_file():
+        return table
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+        for key, entry in entries.items():
+            if isinstance(entry, dict) and str(entry.get("model_url", "")).startswith(("https://", "http://")):
+                table[key.lower()] = {
+                    "title": str(entry.get("title") or key), "model_url": str(entry["model_url"]),
+                    "thumbnail_url": str(entry.get("thumbnail_url") or ""),
+                    "attribution": str(entry.get("attribution") or ""),
+                }
+        log.info("Loaded %d curated fallback model(s) from %s", len(table), path)
+    except (OSError, ValueError, AttributeError) as exc:
+        log.warning("Ignoring unreadable fallback file %s: %s", path, exc)
     return table
 
 
 FALLBACK_MODELS: dict[str, dict[str, str]] = _load_fallbacks()
 
-_IPHONE_RE = re.compile(r"iphone\s*(1[2-6])\b")
-_GALAXY_RE = re.compile(r"(?:galaxy\s*)?\bs\s?(2[0-4])\b")
+
+def local_catalog() -> dict[str, dict[str, str]]:
+    """Cached GLBs with an attribution sidecar: {slug: {"title", "model_url", "glb_url", "thumbnail_url", "attribution"}}."""
+    out: dict[str, dict[str, str]] = {}
+    if not MODELS_DIR.is_dir():
+        return out
+    for js in sorted(MODELS_DIR.glob("*.json")):
+        glb = js.with_suffix(".glb")
+        if not is_valid_glb(glb):
+            continue
+        try:
+            rec = json.loads(js.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        url = f"/static/models/{js.stem}.glb"
+        out[js.stem] = {
+            "title": str(rec.get("canonical_name") or rec.get("title") or js.stem), "model_url": url, "glb_url": url,
+            "thumbnail_url": str(rec.get("thumbnail_url") or ""), "attribution": str(rec.get("attribution_text") or ""),
+            "source": str(rec.get("source") or ""), "badge": str(rec.get("badge") or ""),
+        }
+    return out
 
 
 def resolve_fallback(query: str) -> dict[str, str] | None:
-    """Map a free-text query to a cached model entry, keeping variant info in the title."""
-    q = re.sub(r"\s+", " ", query.lower().replace("_", " ").replace("-", " ")).strip()
-    entry_key: str | None = None
-    title: str | None = None
-
-    m = _IPHONE_RE.search(q)
-    if m:
-        entry_key = f"iphone {m.group(1)}"
-        variant = " Pro Max" if re.search(r"\bpro max\b", q) else " Pro" if re.search(r"\bpro\b", q) else ""
-        title = f"Apple iPhone {m.group(1)}{variant}"
-    elif "samsung" in q or "galaxy" in q or _GALAXY_RE.search(q):
-        m = _GALAXY_RE.search(q)
-        if m:
-            entry_key = f"galaxy s{m.group(1)}"
-            variant = " Ultra" if "ultra" in q else " Plus" if ("plus" in q or "+" in query) else ""
-            title = f"Samsung Galaxy S{m.group(1)}{variant}"
-    if entry_key is None:
-        if "zero" in q:
-            entry_key = "coke zero"
-        elif "diet" in q:
-            entry_key = "diet coke"
-        elif "pepsi" in q:
-            entry_key = "pepsi"
-        elif "sprite" in q:
-            entry_key = "sprite"
-        elif "coca" in q or "coke" in q or "cola" in q:
-            entry_key = "coca-cola"
-        elif any(w in q for w in ("phone", "iphone", "galaxy", "samsung", "apple", "smartphone", "pixel", "android")) \
-                or re.search(r"\bs\s?2\d\b", q):
-            entry_key = "_generic_phone"
-            m = re.search(r"\bs\s?(2\d)\b", q)
-            if m:
-                variant = " Ultra" if "ultra" in q else " Plus" if ("plus" in q or "+" in query) else ""
-                title = f"Samsung Galaxy S{m.group(1)}{variant}"
-        elif any(w in q for w in ("can", "soda", "drink", "beverage")):
-            entry_key = "_generic_can"
-    if entry_key is None or entry_key not in FALLBACK_MODELS:
+    """The verified local / curated model of exactly this product, or None (never a generic stand-in)."""
+    if not (query or "").strip():
         return None
-    entry = dict(FALLBACK_MODELS[entry_key])
-    if title and entry_key == "_generic_phone":
-        entry["title"] = title
-    elif title and entry_key.startswith(("iphone", "galaxy")) and entry["title"].startswith(("Apple iPhone", "Samsung Galaxy")):
-        entry["title"] = title
-    return entry
+    slug, key = slugify(query), product_key(query)
+    local = local_catalog()
+    if slug in local:
+        return dict(local[slug])
+    for stem, entry in local.items():
+        if product_key(stem.replace("_", " ")) == key or product_key(entry["title"]) == key:
+            return dict(entry)
+    for name, entry in FALLBACK_MODELS.items():
+        if slugify(name) == slug or product_key(name) == key:
+            return dict(entry)
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -358,7 +325,10 @@ def _search_online(query: str) -> dict[str, str] | None:
 
 
 def lookup_3d_asset(query: str, format: str = "glb") -> dict:
-    """Resolve a query to {"title", "model_url", "thumbnail_url", "status"} without downloading anything."""
+    """Resolve a query to {"title", "model_url", "thumbnail_url", "status"} without downloading anything.
+
+    status "online" = found on Sketchfab / Poly Pizza, "cached" = verified local / curated model of the same product,
+    "not_found" = nothing verified exists (model_url is empty - no substitute is invented)."""
     query = (query or "").strip()
     if format.lower() != "glb":
         log.info("Requested format %r unsupported; serving glb", format)
@@ -368,8 +338,8 @@ def lookup_3d_asset(query: str, format: str = "glb") -> dict:
     cached = resolve_fallback(query)
     if cached:
         return {**cached, "status": "cached"}
-    log.warning("No online or cached model for %r", query)
-    return {"title": query or "unknown", "model_url": "", "thumbnail_url": "", "status": "cached"}
+    log.warning("No online or verified cached model for %r", query)
+    return {"title": query or "unknown", "model_url": "", "thumbnail_url": "", "status": "not_found"}
 
 
 def slugify(text: str) -> str:
@@ -432,25 +402,40 @@ def download_glb(url: str, slug: str) -> Path | None:
 def search_3d_asset(query: str, format: str = "glb") -> dict:
     """Find and cache a 3D model for a product query (e.g. "Apple iPhone 15 Pro", "coke_can").
 
-    Tries Sketchfab then Poly Pizza (when API credentials are configured) and falls back to a
-    built-in table of public GLB URLs so live demos survive network failures and rate limits.
+    Tries Sketchfab then Poly Pizza (when API credentials are configured), then the verified local catalog (cached
+    attributed GLBs + operator-curated fallback_models.json) so live demos survive network failures and rate limits.
     The chosen GLB is downloaded once into static/models/<query-slug>.glb.
-    Returns {"title", "model_url", "thumbnail_url", "status": "online" | "cached"} plus
-    "glb_url" (the locally served /static/models/... path) when the file is cached on disk.
-    Only GLB output is supported; other formats are served as GLB.
+    Returns {"title", "model_url", "thumbnail_url", "status": "online" | "cached" | "not_found"} plus "glb_url"
+    (the locally served /static/models/... path) when a model is available. Only GLB output is supported.
     """
-    entry = lookup_3d_asset(query, format)
     slug = slugify(query)
     if is_valid_glb(local_glb_path(slug)):
-        return {**entry, "glb_url": f"/static/models/{slug}.glb"}
+        local = resolve_fallback(query) or {}
+        url = f"/static/models/{slug}.glb"
+        return {"title": local.get("title") or query, "model_url": url, "thumbnail_url": local.get("thumbnail_url", ""),
+                "attribution": local.get("attribution", ""), "status": "cached", "glb_url": url}
+    entry = lookup_3d_asset(query, format)
+    if entry.get("glb_url"):
+        return entry
     candidates = [entry]
     fallback = resolve_fallback(query or "")
     if fallback and fallback["model_url"] != entry["model_url"]:
         candidates.append({**fallback, "status": "cached"})
     for cand in candidates:
+        if cand.get("glb_url"):
+            return cand
         if cand["model_url"] and download_glb(cand["model_url"], slug):
             return {**cand, "glb_url": f"/static/models/{slug}.glb"}
     return entry
+
+
+@mcp.tool()
+def search_product_specs(query: str, category: str = "") -> dict:
+    """Verified physical dimensions for a smartphone (GSMArena: height/width/depth mm, rear camera count) or beverage can
+    (Crown Holdings can-size table by volume: diameter/height mm). Returns {"verified": bool, ..., "sources": [...]}."""
+    import spec_search
+
+    return spec_search.search(query, category)
 
 
 class _RouterClient:
@@ -597,7 +582,7 @@ def get_guidance() -> dict:
 @mcp.tool()
 def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant: str = "", package_type: str = "",
                      container_volume: str = "", frames_per_view: int = 6, pause_s: float = 4.0) -> dict:
-    """Guided 4-angle enrollment (front, back, side, top) of the object in front of the camera.
+    """Guided 5-view enrollment (front, right, back, left, top) of the object in front of the camera.
 
     Starts a session with the structured metadata, then captures `frames_per_view` frames per view, waiting
     `pause_s` seconds before each so the object can be rotated. Returns the final enrollment status.
@@ -607,7 +592,7 @@ def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant
     status = _receiver_call("POST", "/api/enroll/start", {k: v for k, v in body.items() if v not in ("", None)}, timeout=10.0)
     if not status.get("ok"):
         return status
-    for view in ("front", "back", "side", "top"):
+    for view in ("front", "right", "back", "left", "top"):
         time.sleep(max(0.0, pause_s))
         status = _receiver_call("POST", "/api/enroll/capture", {"view": view, "wait": True, "timeout": 30}, timeout=45.0)
         if not status.get("ok"):
@@ -618,8 +603,9 @@ def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant
 
 @mcp.tool()
 def fetch_cad_asset(raw_name: str, category: str = "", brand: str = "", variant: str = "", force: bool = False) -> dict:
-    """Find, download and cache a 3D GLB model for a product (Sketchfab -> Poly Pizza -> GitHub -> procedural fallback).
+    """Find, quality-check, download and cache a 3D GLB of exactly this product (Sketchfab + Poly Pizza, ranked).
 
+    No substitute model is invented: when nothing passes the exact-match + quality gate the status is "not_found".
     Returns {"class_id", "title", "glb_url", "status", "source", "attribution", "credit", ...}; glb_url is served from
     /static/models and `credit` is the author/licence line that must be shown with the model.
     """

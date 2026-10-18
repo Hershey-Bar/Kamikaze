@@ -69,7 +69,8 @@
   .led.on { box-shadow:0 0 10px currentColor; }
   input[type=text], select { flex:1; min-width:120px; background:var(--panel2); border:1px solid var(--line); color:var(--text); padding:9px 10px; border-radius:8px; font:inherit; }
   .frow { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
-  .steps { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:12px; }
+  .steps { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin-top:12px; }
+  @media (max-width:760px) { .steps { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .step { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:8px; font-size:12px; }
   .step.current { border-color:var(--amber); box-shadow:0 0 0 1px var(--amber) inset; }
   .step.done { border-color:var(--green); }
@@ -86,6 +87,41 @@
   .pill { font-size:11px; padding:2px 8px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); color:var(--mute); text-transform:none; letter-spacing:0; font-weight:500; }
   .pill.on { border-color:var(--green); color:var(--green); }
   .mute { color:var(--mute); font-size:12px; }
+  .pill.warn { border-color:var(--amber); color:var(--amber); }
+  .pill.bad { border-color:var(--red); color:var(--red); }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; min-height:22px; align-items:center; }
+  .chip { font-size:11px; padding:2px 8px; border-radius:6px; background:rgba(232,121,249,.12); border:1px solid rgba(232,121,249,.5); color:#f5d0fe; font-family:ui-monospace,monospace; }
+  .chip.hit { background:rgba(16,185,129,.15); border-color:var(--green); color:#c9f7e4; }
+  .cadbar { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  .cadbar select { flex:0 0 auto; min-width:0; padding:5px 8px; font-size:12px; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg button { background:transparent; color:var(--mute); border-radius:0; padding:5px 12px; font-size:12px; font-weight:600; }
+  .seg button.on { background:#1d4ed8; color:#fff; }
+  .overlay { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; padding:28px; text-align:center; border-radius:10px; }
+  .overlay.show { display:flex; }
+  #emptyStage { color:var(--mute); pointer-events:none; }
+  #emptyStage b { color:var(--text); font-size:16px; }
+  #notFound { background:rgba(7,11,22,.86); }
+  #notFound h3 { margin:0; font-size:18px; color:var(--amber); letter-spacing:.08em; }
+  #nfReason { color:var(--mute); font-size:12px; max-width:520px; overflow-wrap:anywhere; }
+  .drop { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; width:min(440px,90%); padding:22px; border:2px dashed var(--line); border-radius:12px; cursor:pointer; color:var(--mute); font-size:13px; transition:border-color .2s, background .2s; }
+  .drop.over, .drop:hover { border-color:var(--blue); background:rgba(56,189,248,.07); color:var(--text); }
+  .drop input { display:none; }
+  #estBadge { position:absolute; right:10px; top:10px; padding:4px 10px; border-radius:999px; background:rgba(245,158,11,.18); border:1px solid var(--amber); color:#ffe7bf; font-size:11px; font-weight:600; display:none; }
+  #estBadge.show { display:block; }
+  .modal { position:fixed; inset:0; background:rgba(2,4,10,.72); display:none; align-items:center; justify-content:center; z-index:50; padding:20px; }
+  .modal.show { display:flex; }
+  .mbox { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; width:min(920px,100%); max-height:88vh; overflow:auto; }
+  .mbox h3 { margin:0 0 6px; font-size:15px; }
+  .cands { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; margin-top:12px; }
+  .cand { background:var(--panel2); border:1px solid var(--line); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }
+  .cand img { width:100%; aspect-ratio:4/3; object-fit:cover; background:#000; display:block; }
+  .cand .cb { padding:8px 10px; font-size:11px; color:var(--mute); display:flex; flex-direction:column; gap:3px; flex:1; }
+  .cand .cb b { color:var(--text); font-size:12px; overflow-wrap:anywhere; }
+  .cand .cb a { color:#7dd3fc; }
+  .cand button { margin:0 10px 10px; }
+  .lvl { font-size:10px; text-transform:uppercase; letter-spacing:.08em; }
+  .lvl.exact { color:var(--green); } .lvl.similar { color:var(--amber); } .lvl.category { color:var(--red); }
   footer { padding:6px 22px 20px; color:var(--mute); font-size:11px; }
   code { font-size:11px; }
 </style>
@@ -93,7 +129,7 @@
 <body>
 <header>
   <h1>KAMIKAZE <small>edge visual → 3D retrieval · VENTUNO Q</small></h1>
-  <span><span class="pill" id="modePill">mode: —</span> <span id="conn">connecting…</span></span>
+  <span><span class="pill" id="lightPill" title="Lighting gate on the reticle crop">light: —</span> <span class="pill" id="modePill">mode: —</span> <span id="conn">connecting…</span></span>
 </header>
 
 <div class="wrap">
@@ -111,10 +147,11 @@
           <div class="stat"><b>Confidence</b><span id="tSim">0.0%</span><div class="bar"><div id="confBar"></div></div></div>
           <div class="stat"><b>Margin Δ (top-1 − top-2)</b><span id="tMargin">0.0%</span><div class="bar m"><div id="marginBar"></div></div></div>
         </div>
+        <div class="chips" id="ocrChips" title="Words read by on-device OCR (fused 0.65 vision / 0.35 text)"></div>
       </section>
 
       <section class="panel">
-        <h2>Training console · guided 4-angle enrollment</h2>
+        <h2>Training console · guided 360° enrollment (front · right · back · left · top)</h2>
         <div class="frow">
           <input type="text" id="mName" placeholder="Object name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
           <select id="mCat">
@@ -197,6 +234,8 @@
           <dt>Scene gate (lap / edges)</dt><dd id="tGate">—</dd>
           <dt>Detector domain</dt><dd id="tDomain">—</dd>
           <dt>Pose (DINOv2)</dt><dd id="tPose">—</dd>
+          <dt>OCR text fusion</dt><dd id="tOcr">—</dd>
+          <dt>Lighting gate (luma / glare)</dt><dd id="tLight">—</dd>
         </dl>
       </section>
     </div>
@@ -212,12 +251,42 @@
             <button class="ghost" id="refetchActiveBtn" type="button">Re-Fetch CAD for Active</button>
             <span class="pill" id="syncPill">pose: off</span>
           </span></h2>
+        <div class="cadbar">
+          <span class="seg" title="Offline: local verified cache only. Online: Sketchfab / Poly Pizza search">
+            <button type="button" id="modeOff">Offline</button><button type="button" id="modeOn">Online</button>
+          </span>
+          <select id="srcSel" title="CAD source">
+            <option value="auto">Source: auto (Sketchfab → Poly Pizza)</option>
+            <option value="sketchfab">Source: Sketchfab</option>
+            <option value="polypizza">Source: Poly Pizza</option>
+            <option value="local">Source: local cache only</option>
+          </select>
+          <button class="ghost" id="browseBtn" type="button" title="Show the top ranked online models for the class on screen">Browse options</button>
+          <span class="pill" id="cadPill">CAD: —</span>
+        </div>
         <div class="vstage">
-          <model-viewer id="viewer" src="/static/models/default.glb" camera-controls auto-rotate shadow-intensity="1.2"
+          <model-viewer id="viewer" camera-controls auto-rotate shadow-intensity="1.2"
                         environment-image="neutral" exposure="1.0" tone-mapping="aces" camera-orbit="45deg 75deg auto"
                         interaction-prompt="none"
                         alt="Matched 3D model"></model-viewer>
-          <span id="viewerLabel">Default model</span>
+          <div id="emptyStage" class="overlay show"><b>No object on stage</b><span>Identify or enroll an object; its verified 3D model appears here.</span></div>
+          <div id="notFound" class="overlay">
+            <h3>NOT FOUND</h3>
+            <div id="nfTitle"></div>
+            <div id="nfReason"></div>
+            <label class="drop" id="drop">
+              <input type="file" id="glbFile" accept=".glb,model/gltf-binary">
+              <b>Drop a .glb here or click to upload</b>
+              <span>Quality-checked (geometry, size); credited as an operator upload</span>
+            </label>
+            <div class="frow" style="justify-content:center">
+              <button class="ghost" id="nfBrowse" type="button">Browse online options</button>
+              <button class="ghost" id="nfGen" type="button" title="Build a dimension-calibrated model from verified published specs (GSMArena / Crown can tables)">Generate from verified specs</button>
+              <button id="nfOnline" type="button">Switch to Online Search</button>
+            </div>
+          </div>
+          <span id="viewerLabel">No model</span>
+          <span id="estBadge">ESTIMATED · spec-generated geometry</span>
           <div id="badge"></div>
         </div>
       </section>
@@ -231,7 +300,13 @@
       </section>
   </div>
 </div>
-<footer>Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/credits</code>.</footer>
+<div class="modal" id="modal"><div class="mbox">
+  <h3 id="mHead"></h3>
+  <div class="mute" id="mSub"></div>
+  <div id="mBody"></div>
+  <div class="frow" id="mActions" style="justify-content:flex-end"></div>
+</div></div>
+<footer>Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/classes/&lt;id&gt;/cad_candidates</code> · <code>/api/settings/mode</code> · <code>/api/credits</code>. 3D models are shown only when they are an exact verified match, a model you picked or uploaded, or geometry generated from verified published dimensions (badged ESTIMATED); otherwise the stage reports NOT FOUND.</footer>
 
 <script>
   (function () {
@@ -448,7 +523,7 @@
   }
 
   async function refetchCad(id) {
-    $('enrollMsg').textContent = `Re-fetching CAD for ${id}… (Sketchfab → Poly Pizza → fallbacks, in the background)`;
+    $('enrollMsg').textContent = `Re-fetching CAD for ${id}… (exact-match search only, in the background)`;
     try {
       const r = await fetch('/api/classes/' + encodeURIComponent(id) + '/fetch_cad', { method: 'POST' });
       const j = await r.json().catch(() => ({}));
@@ -479,7 +554,7 @@
       name.title = p.class_id + (p.created_at ? ' · enrolled ' + p.created_at : '');
       cell((p.category || '—').replace('_', ' ') + (p.phone_tier ? ' · ' + p.phone_tier.replace('_', ' ') : ''));
       const views = p.views ? Object.keys(p.views).join(', ') : '';
-      cell(`${p.view_count}/4${views ? ' (' + views + ')' : ''}`);
+      cell(`${p.view_count}/5${views ? ' (' + views + ')' : ''}`);
       cell(p.cad_status === 'ready' || p.cad_path ? (p.cad_source || 'cached') + (p.cad_path ? ' · ' + p.cad_path.split('/').pop() : '') : 'missing',
         p.cad_status === 'ready' || p.cad_path ? 'cad-ready' : 'cad-missing');
       const tdR = document.createElement('td');
@@ -572,6 +647,11 @@
     const pm = models.pose;
     $('tPose').textContent = pm ? `${pm.device === 'npu' ? 'NPU' : (pm.device || 'cpu').toUpperCase()} · ${fmt(pm.median_ms, 1, ' ms')} · ${pm.rate_hz} Hz cap`
       : 'off (MobileNet view centroids)';
+    const om = models.ocr || {};
+    $('tOcr').textContent = om.enabled ? `CPU · ${fmt(om.ms, 0, ' ms')} median · ${om.hz} Hz cap · ${om.runs} runs` : (om.error ? 'off · ' + om.error : 'off');
+    const li = inf.lighting;
+    $('tLight').textContent = li && li.mean_luma != null
+      ? `${fmt(li.mean_luma, 0)} / ${fmt(li.glare_fraction * 100, 1, ' %')}${li.ok ? ' · ok' : ' · ' + li.issue.replace('_', ' ')}` : '—';
   }
 
   async function pollTelemetry() {  // only used when EventSource is unavailable
@@ -599,8 +679,10 @@
     $('capBtn').disabled = ph !== 'ready';
     $('finishBtn').disabled = ph !== 'ready' || !(mv.views || []).some((v) => v.state === 'done');
     $('cancelBtn').disabled = !mv.active;
-    if (ph === 'ready') $('enrollMsg').textContent = `Show the ${mv.current_title}: ${mv.current_instruction} Then press "${$('capBtn').textContent}" (samples the next ${mv.frames_per_view} frames).`;
-    else if (ph === 'capturing') $('enrollMsg').textContent = `Capturing ${mv.current_title}… ${mv.collected}/${mv.frames_per_view}`;
+    if (ph === 'ready' && mv.error) $('enrollMsg').textContent = `${mv.error}. Fix the lighting, then press "${$('capBtn').textContent}" again.`;
+    else if (ph === 'ready') $('enrollMsg').textContent = `Show the ${mv.current_title}: ${mv.current_instruction} Then press "${$('capBtn').textContent}" (samples the next ${mv.frames_per_view} frames).`;
+    else if (ph === 'capturing') $('enrollMsg').textContent = `Capturing ${mv.current_title}… ${mv.collected}/${mv.frames_per_view}` +
+      (mv.rejected ? ` · paused: ${mv.reject_reason} (${mv.rejected} frames skipped)` : '');
     else if (ph === 'done') $('enrollMsg').textContent = `Enrolled "${mv.label}" (consistency ${mv.result ? mv.result.consistency : '—'}). Fetching CAD model…`;
     else if (ph === 'error' && mv.error) $('enrollMsg').textContent = 'Enrollment stopped: ' + mv.error;
   }
@@ -608,8 +690,10 @@
   function guidanceIcon(s) {
     const icon = $('hudIcon');
     icon.className = '';
-    if (s.state !== 'GUIDING') { icon.textContent = ''; return; }
-    if (s.hint === 'flip') { icon.textContent = '🔄'; icon.className = 'on'; }
+    const light = s.hint === 'low_light' || s.hint === 'glare';
+    if (s.state !== 'GUIDING' && !light) { icon.textContent = ''; return; }
+    if (light) { icon.textContent = s.hint === 'glare' ? '☀' : '💡'; icon.className = 'on'; }
+    else if (s.hint === 'flip') { icon.textContent = '🔄'; icon.className = 'on'; }
     else if (s.hint === 'tilt') { icon.textContent = '↗'; icon.className = 'on'; }
     else if (s.hint === 'verify') { icon.textContent = '⌖'; icon.className = 'on'; }
     else { icon.textContent = '⟳'; icon.className = 'on rotate'; }
@@ -647,17 +731,200 @@
     renderClasses(s.bank, s.confirmed_label);
     renderSteps(s.multiview);
 
-    const src = new URL(s.glb_url, location.href).href;
-    if (src !== lastSrc) { lastSrc = src; viewer.setAttribute('src', s.glb_url); }
     const name = s.confirmed_label || s.viewer_label;
-    $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${s.asset_status}` : 'Default model';
+    const glb = name && s.glb_url ? s.glb_url : '';
+    const src = glb ? new URL(glb, location.href).href : '';
+    if (src !== lastSrc) { lastSrc = src; if (glb) viewer.setAttribute('src', glb); else viewer.removeAttribute('src'); }
+    $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${String(s.asset_status || '').replace('_', ' ')}` : 'No model';
     $('refetchActiveBtn').disabled = !name;
-    renderCredit(name ? s.asset_attribution : null);
+    renderCredit(glb ? s.asset_attribution : null);
+    renderCad(s, name, glb);
+    renderSignals(s);
     const poseTxt = pose && pose.valid ? `yaw ${Math.round(pose.yaw)}° · pitch ${Math.round(pose.pitch)}°${pose.source ? ' · ' + pose.source : ''}` : null;
     $('syncPill').textContent = syncPose ? (poseTxt ? 'syncing · ' + poseTxt : 'pose: no object') : (poseTxt ? 'pose: off · ' + poseTxt : 'pose: off');
     $('syncPill').className = 'pill' + (syncPose && pose && pose.valid ? ' on' : '');
     applyPose();
   }
+
+  let offlinePrompted = '', uploadBusy = false;
+  function renderCad(s, name, glb) {
+    const m = s.cad_mode;
+    const offline = !!(m && m.offline);
+    if (m) {
+      $('modeOn').classList.toggle('on', !offline);
+      $('modeOff').classList.toggle('on', offline);
+      if (document.activeElement !== $('srcSel')) $('srcSel').value = m.source;
+    }
+    const nf = !!name && s.asset_status === 'not_found';
+    $('emptyStage').classList.toggle('show', !name);
+    $('notFound').classList.toggle('show', nf);
+    $('estBadge').classList.toggle('show', !!glb && !!s.asset_badge);
+    $('browseBtn').disabled = !name || offline;
+    $('nfOnline').style.display = offline ? '' : 'none';
+    $('nfBrowse').style.display = offline ? 'none' : '';
+    $('nfGen').style.display = offline ? 'none' : '';
+    if (nf && !uploadBusy) {
+      $('nfTitle').textContent = s.asset_title || name;
+      const why = s.asset_reason || 'No verified 3D model matches this object.';
+      const next = offline ? ' Offline mode searches the local cache only.'
+        : ' Pick a ranked online option, upload your own .glb, or generate geometry from verified published dimensions.';
+      if ($('nfReason').dataset.busy !== '1') $('nfReason').textContent = why + next;
+    }
+    const st = !name ? 'CAD: —' : glb ? `CAD: ${s.asset_badge ? 'estimated' : 'verified'}` : `CAD: ${String(s.asset_status || '').replace('_', ' ')}`;
+    $('cadPill').textContent = st + (m ? ` · ${m.mode}` : '');
+    $('cadPill').className = 'pill' + (glb ? ' on' : nf ? ' warn' : '');
+    if (nf && offline && offlinePrompted !== name && !$('modal').classList.contains('show')) {
+      offlinePrompted = name;
+      modal('No local 3D model found', `"${s.asset_title || name}" has no verified model in the local cache. Switch to Online Search?`, null,
+        [['Stay offline', 'ghost', closeModal], ['Switch to Online Search', '', () => { closeModal(); setMode('online'); }]]);
+    }
+  }
+
+  function renderSignals(s) {
+    const li = s.lighting;
+    const lp = $('lightPill');
+    const known = li && li.mean_luma != null;
+    lp.textContent = !known ? 'light: —' : li.ok ? `light: ok · ${Math.round(li.mean_luma)}` : `light: ${li.issue.replace('_', ' ')}`;
+    lp.className = 'pill' + (!known ? '' : li.ok ? ' on' : ' bad');
+    const box = $('ocrChips');
+    const o = s.ocr;
+    const sig = JSON.stringify(o ? [o.texts, o.applied, o.s_text] : null);
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    box.replaceChildren();
+    if (!o) return;
+    const lab = document.createElement('span');
+    lab.className = 'mute';
+    lab.textContent = o.texts && o.texts.length ? `OCR${o.applied && o.s_text != null ? ' · S_text ' + Number(o.s_text).toFixed(2) : ''}:` : 'OCR: no text in view';
+    box.appendChild(lab);
+    (o.texts || []).slice(0, 6).forEach((t) => {
+      const c = document.createElement('span');
+      c.className = 'chip' + (o.applied && o.s_text > 0 ? ' hit' : '');
+      c.textContent = t;
+      box.appendChild(c);
+    });
+  }
+
+  function closeModal() { $('modal').classList.remove('show'); }
+  function modal(head, sub, body, actions) {
+    $('mHead').textContent = head;
+    $('mSub').textContent = sub || '';
+    $('mBody').replaceChildren(...(body ? [body] : []));
+    $('mActions').replaceChildren(...actions.map(([text, cls, fn]) => {
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = text; if (cls) b.className = cls; b.onclick = fn; return b;
+    }));
+    $('modal').classList.add('show');
+  }
+  $('modal').onclick = (e) => { if (e.target === $('modal')) closeModal(); };
+
+  async function setMode(mode, source) {
+    const body = {};
+    if (mode) body.mode = mode;
+    if (source) body.source = source;
+    const j = await post('/api/settings/mode', body);
+    if (j.ok) { offlinePrompted = ''; $('enrollMsg').textContent = `CAD retrieval: ${j.mode} · source ${j.source}`; }
+    pullState();
+  }
+  $('modeOn').onclick = () => setMode('online');
+  $('modeOff').onclick = () => setMode('offline');
+  $('srcSel').onchange = () => setMode(null, $('srcSel').value);
+
+  const activeName = () => state && (state.confirmed_label || state.viewer_label);
+
+  function candCard(c, id, grid) {
+    const card = document.createElement('div'); card.className = 'cand';
+    const img = document.createElement('img'); img.alt = c.title || ''; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
+    if (c.thumbnail_url && String(c.thumbnail_url).startsWith('https://')) img.src = c.thumbnail_url;
+    card.appendChild(img);
+    const cb = document.createElement('div'); cb.className = 'cb';
+    const t = document.createElement('b'); t.textContent = c.title || 'Untitled'; cb.appendChild(t);
+    const lv = document.createElement('span'); lv.className = 'lvl ' + (c.level || ''); lv.textContent = `${c.level || '?'} match · ${c.source}`; cb.appendChild(lv);
+    const stats = document.createElement('span');
+    stats.textContent = [c.likes != null ? `♥ ${c.likes}` : null, c.views != null ? `${c.views} views` : null,
+      c.faces ? `${Number(c.faces).toLocaleString()} faces` : null].filter(Boolean).join(' · ') || '—';
+    cb.appendChild(stats);
+    const by = document.createElement('span'); by.append('by '); link(by, c.author || 'unknown', c.author_url); cb.appendChild(by);
+    const lic = document.createElement('span'); link(lic, c.license || 'licence unknown', c.license_url);
+    if (c.source_url) { lic.append(' · '); link(lic, 'source', c.source_url); }
+    cb.appendChild(lic);
+    card.appendChild(cb);
+    const use = document.createElement('button'); use.type = 'button'; use.textContent = 'Use this model';
+    use.onclick = async () => {
+      grid.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+      use.textContent = 'Downloading + checking…';
+      const r = await post(`/api/classes/${encodeURIComponent(id)}/cad_select`, { uid: c.uid });
+      if (r.ok) { closeModal(); $('enrollMsg').textContent = `Using "${c.title}" by ${c.author || 'unknown'} for ${id}.`; }
+      else {
+        use.textContent = 'Rejected';
+        $('mSub').textContent = r.error || r.reason || 'Download or quality check failed.';
+        grid.querySelectorAll('button').forEach((b) => { if (b !== use) b.disabled = false; });
+      }
+      pullState();
+    };
+    card.appendChild(use);
+    return card;
+  }
+
+  async function browse() {
+    const id = activeName();
+    if (!id) return;
+    const src = $('srcSel').value === 'local' ? 'auto' : $('srcSel').value;
+    const grid = document.createElement('div');
+    grid.className = 'cands';
+    grid.textContent = 'Searching Sketchfab / Poly Pizza…';
+    modal(`3D model options · ${state.asset_title || id}`,
+      'Ranked by match level, likes, downloads and views. Nothing is downloaded until you pick one; every pick is quality-checked and credited.',
+      grid, [['Close', 'ghost', closeModal]]);
+    let j;
+    try { j = await (await fetch(`/api/classes/${encodeURIComponent(id)}/cad_candidates?source=${src}&limit=4`, { cache: 'no-store' })).json(); }
+    catch (e) { grid.textContent = 'Receiver unreachable.'; return; }
+    if (!j.ok) { grid.textContent = j.error || 'Search failed.'; return; }
+    if (!j.candidates.length) { grid.textContent = 'No online models found for this object. Upload a .glb or generate from verified specs.'; return; }
+    grid.replaceChildren(...j.candidates.map((c) => candCard(c, id, grid)));
+  }
+  $('browseBtn').onclick = browse;
+  $('nfBrowse').onclick = browse;
+  $('nfOnline').onclick = () => setMode('online');
+  $('nfGen').onclick = async () => {
+    const id = activeName();
+    if (!id) return;
+    const reason = $('nfReason');
+    $('nfGen').disabled = true;
+    reason.dataset.busy = '1';
+    reason.textContent = 'Looking up verified published dimensions…';
+    const j = await post(`/api/classes/${encodeURIComponent(id)}/generate_spec`);
+    $('nfGen').disabled = false;
+    reason.dataset.busy = '';
+    if (j.ok && j.result && j.result.glb_url) $('enrollMsg').textContent = `Generated ${id} from verified specs (${j.result.credit || 'spec sources'}). Marked ESTIMATED.`;
+    else { reason.dataset.busy = '1'; reason.textContent = (j.result && j.result.reason) || j.reason || j.error || 'No verified specs found; nothing was generated.'; setTimeout(() => { reason.dataset.busy = ''; }, 8000); }
+    pullState();
+  };
+
+  async function uploadGlb(file) {
+    const id = activeName();
+    if (!id || !file || uploadBusy) return;
+    const reason = $('nfReason');
+    if (!/\.glb$/i.test(file.name)) { reason.textContent = 'Only binary glTF (.glb) files are accepted.'; return; }
+    uploadBusy = true;
+    reason.textContent = `Uploading ${file.name} (${(file.size / 1048576).toFixed(1)} MB)…`;
+    let msg = null;
+    try {
+      const r = await fetch(`/api/classes/${encodeURIComponent(id)}/upload_cad?filename=${encodeURIComponent(file.name)}`,
+        { method: 'POST', headers: { 'Content-Type': 'model/gltf-binary', 'X-Filename': file.name }, body: file });
+      const j = await r.json().catch(() => ({}));
+      if (j.ok) $('enrollMsg').textContent = `Installed ${file.name} as the 3D model for ${id}.`;
+      else msg = j.error || `Upload rejected (HTTP ${r.status}).`;
+    } catch (e) { msg = 'Upload failed: receiver unreachable.'; }
+    uploadBusy = false;
+    $('glbFile').value = '';
+    if (msg) { reason.dataset.busy = '1'; reason.textContent = msg; setTimeout(() => { reason.dataset.busy = ''; }, 8000); }
+    pullState();
+  }
+  $('glbFile').onchange = () => uploadGlb($('glbFile').files[0]);
+  const drop = $('drop');
+  ['dragenter', 'dragover'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', (e) => uploadGlb(e.dataTransfer.files[0]));
 
   async function pullState() {
     try { render(await (await fetch('/api/state', { cache: 'no-store' })).json()); }
@@ -725,7 +992,8 @@
     const j = await post('/api/cad/fetch', req);
     $('resolveBtn').disabled = false;
     if (!j.ok) { box.textContent = j.error || 'CAD fetch failed.'; return; }
-    box.textContent = `${parsed.canonical_name} → ${j.source} (${j.status}) · ${j.credit}`;
+    box.textContent = j.glb_url ? `${parsed.canonical_name} → ${j.source} (${j.status}) · ${j.credit}`
+      : `${parsed.canonical_name} → NOT FOUND: ${j.reason || 'no verified 3D model'}`;
     if (j.glb_url) { viewer.setAttribute('src', j.glb_url + '?t=' + Date.now()); lastSrc = ''; renderCredit(j.attribution); }
     pullState();
   };

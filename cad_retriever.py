@@ -3,8 +3,12 @@
 from cad_harvester import (  # noqa: F401
     credits,
     delete_cached,
-    ensure_base_models,
+    candidates,
+    generate_from_specs,
     harvest,
     retrieve,
+    select,
+    upload_glb,
+    validate_glb,
     write_credits_md,
 )
