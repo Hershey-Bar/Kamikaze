@@ -445,16 +445,21 @@ Plus, Pro, Pro Max), Galaxy S20-S25 (base, +, Ultra) and Galaxy Z Fold 3-6. `dev
 dimensions (H x W x D mm, unfolded size for the Folds), outline aspect, front cut-out and camera island family, each
 with its source URL (`scripts/build_devices_db.py` rebuilds it). Lens coordinates are not published and are left null
 (never invented). The populate script searches 1:1 dummies on Printables and Thingiverse (`THINGIVERSE_TOKEN` from
-`.env`), skips accessory prints (cases, stands, holders), downloads up to 12 files per device, converts STL / OBJ / 3MF,
+`.env`), skips accessory prints (cases, stands, holders) and pre-release rumour / leak / concept models, downloads up to 12 files per device, converts STL / OBJ / 3MF,
 and accepts only models within +-2 mm of the GSMArena height and width (depth may include the camera bump); the best by
-popularity rank minus dimension error wins, NC licences only with `KAMIKAZE_CAD_ALLOW_NC=1`. Otherwise the
-spec-generated body (exact dimensions, design-family island, flagged ESTIMATED) is cached. Every GLB is in metres,
+popularity rank minus dimension error wins, NC licences only with `--allow-nc` / `KAMIKAZE_CAD_ALLOW_NC=1`. A
+**camera relief gate** (`device_cache.back_relief`) rasterises the back as a height map and rejects blank slabs with no
+raised camera feature (the old Thingiverse S22 Ultra was one). On the board the Galaxy S24 Ultra is the real Printables
+#733692 dummy by Motani_Works (CC BY-NC, within 0.5 mm): 3 large rings in a column plus the periscope / flash beside
+them; S23 and S25 Ultra are real dummies with the same layout. Otherwise the
+spec-generated body (exact dimensions, design-family island, flagged ESTIMATED) is cached; estimated Ultras use the
+same 3-in-a-column plus side-ring layout. Every GLB is in metres,
 Y-up, centre of mass at the origin, with an attribution sidecar; then the camera-island renders are embedded with
 DINOv2. The harvester and spec search check the cache first, so a phone class installs in a few milliseconds with no
-network. `--offline`, `--only`, `--force`, `--retry-estimated` and `--no-embeddings` control the run.
+network. `--offline`, `--only`, `--force`, `--retry-estimated`, `--allow-nc` and `--no-embeddings` control the run.
 
 ```bash
-cd /home/arduino/hackathon_iot && set -a && . ./.env && set +a && .venv/bin/python scripts/populate_device_cache.py
+cd /home/arduino/hackathon_iot && set -a && . ./.env && set +a && .venv/bin/python scripts/populate_device_cache.py --allow-nc
 ```
 
 Every model has a JSON sidecar with title, author, author URL, licence and source; credits are shown in the

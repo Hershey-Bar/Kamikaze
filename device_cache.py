@@ -276,6 +276,46 @@ def extents_mm(data: bytes) -> dict:
             "com_mm": [round(float(v), 3) for v in com]}
 
 
+def back_relief(data: bytes, rows: int = 320, thresh_mm: float = 0.35) -> dict:
+    """Camera relief on the back (-Z face) of a cached phone GLB.
+
+    Rasterises the nearest back surface (painter's order) into a height map, takes the back-glass plane as the median
+    height of the plain lower back, and counts the connected regions in the top 45 % of the back that stand more than
+    `thresh_mm` proud of / below that plane (lens rings, camera islands, flash). A size-tester slab or a blank shell has
+    none. Edge margins are excluded so curved sides do not count.
+    -> {"features", "max_mm", "areas_px", "centroids"}: features sorted by area, centroids as (x, y) fractions of the
+    back seen from behind (x from the viewer's left, y from the top)"""
+    import cv2
+
+    doc, binary = parse_glb(data)
+    tris = np.concatenate([t for t, _ in triangles(doc, binary)]).astype(np.float64)
+    u, v = -tris[..., 0], tris[..., 1]
+    height = -tris[..., 2].mean(axis=1) * 1000.0  # mm toward a viewer behind the phone
+    scale = (rows - 1) / max(float(np.ptp(v)), 1e-9)
+    cols = int(np.ceil(np.ptp(u) * scale)) + 1
+    px, py = (u - u.min()) * scale, (v.max() - v) * scale
+    pts = np.round(np.stack([px, py], -1) * 16).astype(np.int32)
+    hmap = np.full((rows, cols), np.nan, np.float32)
+    for i in np.argsort(height):  # far -> near
+        cv2.fillConvexPoly(hmap, pts[i], float(height[i]), shift=4)
+    x0, x1 = int(0.12 * cols), int(0.88 * cols)
+    lower = hmap[int(0.55 * rows):int(0.9 * rows), x0:x1]
+    if not np.isfinite(lower).any():
+        return {"features": 0, "max_mm": 0.0, "areas_px": [], "centroids": []}
+    plane = float(np.nanmedian(lower))
+    r0, c0 = int(0.02 * rows), int(0.05 * cols)
+    top = hmap[r0:int(0.45 * rows), c0:int(0.95 * cols)] - plane
+    mask = (np.nan_to_num(np.abs(top), nan=0.0) > thresh_mm).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, _, stats, cents = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    min_area = max(12, int(0.0006 * rows * cols))
+    feats = sorted(((int(stats[i, cv2.CC_STAT_AREA]), cents[i]) for i in range(1, n)
+                    if stats[i, cv2.CC_STAT_AREA] >= min_area), key=lambda f: -f[0])
+    return {"features": len(feats), "max_mm": round(float(np.nanmax(np.abs(top))) if np.isfinite(top).any() else 0.0, 2),
+            "areas_px": [a for a, _ in feats[:8]],
+            "centroids": [(round((c[0] + c0) / cols, 3), round((c[1] + r0) / rows, 3)) for _, c in feats[:8]]}
+
+
 def dimension_error(ext: dict, entry: dict) -> dict:
     """Height (Y) / width (X) error vs the DB spec; depth (Z) may exceed it by the camera bump."""
     dh = ext["y"] - entry["height_mm"]

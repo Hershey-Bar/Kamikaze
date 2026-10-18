@@ -328,16 +328,30 @@ def build_phone_spec(width_mm: float, height_mm: float, depth_mm: float, rear_ca
         x = w / 2 - 0.06 * w - lr
         y0 = h / 2 - 0.06 * w - lr
         housed = island_type != "floating_rings" if island_type else bool(gen and gen < 23)
+        # Ultra layout (S20-S25 Ultra 1:1 dummies): three large rings in a column, the 4th+ module (periscope) as a
+        # smaller ring beside the top ring and the flash beside the next one, both to the viewer's right (-X)
+        big = min(n, 3) if n >= 4 else n
+        side = n - big
+        sr, sx = 0.5 * lr, x - 2.0 * lr
         if housed:
-            hw, hh = 2 * lr + 0.012 * w, (n - 1) * pitch + 2 * lr + 0.024 * w
-            rounded_prism(m, (x, y0 - (n - 1) * pitch / 2, rear - 0.0008), hw, hh, 0.0016, 0.3 * hw, body, 0.6, 0.3)
+            left, right = x + lr + 0.006 * w, (sx - sr if side else x - lr) - 0.006 * w
+            hw, hh = left - right, (big - 1) * pitch + 2 * lr + 0.024 * w
+            rounded_prism(m, ((left + right) / 2, y0 - (big - 1) * pitch / 2, rear - 0.0008), hw, hh, 0.0016,
+                          0.3 * min(hw, hh), body, 0.6, 0.3)
             base = rear - 0.0016
         else:
             base = rear
-        for i in range(n):
+        for i in range(big):
             y = y0 - i * pitch
             m.cylinder((x, y, base - 0.0011), lr, 0.0022, LENS, axis="z", metallic=0.9, rough=0.1)
             m.cylinder((x, y, base - 0.0023), lr * 0.62, 0.0002, GLASS, axis="z", metallic=0.2, rough=0.02)
+        for i in range(side):
+            y = y0 - i * pitch
+            m.cylinder((sx, y, base - 0.0008), sr, 0.0016, LENS, axis="z", metallic=0.9, rough=0.1)
+            m.cylinder((sx, y, base - 0.0017), sr * 0.62, 0.0002, GLASS, axis="z", metallic=0.2, rough=0.02)
+        if side:
+            m.cylinder((sx, y0 - side * pitch, base - 0.0003), 0.35 * sr, 0.0006,
+                       (0.95, 0.9, 0.75), axis="z", metallic=0.1, rough=0.3)
     return m.to_glb({"kind": SPEC_TAG, "category": "smartphone",
                      "dimensions_mm": {"width": width_mm, "height": height_mm, "depth": depth_mm},
                      "rear_cameras": n, **({"island_type": island_type} if island_type else {}), **meta, **(extras or {})})

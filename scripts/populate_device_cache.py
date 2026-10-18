@@ -5,8 +5,10 @@ For every device in models/devices_db.json (GSMArena-verified dimensions):
      relevance, popularity (likes / downloads) and licence (cad_dummies.search). The top candidates are downloaded
      and converted (metres, height +Y, screen +Z, camera bump -Z at the top). Every converted mesh is measured and
      must match the published height and width within +/-2.0 mm (depth: published -2 .. +7 mm for the camera bump).
-     Among the passing files the most accurate + best regarded wins: rank = candidate score - 3 x |error mm| - 8 if
-     no camera bump was found.
+     The back must also carry camera relief (device_cache.back_relief: lens rings / island standing >= 0.35 mm off
+     the back glass); blank size-tester slabs are rejected. Among the passing files the most accurate + best regarded
+     wins: rank = candidate score - 3 x |error mm|. CC non-commercial prints are only considered with --allow-nc
+     (local, attributed, non-commercial display).
   2. Otherwise the spec-generated body (procedural_glb, exact published dimensions, design-family camera island,
      flagged ESTIMATED with its approximations) is cached so the device still loads offline.
   3. The GLB is re-centred so its centre of mass is at (0, 0, 0) and written with an attribution sidecar.
@@ -14,7 +16,7 @@ Then the camera-island renders are embedded with DINOv2 (when the exported model
 models/phone_embeddings.npz for phone_classifier.py.
 
     python scripts/populate_device_cache.py [--only id,id] [--force] [--retry-estimated] [--budget 120]
-                                            [--offline] [--no-embeddings]
+                                            [--allow-nc] [--offline] [--no-embeddings]
 """
 from __future__ import annotations
 
@@ -51,11 +53,18 @@ ENOUGH_PASSING = 3
 ACCESSORY_WORDS = {"stand", "case", "cases", "mount", "holder", "dock", "raiser", "riser", "adapter", "controller",
                    "joycon", "cover", "bumper", "grip", "tripod", "clip", "wallet", "charger", "cradle", "sleeve"}
 DUMMY_WORDS = {"dummy", "replica", "mockup", "mock", "template", "1:1", "blank", "body"}
+# pre-launch models drawn from rumours / leaks / concept renders are not verified geometry
+SPECULATIVE_WORDS = {"rumor", "rumored", "rumors", "rumour", "rumoured", "rumours", "leak", "leaked", "leaks",
+                     "concept", "speculative", "unofficial"}
 
 
 def is_accessory(title: str) -> bool:
     words = set(re.findall(r"[a-z0-9:]+", (title or "").lower()))
     return bool(words & ACCESSORY_WORDS) and not words & DUMMY_WORDS
+
+
+def is_speculative(title: str) -> bool:
+    return bool(set(re.findall(r"[a-z0-9:]+", (title or "").lower())) & SPECULATIVE_WORDS)
 
 
 def product_for(dev_id: str, e: dict) -> SimpleNamespace:
@@ -83,6 +92,9 @@ def best_dummy(dev_id: str, e: dict, budget_s: float) -> tuple[dict, bytes, dict
     for cand in cands:
         if is_accessory(cand["title"]):
             rejected.append({"uid": cand["uid"], "why": f"accessory title: {cand['title']!r}"})
+            continue
+        if is_speculative(cand["title"]):
+            rejected.append({"uid": cand["uid"], "why": f"pre-release / speculative model: {cand['title']!r}"})
             continue
         if time.monotonic() > deadline or downloads >= MAX_DOWNLOADS or len(passing) >= ENOUGH_PASSING:
             break
@@ -115,13 +127,16 @@ def best_dummy(dev_id: str, e: dict, budget_s: float) -> tuple[dict, bytes, dict
                 rejected.append({"uid": cand["uid"], "file": f["name"],
                                  "why": f"+/-{device_cache.DIM_TOL_MM} mm gate: {err}"})
                 continue
-            # GSMArena depth excludes the camera bump, so a 1:1 rear shell is >= ~0.5 mm deeper than the spec;
-            # a flat slab at or under the body depth (e.g. a 145 x 70 x 7 mm block) has no bump.
-            bump = not any("no camera bump" in n for n in report.get("notes", [])) and err["depth_mm"] >= 0.5
-            rank = cand["score"] - 3.0 * err["abs_mm"] - (0.0 if bump else 8.0)
+            # a right-sized slab without lens rings / island (size testers, blank shells) is not a 1:1 replica
+            relief = device_cache.back_relief(glb)
+            if relief["features"] == 0:
+                rejected.append({"uid": cand["uid"], "file": f["name"],
+                                 "why": f"no camera relief on the back (max {relief['max_mm']} mm): blank slab"})
+                continue
+            rank = cand["score"] - 3.0 * err["abs_mm"]
             passing.append(({**cand, "file": f["name"], "report": report}, glb,
                             {"rank": round(rank, 2), "error_mm": err, "extent_mm": ext, "com_shift_m": com,
-                             "camera_bump": bump}))
+                             "camera_bump": True, "camera_relief": relief}))
             log.info("%s: pass %r / %s  err %s  rank %.1f", dev_id, cand["title"], f["name"], err, rank)
             break  # one passing file per print is enough
     if not passing:
@@ -170,6 +185,13 @@ def write_entry(dev_id: str, attr: dict, glb: bytes) -> dict:
     return attr
 
 
+def _has_relief(dev_id: str) -> bool:
+    try:
+        return device_cache.back_relief(device_cache.glb_file(dev_id).read_bytes())["features"] > 0
+    except (OSError, ValueError):
+        return False
+
+
 def populate(only: set[str] | None, force: bool, retry_estimated: bool, budget_s: float, offline: bool) -> dict:
     stats = {"dummy": [], "estimated": [], "kept": [], "failed": []}
     for dev_id, e in device_cache.devices().items():
@@ -186,7 +208,8 @@ def populate(only: set[str] | None, force: bool, retry_estimated: bool, budget_s
                 cand, glb, info = found
                 attr = {**cad_harvester._dummy_attr(cand, device_cache.spec_for(dev_id)), "ranking": info}
                 stats["dummy"].append(dev_id)
-            elif have and have.get("source_key") != "spec_generated":
+            elif (have and have.get("source_key") != "spec_generated" and _has_relief(dev_id)
+                  and not is_speculative(have.get("title", ""))):
                 stats["kept"].append(dev_id)  # never replace a verified dummy with an estimate
                 continue
             else:
@@ -241,11 +264,15 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="rebuild cached devices")
     ap.add_argument("--retry-estimated", action="store_true", help="search dummies again for spec-generated entries")
     ap.add_argument("--budget", type=float, default=120.0, help="seconds per device for the dummy search")
+    ap.add_argument("--allow-nc", action="store_true",
+                    help="also accept CC non-commercial prints (attributed, local non-commercial display)")
     ap.add_argument("--offline", action="store_true", help="no network: spec-generated fallbacks only")
     ap.add_argument("--no-embeddings", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     only = {s.strip() for s in args.only.split(",") if s.strip()} or None
+    if args.allow_nc:
+        cad_harvester.ALLOW_NONCOMMERCIAL = True
     stats = populate(only, args.force, args.retry_estimated, args.budget, args.offline)
     print(json.dumps({k: len(v) for k, v in stats.items()}), "| dummies:", ", ".join(stats["dummy"]) or "-")
     if not args.no_embeddings:

@@ -146,6 +146,15 @@ class DeviceCacheTests(unittest.TestCase):
             self.assertTrue(80 < ext["y"] < 200, f"{dev} not in metres ({ext})")
             self.assertLess(max(abs(v) for v in ext["com_mm"]), 0.5, f"{dev} not centred ({ext['com_mm']})")
             self.assertTrue(rec.get("source_key") and (rec.get("author") or rec.get("source")), dev)
+            relief = device_cache.back_relief(Path(rec["glb"]).read_bytes())
+            self.assertGreater(relief["features"], 0, f"{dev}: blank back, no camera relief ({rec.get('title')})")
+
+    def test_s24_ultra_camera_layout(self):
+        """S24 Ultra: three large rings in a column + the smaller periscope / flash beside them (not 4 in a row)."""
+        if device_cache.cached("galaxy_s24_ultra") is None:
+            self.skipTest("cache not populated")
+        rec = device_cache.cached("galaxy_s24_ultra")
+        assert_ultra_layout(self, device_cache.back_relief(Path(rec["glb"]).read_bytes()))
 
     def test_install_is_instant_and_offline(self):
         tmp = Path(tempfile.mkdtemp())
@@ -161,6 +170,47 @@ class DeviceCacheTests(unittest.TestCase):
                 self.assertTrue((tmp / f"{dev}.glb").is_file())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+def assert_ultra_layout(tc, relief):
+    tc.assertGreaterEqual(relief["features"], 4, relief)
+    big, small = relief["centroids"][:3], relief["centroids"][3:]
+    areas = relief["areas_px"]
+    tc.assertLess(areas[3], 0.7 * areas[2], f"4th module is not smaller than the main column: {relief}")
+    xs = [c[0] for c in big]
+    tc.assertLess(max(xs) - min(xs), 0.05, f"large rings not in one column: {relief}")
+    ys = sorted(c[1] for c in big)
+    tc.assertGreater(min(b - a for a, b in zip(ys, ys[1:])), 0.03, f"large rings overlap: {relief}")
+    tc.assertTrue(any(c[0] > max(xs) + 0.05 and ys[0] - 0.05 <= c[1] <= ys[-1] for c in small),
+                  f"no periscope / flash beside the column: {relief}")
+
+
+class CameraReliefTests(unittest.TestCase):
+    def test_blank_slab_has_no_relief(self):
+        m = procedural_glb._Mesh()
+        procedural_glb.rounded_prism(m, (0, 0, 0), 0.079, 0.1623, 0.0086, 0.008, procedural_glb.NEUTRAL, 0.8, 0.35)
+        self.assertEqual(device_cache.back_relief(m.to_glb({}))["features"], 0)
+
+    def test_estimated_ultra_is_column_plus_side(self):
+        spec = device_cache.spec_for("galaxy_s24_ultra")
+        self.assertEqual(spec["rear_cameras"], 4)
+        assert_ultra_layout(self, device_cache.back_relief(procedural_glb.build_from_spec(spec, "galaxy_s24_ultra")))
+
+    def test_estimated_base_model_keeps_three_in_a_column(self):
+        r = device_cache.back_relief(procedural_glb.build_from_spec(device_cache.spec_for("galaxy_s24"), "galaxy_s24"))
+        self.assertEqual(r["features"], 3)
+        self.assertLess(max(c[0] for c in r["centroids"]) - min(c[0] for c in r["centroids"]), 0.05)
+
+    def test_speculative_and_accessory_titles_rejected(self):
+        import importlib.util
+        path = Path(__file__).resolve().parent / "scripts" / "populate_device_cache.py"
+        spec = importlib.util.spec_from_file_location("populate_device_cache", path)
+        pop = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pop)
+        self.assertTrue(pop.is_speculative("3D model of Rumored Samsung galaxy S20 Ultra"))
+        self.assertTrue(pop.is_speculative("iPhone 17 concept (leaked)"))
+        self.assertFalse(pop.is_speculative("Samsung galaxy S24 Ultra phone model"))
+        self.assertFalse(pop.is_speculative("Apple iPhone 14 Replica Mockup Template Blank Smartphone"))
 
 
 class PhoneCueTests(unittest.TestCase):
