@@ -55,6 +55,21 @@ def rect_image(w, h, angle=0.0, size=(320, 240)):
 
 
 class MetadataTests(unittest.TestCase):
+    def test_scene_gate_keeps_dim_smooth_objects(self):
+        """A dark, untextured phone on a dark desk has a low Laplacian variance but a clear outline: not empty."""
+        rng = np.random.default_rng(3)
+        base = np.full((480, 640), 20.0)
+        empty = Image.fromarray(np.clip(base + rng.normal(0, 0.6, base.shape), 0, 255).astype(np.uint8)).convert("RGB")
+        phone = base.copy()
+        phone[150:330, 270:370] = 45.0  # 25 grey levels of contrast, no texture
+        phone = Image.fromarray(np.clip(phone + rng.normal(0, 1.0, base.shape), 0, 255).astype(np.uint8)).convert("RGB")
+        e, p = receiver.scene_saliency(empty), receiver.scene_saliency(phone)
+        self.assertTrue(e["empty"], e)
+        self.assertLess(p["laplacian_var"], receiver.LAPLACIAN_MIN, p)
+        self.assertGreaterEqual(p["edge_density"], receiver.EDGE_MIN, p)
+        self.assertFalse(p["empty"], p)
+        self.assertFalse(receiver.scene_saliency(rect_image(90, 150))["empty"])
+
     def test_can_metadata(self):
         meta = taxonomy.parse_metadata({
             "raw_name": "Coca Cola Original Taste Can 330ml", "category": "beverage_can", "brand": "Coca-Cola",

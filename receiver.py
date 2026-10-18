@@ -48,7 +48,7 @@ Router socket (STM32 firmware untouched), background 3D CAD retrieval and physic
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
 KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE, KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
 KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_FLOOR / C_IDENT / C_SEARCH / MARGIN
-(calibrated confidence), KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
+(calibrated confidence), KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN / CANNY_LO / CANNY_HI (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
 KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0).
 
@@ -150,6 +150,8 @@ SEARCH_FRAMES = 3
 SCENE_GATE = os.environ.get("KAMIKAZE_SCENE_GATE", "1") != "0"
 LAPLACIAN_MIN = float(os.environ.get("KAMIKAZE_LAPLACIAN_MIN", "18"))
 EDGE_MIN = float(os.environ.get("KAMIKAZE_EDGE_MIN", "0.002"))
+CANNY_LO = int(os.environ.get("KAMIKAZE_CANNY_LO", "10"))  # low thresholds: dim webcam scenes have soft outlines
+CANNY_HI = int(os.environ.get("KAMIKAZE_CANNY_HI", "30"))
 SALIENCY_SIZE = 256
 ENROLL_FRAMES = 12
 ENROLL_STALE_S = 15.0
@@ -222,15 +224,17 @@ def scene_saliency(image: Image.Image) -> dict:
     gray = np.asarray(crop, dtype=np.uint8)
     if cv2 is not None:
         lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        edges = float(np.count_nonzero(cv2.Canny(gray, 50, 150))) / gray.size
+        edges = float(np.count_nonzero(cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), CANNY_LO, CANNY_HI))) / gray.size
     else:
         g = gray.astype(np.float64)
         lap = float((g[1:-1, :-2] + g[1:-1, 2:] + g[:-2, 1:-1] + g[2:, 1:-1] - 4.0 * g[1:-1, 1:-1]).var())
         gx = g[1:-1, 2:] - g[1:-1, :-2]
         gy = g[2:, 1:-1] - g[:-2, 1:-1]
-        edges = float(np.count_nonzero(np.hypot(gx, gy) > 100.0)) / gray.size
+        edges = float(np.count_nonzero(np.hypot(gx, gy) > CANNY_HI / 3.0)) / gray.size
+    # Empty needs BOTH signals low: a smooth phone or can with a crisp outline has a low Laplacian variance but a clear
+    # edge contour, and a false "empty" would block recognition entirely (a false "object" is only scored as background).
     return {"laplacian_var": round(lap, 2), "edge_density": round(edges, 5),
-            "empty": lap < LAPLACIAN_MIN or edges < EDGE_MIN}
+            "empty": lap < LAPLACIAN_MIN and edges < EDGE_MIN}
 
 
 def build_eager_model():
@@ -1967,7 +1971,7 @@ class Pipeline:
                            "margin": MIN_MARGIN, "identified_raw_cosine": round(T_IDENT, 4),
                            "searching_raw_cosine": round(T_SEARCH, 4), "phone_margin": PHONE_AMBIG_MARGIN,
                            "front_cap": device_taxonomy.FRONT_CONFIDENCE_CAP, "scene_gate": SCENE_GATE,
-                           "laplacian_min": LAPLACIAN_MIN, "edge_min": EDGE_MIN,
+                           "laplacian_min": LAPLACIAN_MIN, "edge_min": EDGE_MIN, "canny": [CANNY_LO, CANNY_HI],
                            "detector_gate": device_taxonomy.DETECTOR_GATE_MIN},
         }
 

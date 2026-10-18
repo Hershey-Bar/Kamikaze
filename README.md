@@ -122,10 +122,14 @@ kept as `enrolled_classes.<embedder>.bak.pt` and the objects must be re-enrolled
 
 Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` / `_arbitrate`):
 
-1. **Empty-scene gate.** The 60% reticle crop is scored for structure (Laplacian variance and Canny edge density). Below
-   `KAMIKAZE_LAPLACIAN_MIN` (default 18) or `KAMIKAZE_EDGE_MIN` (0.002) the frame is a blank wall / dark scene: detector and
+1. **Empty-scene gate.** The 60% reticle crop is scored for structure (Laplacian variance and Canny edge density, Canny
+   10/30 after a 3×3 blur so dim, soft outlines still register). Only when **both** are low — Laplacian below
+   `KAMIKAZE_LAPLACIAN_MIN` (default 18) *and* edge density below `KAMIKAZE_EDGE_MIN` (0.002) — is the frame a blank wall /
+   dark scene (a smooth phone has a low Laplacian variance but a clear outline, so a Laplacian-only test would reject it):
+   detector and
    embedder are skipped, the state is **SEARCHING** with confidence 0% / margin 0%, the banner reads
-   *Awaiting object inside center reticle...* and one cyan LED is lit `(0,100,150,15,1)`. Disable with `KAMIKAZE_SCENE_GATE=0`.
+   *Awaiting object inside center reticle...* and one cyan LED is lit `(0,100,150,15,1)`. Disable with `KAMIKAZE_SCENE_GATE=0`;
+   tune edges with `KAMIKAZE_CANNY_LO` / `KAMIKAZE_CANNY_HI`. Live values are shown in the Edge-AI telemetry card.
 2. **Detector = domain gate.** YOLO26n on the NPU only restricts *which classes may match*: `cell phone` ≥ 0.50 → smartphones
    only, `cup` / `bottle` ≥ 0.50 → beverage cans/bottles only. If the unrestricted top-1 is from the other domain the frame is
    **GUIDING** with *Verifying object geometry... Hold steady in center.*
