@@ -1,5 +1,36 @@
 # Kamikaze
 
+
+## Final hackathon build (at a glance)
+
+**What it does:** Kamikaze recognises phones (iPhone 12-16, Galaxy S20-S25, Z Fold 3-6) and beverage cans (Coke, Pepsi,
+Sprite, Kirkland sparkling water) live from the Brio 101 camera on an Arduino VENTUNO Q. It shows a verified,
+attributed 3D model in the dashboard and drives the Modulino Pixels LEDs (green = identified, amber = rotate,
+cyan = searching). Everything runs at the edge; camera frames never touch disk.
+
+**Stack:**
+- **Hardware:** Arduino VENTUNO Q (Qualcomm QCS8275, Hexagon NPU, Ubuntu 24.04), STM32H5F5 on Zephyr with Modulino Pixels.
+- **Firmware link:** arduino-router plus MessagePack-RPC `set_pixels`.
+- **Python 3.12:** `receiver.py` (HTTP, MJPEG and SSE on port 5000) and FastMCP `mcp_server.py`.
+- **Vision:** YOLO-World detection, DINOv2 / MobileNetV3 few-shot embeddings and pose, RapidOCR.
+- **Classifiers:** HSV+LAB citrus classifier, phone-island classifier.
+- **Frontend:** `<model-viewer>` dashboard.
+
+**Pipeline:** Brio capture → YOLO-World domain gate → embedding match + OCR / colour / camera-island cues → sigmoid +
+EMA confidence → LEDs over RPC → 3D asset lookup. Lookup order: local library (hand scans) → offline device CAD cache
+(38 phones, within ±2 mm of GSMArena dimensions, camera relief gate) → Printables / Thingiverse / Sketchfab / Poly Pizza,
+popularity-ranked and licence-checked → dimension-calibrated estimate. The result is shown on the stage with Auto-Orient
+pose sync.
+
+**Features:**
+- Guided 4-angle enrollment and a model library with delete.
+- Smart kiosk scan with citrus disambiguation.
+- Offline CAD cache with real 1:1 dummies (e.g. Galaxy S24 Ultra, Printables #733692).
+- Label stitching.
+- MCP tools for CAD and packaging lookup.
+- Hardware telemetry.
+- 317 automated tests.
+
 Real-time edge AI: a webcam feed is classified on the **Arduino VENTUNO Q** (Qualcomm Dragonwing QCS8275, Hexagon NPU), the
 matching 3D model is fetched and shown in a pose-synchronised `<model-viewer>`, and the **Modulino Pixels** on the STM32H5F5
 co-processor show the recognition state.
