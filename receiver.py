@@ -2,11 +2,15 @@
 """Kamikaze edge receiver: few-shot visual identification, guidance state machine, 3D dashboard.
 
 One process, one port (0.0.0.0:5000):
-  POST /upload | /api/frame | /      raw JPEG frame from stream_cam.py -> JSON verdict
+  POST /api/ingest                   live stream_cam.py frames: returns at once with the latest verdict; a background NPU
+                                     worker always processes the newest frame (older unprocessed frames are dropped)
+  POST /upload | /api/frame | /      raw JPEG frame -> synchronous JSON verdict (tests, replay_frames.py, verify_live.py)
   GET  /                             interactive dashboard + <model-viewer> (static/index.html)
   GET  /api/state                    live telemetry (state, top-1, confidence, guidance, LEDs, ...)
   GET  /api/asset                    active 3D asset for the identified object
-  GET  /api/frame.jpg                latest camera frame (dashboard live view)
+  GET  /api/stream                   MJPEG live view (multipart/x-mixed-replace, each new frame, <= KAMIKAZE_STREAM_FPS)
+  GET  /api/frame.jpg                latest camera frame (404 once the stream has been idle for KAMIKAZE_STALE_S)
+  GET  /api/ring | /api/ring/frame.jpg?ago=N   opt-in RAM frame ring (KAMIKAZE_RING_GB, training mode only)
   GET  /api/classes                  enrolled classes: metadata, view count, created_at, CAD status/credit
   DELETE /api/classes/<id>[?delete_cad=0]   remove one class + its cached GLB/attribution (keep the GLB with delete_cad=0)
   POST /api/classes/reset            {"delete_cad": true} drop every enrolled class (and their cached GLBs)
@@ -38,10 +42,13 @@ Router socket (STM32 firmware untouched), background 3D CAD retrieval and physic
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
 KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE, KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
 KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_T_IDENT/T_SEARCH/MARGIN,
-KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s).
+KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
+KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0).
 
-Privacy: no raw image is ever written to disk or accumulated; only 1280-d vectors reach enrolled_classes.pt. The
-dashboard's live view keeps ONE most-recent JPEG in RAM (overwritten every frame; disabled in deployment mode).
+Privacy: no raw image is ever written to disk; only 1280-d vectors reach enrolled_classes.pt. The dashboard's live
+view keeps ONE most-recent JPEG in RAM (overwritten every frame, dropped when the stream goes idle, disabled in
+deployment mode). KAMIKAZE_RING_GB > 0 opts in to a RAM ring of recent frames (training mode only, reported in
+/api/telemetry privacy + memory_pools).
 """
 
 from __future__ import annotations
@@ -143,6 +150,11 @@ MV_IDLE_EXPIRE_S = 900.0
 SSE_PERIOD_S = 0.1
 SSE_KEEPALIVE_S = 1.0
 TELEMETRY_PERIOD_S = float(os.environ.get("KAMIKAZE_TELEMETRY_PERIOD", "1.0"))
+STALE_S = float(os.environ.get("KAMIKAZE_STALE_S", "3.0"))  # no camera frame for this long -> stream idle, preview dropped
+STREAM_MAX_FPS = float(os.environ.get("KAMIKAZE_STREAM_FPS", "30"))  # MJPEG /api/stream rate cap
+RING_GB = float(os.environ.get("KAMIKAZE_RING_GB", "0")) if MODE == "training" else 0.0
+ASSET_CACHE_MB = float(os.environ.get("KAMIKAZE_ASSET_CACHE_MB", "1024"))
+JPEG_SOI = b"\xff\xd8\xff"
 
 
 # --------------------------------------------------------------------------------------
@@ -1095,6 +1107,134 @@ class SystemStats:
 
 
 # --------------------------------------------------------------------------------------
+# RAM pools: static/GLB cache and the opt-in camera frame ring
+# --------------------------------------------------------------------------------------
+
+
+def _phys_ram_bytes() -> int | None:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+class StaticCache:
+    """LRU RAM cache for static files (GLB models, model-viewer JS): served from memory, revalidated by mtime/size."""
+
+    PRELOAD = ("models/*.glb", "vendor/*.js")
+
+    def __init__(self, budget_bytes: int) -> None:
+        self.budget = max(0, int(budget_bytes))
+        self._lock = threading.Lock()
+        self._items: collections.OrderedDict[str, tuple[int, int, bytes]] = collections.OrderedDict()
+        self._bytes = 0
+        self.hits = self.misses = 0
+
+    def read(self, path: Path) -> bytes:
+        st = path.stat()
+        key, sig = str(path), (st.st_mtime_ns, st.st_size)
+        with self._lock:
+            item = self._items.get(key)
+            if item is not None and item[:2] == sig:
+                self._items.move_to_end(key)
+                self.hits += 1
+                return item[2]
+        data = path.read_bytes()
+        with self._lock:
+            self.misses += 1
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._bytes -= len(old[2])
+            if len(data) <= self.budget:
+                self._items[key] = (*sig, data)
+                self._bytes += len(data)
+                while self._bytes > self.budget and self._items:
+                    self._bytes -= len(self._items.popitem(last=False)[1][2])
+        return data
+
+    def preload(self, root: Path) -> int:
+        n = 0
+        for pattern in self.PRELOAD:
+            for path in sorted(root.glob(pattern)):
+                try:
+                    self.read(path)
+                    n += 1
+                except OSError:
+                    pass
+        return n
+
+    def prune(self) -> None:
+        with self._lock:
+            for key in [k for k in self._items if not os.path.exists(k)]:
+                self._bytes -= len(self._items.pop(key)[2])
+
+    def info(self) -> dict:
+        self.prune()
+        with self._lock:
+            return {"files": len(self._items), "mb": round(self._bytes / 2**20, 1), "budget_mb": round(self.budget / 2**20, 1),
+                    "hits": self.hits, "misses": self.misses}
+
+
+class FrameRing:
+    """Opt-in RAM ring of recent decoded RGB camera frames (KAMIKAZE_RING_GB > 0, training mode only). Pages are
+    committed as frames arrive, never written to disk, and dropped on clear() or when the frame size changes."""
+
+    def __init__(self, budget_bytes: int) -> None:
+        phys = _phys_ram_bytes()
+        cap = int(phys * 0.6) if phys else None
+        self.budget = max(0, min(int(budget_bytes), cap) if cap else int(budget_bytes))
+        self._lock = threading.Lock()
+        self._buf: np.ndarray | None = None
+        self._ts: np.ndarray | None = None
+        self._head = self._count = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.budget > 0
+
+    def push(self, image: Image.Image) -> None:
+        if not self.budget:
+            return
+        arr = np.asarray(image, dtype=np.uint8)
+        with self._lock:
+            if self._buf is None or self._buf.shape[1:] != arr.shape:
+                self._buf = None
+                capacity = max(1, self.budget // max(1, arr.nbytes))
+                self._buf = np.empty((capacity, *arr.shape), np.uint8)
+                self._ts = np.zeros(capacity, np.float64)
+                self._head = self._count = 0
+            self._buf[self._head] = arr
+            self._ts[self._head] = time.time()
+            self._head = (self._head + 1) % len(self._buf)
+            self._count = min(self._count + 1, len(self._buf))
+
+    def get(self, ago: int = 0) -> np.ndarray | None:
+        with self._lock:
+            if self._buf is None or not 0 <= ago < self._count:
+                return None
+            return self._buf[(self._head - 1 - ago) % len(self._buf)].copy()
+
+    def __len__(self) -> int:
+        return self._count
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buf = self._ts = None
+            self._head = self._count = 0
+
+    def info(self) -> dict:
+        with self._lock:
+            out = {"enabled": self.enabled, "budget_mb": round(self.budget / 2**20, 1), "frames": self._count,
+                   "capacity": 0, "used_mb": 0.0, "shape": None, "span_s": 0.0}
+            if self._buf is not None and self._count:
+                cap, frame_bytes = len(self._buf), self._buf[0].nbytes
+                newest, oldest = self._ts[(self._head - 1) % cap], self._ts[(self._head - self._count) % cap]
+                out.update(capacity=cap, used_mb=round(self._count * frame_bytes / 2**20, 1),
+                           shape=list(self._buf.shape[1:]), span_s=round(float(newest - oldest), 2))
+            return out
+
+
+# --------------------------------------------------------------------------------------
 # Pipeline: frame -> embedding -> scores -> state -> actuation / assets
 # --------------------------------------------------------------------------------------
 
@@ -1123,6 +1263,18 @@ class Pipeline:
         self._frame_lock = threading.Lock()
         self._snap_lock = threading.Lock()
         self._latest_jpeg: bytes | None = None  # single most-recent preview frame, in RAM only, overwritten each frame
+        self._frame_cv = threading.Condition(self._frame_lock)
+        self._frame_seq = 0
+        self._ingested = 0
+        self._ingest_fps = 0.0
+        self._last_ingest_mono = 0.0
+        self._pending: bytes | None = None
+        self._pending_cv = threading.Condition()
+        self._dropped = 0
+        self._decode_errors = 0
+        self._worker: threading.Thread | None = None
+        self.ring = FrameRing(int(RING_GB * 2**30))
+        self.static_cache = StaticCache(int(ASSET_CACHE_MB * 2**20))
         self._embed_lat: collections.deque = collections.deque(maxlen=240)
         self._total_lat: collections.deque = collections.deque(maxlen=240)
         self._started = time.time()
@@ -1138,7 +1290,73 @@ class Pipeline:
     @property
     def latest_jpeg(self) -> bytes | None:
         with self._frame_lock:
+            if self._latest_jpeg is not None and time.monotonic() - self._last_ingest_mono > STALE_S:
+                self._latest_jpeg = None  # stream went idle: never keep showing (or holding) an old frame
             return self._latest_jpeg
+
+    def _publish_frame(self, data: bytes) -> None:
+        now = time.monotonic()
+        with self._frame_cv:
+            if PREVIEW_FRAME:
+                self._latest_jpeg = data
+            gap = now - self._last_ingest_mono if self._last_ingest_mono else None
+            if gap is None or gap > STALE_S:
+                self._ingest_fps = 0.0
+            else:
+                inst = 1.0 / max(1e-3, gap)
+                self._ingest_fps = inst if self._ingest_fps == 0 else 0.85 * self._ingest_fps + 0.15 * inst
+            self._last_ingest_mono = now
+            self._ingested += 1
+            self._frame_seq += 1
+            self._frame_cv.notify_all()
+
+    def wait_frame(self, seq: int, timeout: float) -> tuple[bytes | None, int]:
+        """Block until a frame newer than `seq` arrives (MJPEG stream). (None, seq) on timeout."""
+        with self._frame_cv:
+            self._frame_cv.wait_for(lambda: self._frame_seq != seq, timeout)
+            if self._frame_seq == seq or time.monotonic() - self._last_ingest_mono > STALE_S:
+                return None, self._frame_seq
+            return self._latest_jpeg, self._frame_seq
+
+    def ingest(self, data: bytes) -> dict:
+        """Fast live-stream path: publish the frame for the preview and hand it to the NPU worker (latest frame wins,
+        older unprocessed frames are dropped). Returns the most recent verdict without waiting for inference."""
+        if not data.startswith(JPEG_SOI):
+            raise ValueError("not a JPEG frame")
+        self._publish_frame(data)
+        with self._pending_cv:
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._work, name="npu-worker", daemon=True)
+                self._worker.start()
+            if self._pending is not None:
+                self._dropped += 1
+            self._pending = data
+            self._pending_cv.notify()
+        with self._snap_lock:
+            last = dict(self._last)
+        return {"ok": True, "queued": True, "seq": self._frame_seq, "state": last["state"], "label": last["label"],
+                "similarity": round(last["similarity"], 3), "confidence": round(last["confidence"], 3),
+                "fps": round(self._fps, 1), "ingest_fps": round(self._ingest_fps, 1), "latency_ms": round(last["total_ms"], 1)}
+
+    def _work(self) -> None:
+        while True:
+            with self._pending_cv:
+                self._pending_cv.wait_for(lambda: self._pending is not None)
+                data, self._pending = self._pending, None
+            try:
+                self.process_jpeg(data, publish=False)
+            except ValueError:
+                self._decode_errors += 1
+            except Exception:
+                log.exception("Frame processing failed")
+
+    def stream_stats(self) -> dict:
+        age = time.monotonic() - self._last_ingest_mono if self._last_ingest_mono else None
+        live = age is not None and age <= STALE_S
+        return {"live": live, "frame_age_s": round(age, 2) if age is not None else None,
+                "ingest_fps": round(self._ingest_fps, 1) if live else 0.0, "infer_fps": round(self._fps, 1) if live else 0.0,
+                "ingested": self._ingested, "processed": self._frames, "dropped": self._dropped,
+                "decode_errors": self._decode_errors, "async_worker": self._worker is not None}
 
     def _bump(self) -> None:
         with self._ver_cv:
@@ -1157,7 +1375,7 @@ class Pipeline:
         self.assets.get(label)
         self._bump()
 
-    def process_jpeg(self, data: bytes) -> dict:
+    def process_jpeg(self, data: bytes, publish: bool = True) -> dict:
         t0 = time.perf_counter()
         try:
             image = Image.open(io.BytesIO(data))
@@ -1165,10 +1383,10 @@ class Pipeline:
         except Exception as exc:
             raise ValueError(f"undecodable image: {exc}") from exc
         image = image.convert("RGB")
-        if PREVIEW_FRAME:
-            with self._frame_lock:
-                self._latest_jpeg = data
+        if publish:
+            self._publish_frame(data)
         del data
+        self.ring.push(image)
         with self._infer_lock:
             box, detect_ms = self._locate(image)
             arr = preprocess(image, box)
@@ -1210,9 +1428,11 @@ class Pipeline:
             self._pose, self._best_view, self._category = pose, best_view, category
             self._frames += 1
             now = time.monotonic()
-            if self._last_frame_mono:
+            if self._last_frame_mono and now - self._last_frame_mono <= STALE_S:
                 inst = 1.0 / max(1e-3, now - self._last_frame_mono)
-                self._fps = inst if self._fps == 0 else 0.8 * self._fps + 0.2 * inst
+                self._fps = inst if self._fps == 0 else 0.85 * self._fps + 0.15 * inst
+            else:
+                self._fps = 0.0
             self._last_frame_mono = now
             total_ms = (time.perf_counter() - t0) * 1000.0
             self._embed_lat.append((t2 - t1) * 1000.0)
@@ -1309,7 +1529,8 @@ class Pipeline:
     def snapshot(self) -> dict:
         with self._snap_lock:
             last = dict(self._last)
-        age = round(time.monotonic() - self._last_frame_mono, 2) if self._last_frame_mono else None
+        stream = self.stream_stats()
+        age = stream["frame_age_s"]
         viewer = (
             self.assets.peek(self._viewer_label)
             if self._viewer_label
@@ -1337,7 +1558,9 @@ class Pipeline:
             "latency_ms": {"embed": round(last["embed_ms"], 1), "detect": round(last["detect_ms"], 1), "total": round(last["total_ms"], 1)},
             "detection": self._detection,
             "accelerator": self.accelerator(),
-            "fps": round(self._fps, 1),
+            "fps": stream["infer_fps"],
+            "ingest_fps": stream["ingest_fps"],
+            "stream": stream,
             "frames": self._frames,
             "frame_age_s": age,
             "led": self.leds.status(),
@@ -1356,10 +1579,10 @@ class Pipeline:
         }
 
     def privacy(self) -> dict:
-        with self._frame_lock:
-            held = self._latest_jpeg is not None
+        held = self.latest_jpeg is not None
         return {"raw_frames_persisted": False, "images_written_to_disk": False, "stored_in_class_db": "1280-d vectors only",
-                "preview_frame_in_ram": bool(PREVIEW_FRAME and held), "preview_enabled": PREVIEW_FRAME, "mode": MODE}
+                "preview_frame_in_ram": bool(PREVIEW_FRAME and held), "preview_enabled": PREVIEW_FRAME, "mode": MODE,
+                "ram_ring_enabled": self.ring.enabled, "ram_ring_frames": len(self.ring)}
 
     def accelerator(self) -> str:
         on_npu = [name for name, part in (("embedder", self.extractor), ("detector", self.detector))
@@ -1399,7 +1622,7 @@ class Pipeline:
                 "embed_ms_median": telemetry.percentile(embed, 50), "embed_ms_p95": telemetry.percentile(embed, 95),
                 "detect_ms_median": telemetry.percentile(detect, 50), "detect_ms_p95": telemetry.percentile(detect, 95),
                 "total_ms_median": telemetry.percentile(total, 50), "total_ms_p95": telemetry.percentile(total, 95),
-                "samples": len(embed), "fps": round(self._fps, 1), "frames": self._frames,
+                "samples": len(embed), "fps": self.stream_stats()["infer_fps"], "frames": self._frames,
                 "cosine_similarity": round(last["similarity"], 4), "margin": round(last["margin"], 4),
                 "confidence": round(last["confidence"], 4), "label": last["label"],
                 "accelerator": self.accelerator(),
@@ -1410,6 +1633,8 @@ class Pipeline:
                 "detection": self._detection,
             },
             "privacy": self.privacy(),
+            "stream": self.stream_stats(),
+            "memory_pools": {"static_cache": self.static_cache.info(), "frame_ring": self.ring.info()},
             "uptime_service_s": round(time.time() - self._started, 1),
         }
 
@@ -1506,11 +1731,53 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/frame.jpg":
             frame = p.latest_jpeg
             if frame is None:
-                return self._json(404, {"ok": False, "error": "no frame received yet" if PREVIEW_FRAME else "preview disabled (deployment mode)"})
+                return self._json(404, {"ok": False, "error": "no live frame (stream idle)" if PREVIEW_FRAME else "preview disabled (deployment mode)"})
             return self._send(200, frame, "image/jpeg")
+        if path == "/api/stream":
+            if not PREVIEW_FRAME:
+                return self._json(404, {"ok": False, "error": "preview disabled (deployment mode)"})
+            return self._mjpeg()
+        if path == "/api/ring":
+            return self._json(200, {"ok": True, **p.ring.info()})
+        if path == "/api/ring/frame.jpg":
+            try:
+                ago = int(urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("ago", ["0"])[0])
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "ago must be an integer"})
+            arr = p.ring.get(ago)
+            if arr is None:
+                return self._json(404, {"ok": False, "error": "frame not in RAM ring (KAMIKAZE_RING_GB=0 or out of range)"})
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, "JPEG", quality=85)
+            return self._send(200, buf.getvalue(), "image/jpeg")
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
         self._json(404, {"ok": False, "error": "not found"})
+
+    def _mjpeg(self) -> None:
+        """multipart/x-mixed-replace live view: pushes each new camera frame as it arrives (capped at STREAM_MAX_FPS)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=kzframe")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        p, seq, last = self.pipeline, -1, 0.0
+        min_dt = 1.0 / max(1.0, STREAM_MAX_FPS)
+        try:
+            while True:
+                data, seq = p.wait_frame(seq, SSE_KEEPALIVE_S * 5)
+                if data is None:
+                    continue
+                wait = min_dt - (time.monotonic() - last)
+                if wait > 0:
+                    time.sleep(wait)
+                    data = p.latest_jpeg or data
+                last = time.monotonic()
+                self.wfile.write(b"--kzframe\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % len(data) + data + b"\r\n")
+                self.wfile.flush()
+        except (OSError, ValueError):
+            return
 
     def _telemetry_sse(self) -> None:
         self.send_response(200)
@@ -1655,13 +1922,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(404, {"ok": False, "error": "not found"})
         ctype = _MIME.get(target.suffix.lower()) or mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         cache = "no-cache" if target.suffix == ".html" else "public, max-age=3600"
-        self._send(200, target.read_bytes(), ctype, cache)
+        try:
+            body = self.pipeline.static_cache.read(target)
+        except OSError:
+            return self._json(404, {"ok": False, "error": "not found"})
+        self._send(200, body, ctype, cache)
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
         body = self._read_body()
         if body is None:
             return
+        if path == "/api/ingest":
+            try:
+                return self._json(200, self.pipeline.ingest(body))
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
         if path in ("/", "/upload", "/api/frame"):
             try:
                 return self._json(200, self.pipeline.process_jpeg(body))
@@ -1749,6 +2025,10 @@ def main() -> None:
     assets = AssetManager()
     pipeline = Pipeline(extractor, bank, leds, assets, detector)
     assets.prepare_static()
+    threading.Thread(target=lambda: log.info("RAM asset cache: %d static files preloaded (%s)", pipeline.static_cache.preload(STATIC_DIR),
+                                             pipeline.static_cache.info()), name="asset-preload", daemon=True).start()
+    if pipeline.ring.enabled:
+        log.info("RAM frame ring enabled: %.1f GB budget (training mode, never written to disk)", pipeline.ring.budget / 2**30)
     leds.set(led_params(SEARCHING, 0.0))
     server = make_server(pipeline, args.host, args.port)
     log.info(

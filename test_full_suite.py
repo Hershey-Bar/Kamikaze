@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from http.client import HTTPConnection
@@ -474,6 +475,101 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
     def test_preview_frame_is_not_served_in_deployment_mode(self):
         with mock.patch.object(self.receiver, "PREVIEW_FRAME", False):
             self.assertEqual(self.call("GET", "/api/frame.jpg")[0], 404)
+
+    def _until(self, cond, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_ingest_answers_fast_and_worker_infers_newest_frame(self):
+        self.assertEqual(self.call("POST", "/api/ingest", b"junk")[0], 400)
+        frame = self.tc.jpeg()
+        t0 = time.perf_counter()
+        for _ in range(20):
+            status, data = self.call("POST", "/api/ingest", frame)
+            self.assertEqual(status, 200, data)
+            self.assertTrue(data["queued"])
+        per_post_ms = (time.perf_counter() - t0) / 20 * 1000
+        self.assertTrue(self._until(lambda: (lambda s: s["processed"] + s["dropped"] == 20)(self.pipe.stream_stats())),
+                        self.pipe.stream_stats())
+        st = self.pipe.stream_stats()
+        self.assertEqual((st["ingested"], st["decode_errors"]), (20, 0))
+        self.assertGreaterEqual(st["processed"], 1)
+        _, state = self.call("GET", "/api/state")
+        self.assertTrue(state["stream"]["live"])
+        self.assertGreater(state["ingest_fps"], 0)
+        self.assertEqual(self.call("GET", "/api/frame.jpg")[1], frame)
+        print(f"\n  /api/ingest: {per_post_ms:.2f} ms per POST (loopback), {st['processed']} inferred, {st['dropped']} superseded")
+
+    def test_idle_stream_drops_preview_and_zeroes_fps(self):
+        for _ in range(3):
+            self.call("POST", "/api/ingest", self.tc.jpeg())
+        self.assertEqual(self.call("GET", "/api/frame.jpg")[0], 200)
+        with mock.patch.object(self.receiver, "STALE_S", 0.05):
+            time.sleep(0.15)
+            self.assertEqual(self.call("GET", "/api/frame.jpg")[0], 404)
+            _, state = self.call("GET", "/api/state")
+            self.assertFalse(state["stream"]["live"])
+            self.assertEqual((state["fps"], state["ingest_fps"]), (0.0, 0.0))
+            self.assertFalse(state["privacy"]["preview_frame_in_ram"])
+
+    def test_mjpeg_stream_pushes_each_new_frame(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        frame = self.tc.jpeg()
+        try:
+            conn.request("GET", "/api/stream")
+            resp = conn.getresponse()
+            self.assertIn("multipart/x-mixed-replace", resp.getheader("Content-Type"))
+            threading.Timer(0.2, lambda: self.pipe.ingest(frame)).start()
+            self.assertEqual(resp.readline(), b"--kzframe\r\n")
+            headers = {}
+            while (line := resp.readline()) != b"\r\n":
+                key, value = line.decode().split(":", 1)
+                headers[key.strip().lower()] = value.strip()
+            self.assertEqual(headers["content-type"], "image/jpeg")
+            self.assertEqual(resp.read(int(headers["content-length"])), frame)
+        finally:
+            conn.close()
+
+
+class RamPoolTests(unittest.TestCase):
+    def test_static_cache_hits_revalidates_and_evicts(self):
+        import receiver
+        tmp = Path(tempfile.mkdtemp(prefix="kz_cache_"))
+        try:
+            a, b = tmp / "a.glb", tmp / "b.glb"
+            a.write_bytes(b"x" * 600)
+            b.write_bytes(b"y" * 600)
+            cache = receiver.StaticCache(1000)
+            self.assertEqual(cache.read(a), b"x" * 600)
+            self.assertEqual(cache.read(a), b"x" * 600)
+            self.assertEqual((cache.hits, cache.misses), (1, 1))
+            a.write_bytes(b"z" * 500)
+            self.assertEqual(cache.read(a), b"z" * 500)
+            self.assertEqual(cache.misses, 2)
+            cache.read(b)
+            self.assertEqual(cache.info()["files"], 1)
+            b.unlink()
+            self.assertEqual(cache.info()["files"], 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_frame_ring_wraps_newest_first_and_is_off_by_default(self):
+        import receiver
+        from PIL import Image
+        ring = receiver.FrameRing(4 * 4 * 3 * 3)
+        for v in range(5):
+            ring.push(Image.new("RGB", (4, 4), (v, v, v)))
+        self.assertEqual(len(ring), 3)
+        self.assertEqual([int(ring.get(i)[0, 0, 0]) for i in range(3)], [4, 3, 2])
+        self.assertIsNone(ring.get(3))
+        self.assertEqual((ring.info()["capacity"], ring.info()["frames"]), (3, 3))
+        ring.clear()
+        self.assertEqual(len(ring), 0)
+        self.assertFalse(receiver.FrameRing(0).enabled)
 
 
 class HardwareStatsTests(unittest.TestCase):

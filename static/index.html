@@ -176,13 +176,14 @@
         <div class="kv" id="kvThermal">Thermal: —</div>
         <div class="kv" id="kvInfer">Inference: —</div>
         <div class="kv" id="kvNpu">NPU: —</div>
+        <div class="kv" id="kvStream">Stream: —</div>
       </div>
       <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
       <div class="mute" id="tBackend" style="margin-top:8px"></div>
     </section>
   </div>
 </main>
-<footer>Object detection (Ultralytics YOLO26n) and 1280-d embeddings (MobileNetV3-Large) run on the Hexagon NPU through the QNN TFLite delegate, with the Arm CPU as fallback. Pose is a heuristic estimate. No camera image is ever saved: only 1280-d vectors are stored, and the live view holds a single in-memory frame. API: <code>/api/state</code>, <code>/api/telemetry</code>, <code>/api/classes</code>, <code>/api/credits</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
+<footer>Object detection (Ultralytics YOLO26n) and 1280-d embeddings (MobileNetV3-Large) run on the Hexagon NPU through the QNN TFLite delegate, with the Arm CPU as fallback. Pose is a heuristic estimate. No camera image is ever saved: only 1280-d vectors are stored, and the live view holds a single in-memory frame (MJPEG <code>/api/stream</code>, dropped when the stream goes idle). API: <code>/api/state</code>, <code>/api/telemetry</code>, <code>/api/classes</code>, <code>/api/credits</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
 
 <script>
   (function () {
@@ -258,8 +259,19 @@
     ctx.restore();
   }
 
-  let lastBmp = null;
-  async function pullFrame() {
+  let lastBmp = null, lastPoll = 0, lastStateAt = 0, wasLive = false, feedRetry = null;
+  const feed = new Image();
+  function openFeed() {
+    clearTimeout(feedRetry);
+    feed.onerror = () => { feedRetry = setTimeout(openFeed, 2000); };
+    feed.src = '/api/stream?t=' + Date.now();
+  }
+
+  function isLive() {
+    return !!(state && state.stream && state.stream.live && Date.now() - lastStateAt < 4000);
+  }
+
+  async function pullFrame() {  // fallback when the browser cannot render the MJPEG stream
     if (frameBusy) return;
     frameBusy = true;
     try {
@@ -269,9 +281,34 @@
         lastBmp = await createImageBitmap(await r.blob());
       }
     } catch (e) { /* receiver restarting */ }
-    if (lastBmp) ctx.drawImage(lastBmp, 0, 0, 640, 480); else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 640, 480); }
-    drawOverlay();
     frameBusy = false;
+  }
+
+  function drawAwaiting(t) {
+    const pulse = 0.5 + 0.5 * Math.sin(t / 380);
+    ctx.fillStyle = '#05070d'; ctx.fillRect(0, 0, 640, 480);
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(96,165,250,${0.35 + 0.5 * pulse})`;
+    ctx.beginPath(); ctx.arc(320, 200, 9 + 5 * pulse, 0, 2 * Math.PI); ctx.fill();
+    const off = state && state.privacy && state.privacy.preview_enabled === false;
+    ctx.font = '600 17px system-ui'; ctx.fillStyle = `rgba(226,232,240,${0.55 + 0.4 * pulse})`;
+    ctx.fillText(off ? 'Live preview disabled (deployment mode)' : 'Awaiting stream from stream_cam.py on port 5000…', 320, 250);
+    ctx.font = '13px ui-monospace, monospace'; ctx.fillStyle = '#64748b';
+    ctx.fillText(state ? 'adb forward tcp:5000 tcp:5000  ·  python stream_cam.py' : 'connecting to receiver…', 320, 278);
+    ctx.restore();
+  }
+
+  function tick(t) {
+    if (isLive()) {
+      if (feed.naturalWidth) ctx.drawImage(feed, 0, 0, 640, 480);
+      else {
+        if (Date.now() - lastPoll > 50) { lastPoll = Date.now(); pullFrame(); }
+        if (lastBmp) ctx.drawImage(lastBmp, 0, 0, 640, 480); else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 640, 480); }
+      }
+      drawOverlay();
+    } else drawAwaiting(t);
+    requestAnimationFrame(tick);
   }
 
   function renderLeds(led) {
@@ -352,7 +389,12 @@
     $('tDetect').textContent = fmt(inf.detect_ms_median, 2, ' ms');
     const npu = t.npu || {}, models = inf.models || {}, em = models.embedder || {}, dm = models.detector || {};
     const onNpu = [em.device === 'npu' ? 'embedder' : null, dm.device === 'npu' ? 'detector' : null].filter(Boolean);
-    $('tNpu').textContent = onNpu.length ? `active · ${onNpu.join(' + ')}` : (npu.fastrpc_cdsp ? 'idle (CPU fallback)' : 'unavailable');
+    const st = t.stream || {}, pools = t.memory_pools || {}, gc = pools.static_cache || {}, ring = pools.frame_ring || {};
+    $('tNpu').textContent = onNpu.length ? (st.live ? `active · ${onNpu.join(' + ')} · ${st.infer_fps} fps` : `ready · ${onNpu.join(' + ')} · idle (no frames)`)
+      : (npu.fastrpc_cdsp ? 'idle (CPU fallback)' : 'unavailable');
+    $('kvStream').textContent = `Stream: ${st.live ? 'live' : 'idle'} · camera ${st.ingest_fps ?? 0} fps → NPU ${st.infer_fps ?? 0} fps · ` +
+      `${st.ingested ?? 0} received / ${st.processed ?? 0} inferred / ${st.dropped ?? 0} superseded · RAM pools: GLB/JS cache ${gc.mb ?? 0} MB ` +
+      `(${gc.files ?? 0} files, ${gc.hits ?? 0} hits) · frame ring ${ring.enabled ? `${ring.used_mb} / ${ring.budget_mb} MB, ${ring.frames} frames, ${ring.span_s}s` : 'off'}`;
     $('kvNpu').textContent = `NPU: Hexagon cDSP ${npu.cdsp ? npu.cdsp.remoteproc + ' ' + npu.cdsp.state : '—'} · /dev/fastrpc-cdsp ${npu.fastrpc_cdsp ? 'present' : 'absent'}` +
       ` · NSP ${npu.nsp_temp_c != null ? npu.nsp_temp_c + ' °C' : '—'} · embedder: ${em.model || '—'} [${em.runtime || em.device || '—'}]` +
       ` · detector: ${dm.model || 'off'}${dm.runtime ? ' [' + dm.runtime + ']' : ''}`;
@@ -432,9 +474,11 @@
   }
 
   function render(s) {
-    state = s; pose = s.pose;
-    const stale = s.frame_age_s === null || s.frame_age_s > 3;
-    $('conn').textContent = stale ? 'receiver up · waiting for camera frames' : `live · ${s.fps} fps`;
+    state = s; pose = s.pose; lastStateAt = Date.now();
+    const live = isLive();
+    if (live && !wasLive) openFeed();  // (re)attach the MJPEG feed whenever the camera stream (re)starts
+    wasLive = live;
+    $('conn').textContent = live ? `live · camera ${s.ingest_fps} fps → NPU ${s.fps} fps` : 'receiver up · awaiting camera stream';
     $('hud').className = s.state;
     $('hudText').textContent = s.guidance;
     guidanceIcon(s);
@@ -531,8 +575,8 @@
     pullState();
   };
 
-  setInterval(pullFrame, 120);
   setInterval(() => { if (Date.now() - lastSse > 3000) pullState(); }, 500);
+  requestAnimationFrame(tick);
   connectEvents();
   connectTelemetry();
   pullState();

@@ -5,7 +5,8 @@ matching 3D model is fetched and shown in a pose-synchronised `<model-viewer>`, 
 co-processor show the recognition state.
 
 ```
-Windows webcam (stream_cam.py) --HTTP POST /upload--> adb forward tcp:5000 --> receiver.py (VENTUNO Q, 0.0.0.0:5000)
+Windows webcam (stream_cam.py) --HTTP POST /api/ingest, 30 fps--> adb forward tcp:5000 --> receiver.py (VENTUNO Q, 0.0.0.0:5000)
+   receiver.py: ingest returns at once; an NPU worker thread always processes the newest frame (older ones are dropped)
    receiver.py: YOLO26n (Ultralytics, Hexagon NPU)       -> crop the phone/can inside the 60% reticle
                 MobileNetV3-Large embedder (Hexagon NPU) -> 1280-d unit vector -> few-shot multi-view prototypes
                 pose.py (OpenCV/NumPy + view matching)   -> pitch/yaw/roll for the 3D viewer
@@ -42,6 +43,12 @@ adb forward tcp:5000 tcp:5000
 python stream_cam.py
 ```
 
+`stream_cam.py` captures in MJPG mode at 30 fps and POSTs over 3 parallel keep-alive connections (`--senders`), because
+one round trip through the ADB tunnel costs ~45 ms and a single sequential sender tops out at ~21 fps. The dashboard
+shows the live feed as MJPEG (`/api/stream`); if no frame has arrived for `KAMIKAZE_STALE_S` (3 s) the preview is dropped
+and it shows *Awaiting stream from stream_cam.py on port 5000?*, so a stale or test image is never displayed.
+Measured live: camera 30 fps, 29.8 fps sent, NPU worker 29?30 fps (detect 8.7 ms, embed 2.3 ms, 17 ms per frame), MJPEG 29.8 fps, 0 dropped.
+
 The startup log prints the accelerator, e.g. `Hexagon NPU (HTP v75, QNN TFLite delegate): embedder + detector`.
 `KAMIKAZE_NPU=0` forces CPU (XNNPACK); `KAMIKAZE_DETECT_CROP=0` falls back to the fixed center crop.
 
@@ -55,6 +62,15 @@ The startup log prints the accelerator, e.g. `Hexagon NPU (HTP v75, QNN TFLite d
 End to end per frame (JPEG decode, letterbox, detect, crop, embed) is ~20–30 ms, dominated by image resizing on the CPU.
 COCO has no "can" class, so cans crop as `bottle`/`cup` and phones as `cell phone`/`remote`; when nothing is found the center crop is used.
 For real can/phone classes, train a custom YOLO and run `./export_yolo.sh best.pt` with `KAMIKAZE_DETECTOR=best`.
+
+### Memory
+
+Models, the embedding bank and all `static/` files (GLB models, JS) are kept in RAM (`KAMIKAZE_ASSET_CACHE_MB`,
+default 1024), so `<model-viewer>` loads models without touching the disk. The pipeline needs ~1.5 GB in total; the
+remaining RAM is deliberately left free. An optional rewind ring of decoded frames can be enabled in training mode with
+`KAMIKAZE_RING_GB=8` (capped at 60% of physical RAM, filled as frames arrive, ~27 MB/s at 640x480 30 fps, browsable via
+`/api/ring` and `/api/ring/frame.jpg?ago=N`). It is off by default because it keeps camera images in memory and does not
+make inference faster; it is always off in deployment mode.
 
 ## Training (enrollment)
 
@@ -87,7 +103,10 @@ with title, author, author URL, licence and source; credits are shown in the das
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/upload`, `/api/frame` | JPEG frame in, classification out |
+| POST | `/api/ingest` | JPEG frame in, returns at once (async NPU worker, latest-frame-wins) |
+| POST | `/upload`, `/api/frame` | JPEG frame in, synchronous classification out |
+| GET | `/api/stream`, `/api/frame.jpg` | live MJPEG preview / latest frame (404 when the stream is idle; training mode only) |
+| GET | `/api/ring`, `/api/ring/frame.jpg?ago=N` | optional RAM frame ring status / rewind (`KAMIKAZE_RING_GB`) |
 | GET | `/api/state`, `/api/asset`, `/api/pose` | recognition state, current 3D asset, pose |
 | GET | `/api/telemetry`, `/api/telemetry/stream` | SoC, thermals, RAM, CPU, NPU, LED bridge, inference (JSON / SSE) |
 | POST | `/api/enroll/start` / `capture` / `finish` / `cancel`, GET `/api/enroll/status` | guided enrollment |
