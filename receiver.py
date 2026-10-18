@@ -37,6 +37,14 @@ One process, one port (0.0.0.0:5000). Video comes from the on-board Logitech Bri
                                      Wire1/Modulino status, NPU (cDSP/NSP), detector + embedder median/p95, cosine/margin, FPS
                                      (SSE: /api/telemetry/stream)
   GET  /api/credits                  author/licence attribution of every cached 3D model
+  GET  /api/models                   local model library (static/models/library: hand scans / owned GLBs, never committed)
+                                     + every per-class cached GLB with its credit and linked class
+  POST /api/models/library?name=&filename=&category=&replace=1   raw GLB body -> quality gate, auto-orient, add to library;
+                                     NOT_FOUND classes whose (category, brand, flavour/model) match are re-resolved to it
+  POST /api/models/library/<id>/attach   {"label": "<class>"} use a library model as that class's CAD
+  DELETE /api/models/library/<id>    trash a library model (and the per-class copies made from it)
+  DELETE /api/models/cache/<class>   trash one per-class cached GLB (re-resolved on next use: library first, then online)
+  GET  /ATTRIBUTION.md               third-party models / runtimes / libraries and their licences
   POST /api/enroll                   legacy single-shot {"label": "coke_can", "frames": 12, "append": false, "wait": false}
   POST /api/unenroll                 {"label": "coke_can"}
   POST /api/enroll/start             multi-view guided enrollment: {"raw_name", "category", "brand", "variant",
@@ -127,6 +135,7 @@ import cad_harvester
 import color_sig
 import device_taxonomy
 import entity_resolver
+import model_library
 import netguard
 import npu as npu_mod
 import onboard_camera
@@ -237,6 +246,14 @@ DECODE_MAX = int(os.environ.get("KAMIKAZE_DECODE_MAX", "960"))  # >0: JPEG DCT-s
 POSE_DINO = os.environ.get("KAMIKAZE_POSE_DINO", "1") != "0"  # DINOv2 viewpoint descriptors for yaw (pose worker)
 POSE_HZ = float(os.environ.get("KAMIKAZE_POSE_HZ", "10"))  # pose worker rate cap (NPU time shared with detector)
 POSE_FRESH_S = 1.0  # DINOv2 view sims older than this fall back to the MobileNet view centroids
+# Smartphone route: DINOv2 (NPU) identity joins MobileNetV3 as a two-backbone ensemble. Raw max-view DINOv2 cosine ->
+# calibrated confidence through these knots (s0 -> 0, s1 -> 80 %, s2 -> 95 %, capped); weight 0 disables the route.
+DINO_KNOTS = tuple(float(x) for x in os.environ.get("KAMIKAZE_DINO_KNOTS", "0.45,0.78,0.92").split(","))
+DINO_WEIGHT = float(os.environ.get("KAMIKAZE_DINO_WEIGHT", "0.5"))
+PIPELINE = ("raw_frame_input -> yolo_world_v2_npu_detection(beverage can|soda can|smartphone|bottle) -> "
+            "roi_crop(pad=15%) -> routing_switch(smartphone=dinov2_vits14_npu+mobilenetv3_npu view-prototype cosine, "
+            "beverage=pp_ocrv4(det npu, rec cpu) rolling 5-pass keyword lexicon + dinov2 pose, colour) -> "
+            "output_metadata(variant_label, confidence, bbox, pose_yaw_pitch) -> physical_actuation(modulino_pixels)")
 JPEG_SOI = b"\xff\xd8\xff"
 
 
@@ -277,8 +294,9 @@ class PoseWorker:
     """DINOv2 viewpoint descriptors on the NPU, off the 30 Hz inference thread.
 
     The inference loop submits the current crop (latest wins, rate-capped at POSE_HZ); the worker embeds it and
-    stores its cosine with the identified class's per-view DINOv2 centroids. PoseEstimator turns those into yaw with
-    the circular blend yaw = atan2(w_side, w_front - w_back) (softmax view weights)."""
+    stores its cosine with the identified class's per-view DINOv2 centroids (pose) plus the raw descriptor (smartphone
+    identity route, see Pipeline._dino_identity). PoseEstimator turns the view sims into a 360 degree yaw with
+    yaw = atan2(w_right - w_left, w_front - w_back) (softmax view weights)."""
 
     def __init__(self, embedder, bank: "EmbeddingBank", hz: float = POSE_HZ) -> None:
         self.embedder, self.bank = embedder, bank
@@ -298,7 +316,7 @@ class PoseWorker:
         self._lat.append((time.perf_counter() - t) * 1000.0)
         return desc
 
-    def submit(self, label: str, arr: np.ndarray) -> bool:
+    def submit(self, label: str | None, arr: np.ndarray) -> bool:
         now = time.monotonic()
         with self._cv:
             if now - self._last_submit < self.period:
@@ -318,10 +336,11 @@ class PoseWorker:
                 label, arr = self._job
                 self._job = None
             try:
-                sims = self.bank.pose_view_sims(label, self.describe(arr))
+                desc = np.asarray(self.describe(arr), dtype=np.float32)
+                sims = self.bank.pose_view_sims(label, desc) if label else {}
                 self.runs += 1
                 with self._cv:
-                    self._result = {"label": label, "sims": sims, "t": time.monotonic()}
+                    self._result = {"label": label, "sims": sims, "desc": desc, "t": time.monotonic()}
             except Exception:
                 self.errors += 1
                 if self.errors <= 3:
@@ -333,6 +352,14 @@ class PoseWorker:
         if not r or r["label"] != label or not r["sims"] or time.monotonic() - r["t"] > POSE_FRESH_S:
             return None
         return dict(r["sims"])
+
+    def latest_desc(self) -> np.ndarray | None:
+        """The most recent DINOv2 descriptor (any label) if younger than POSE_FRESH_S."""
+        with self._cv:
+            r = self._result
+        if not r or r.get("desc") is None or time.monotonic() - r["t"] > POSE_FRESH_S:
+            return None
+        return r["desc"]
 
     def reset(self) -> None:
         with self._cv:
@@ -353,6 +380,17 @@ def calibrate(sim: float) -> float:
     if s < s1:
         return (s - s0) / (s1 - s0) * CAL_MID
     return min(CAL_CAP, CAL_MID + (s - s1) / (s2 - s1) * (CAL_CAP - CAL_MID))
+
+
+def dino_calibrate(sim: float) -> float:
+    """Raw max-view DINOv2 cosine -> calibrated confidence: s0 -> 0, s1 -> 0.80, s2 -> 0.95 (cap), linear between."""
+    s0, s1, s2 = DINO_KNOTS
+    s = float(sim)
+    if s <= s0:
+        return 0.0
+    if s < s1:
+        return (s - s0) / (s1 - s0) * 0.80
+    return min(0.95, 0.80 + (s - s1) / max(1e-6, s2 - s1) * 0.15)
 
 
 def raw_threshold(c: float) -> float:
@@ -749,6 +787,36 @@ class EmbeddingBank:
         with self._lock:
             return bool(label) and bool(self.pose_views.get(label))
 
+    def has_pose_category(self, category: str) -> bool:
+        with self._lock:
+            return any(table and (self.meta.get(lab) or {}).get("category") == category
+                       for lab, table in self.pose_views.items())
+
+    def dino_rank(self, desc: np.ndarray, categories: tuple[str, ...]) -> dict[str, tuple[float, str]]:
+        """View-centric DINOv2 identity: {label: (best raw cosine over its per-view DINOv2 centroids, that view)} for
+        every class of the given categories. Max over individual views, never the diluted mean of all views."""
+        live = np.asarray(desc, dtype=np.float32)
+        live = live / (np.linalg.norm(live) + 1e-8)
+        out = {}
+        with self._lock:
+            for lab, table in self.pose_views.items():
+                if not table or (self.meta.get(lab) or {}).get("category") not in categories:
+                    continue
+                sims = {v: float(np.dot(c.numpy().astype(np.float32), live)) for v, c in table.items()}
+                view = max(sims, key=sims.get)
+                out[lab] = (sims[view], view)
+        return out
+
+    def lexicon(self, label: str) -> list[str]:
+        """OCR keyword lexicon of a class (learned at enrollment; metadata words for older enrollments)."""
+        with self._lock:
+            meta = dict(self.meta.get(label) or {})
+        return list(meta.get("lexicon") or ocr_fusion.build_lexicon(meta, label))
+
+    def labels_in(self, categories: tuple[str, ...]) -> list[str]:
+        with self._lock:
+            return [lab for lab in self._labels if (self.meta.get(lab) or {}).get("category") in categories]
+
     def color_refs(self, label: str) -> dict[str, np.ndarray]:
         with self._lock:
             return {view: sig.numpy() for view, sig in (self.color_views.get(label) or {}).items()}
@@ -1018,6 +1086,7 @@ class MultiViewEnroller:
         self.captured: dict[str, list] = {}
         self.pose_captured: dict[str, list] = {}
         self.color_captured: dict[str, list] = {}
+        self.text_runs: dict[str, int] = {}  # OCR token -> number of OCR passes that read it during this session
         self.stability: dict[str, float] = {}
         self.warnings: dict[str, str] = {}
         self._buf: list = []
@@ -1071,6 +1140,16 @@ class MultiViewEnroller:
             self._touched = time.monotonic()
             self._cond.notify_all()
         return self.status()
+
+    def add_text(self, run_token_sets) -> None:
+        """Count the corrected tokens of OCR passes made while this session is active (ready or capturing): the
+        lexicon learns the rear-panel / side text that the user shows during the wizard."""
+        with self._cond:
+            if not self.active:
+                return
+            for toks in run_token_sets:
+                for tok in toks:
+                    self.text_runs[tok] = self.text_runs.get(tok, 0) + 1
 
     def feed(self, vec, pose_desc=None, color=None) -> str | None:
         """Offer a frame embedding (plus optionally its DINOv2 pose descriptor and colour signature).
@@ -1133,7 +1212,9 @@ class MultiViewEnroller:
 
     def _finalize(self) -> None:
         try:
-            self.result = self.bank.add_multiview(self.label, self.captured, self.meta or {}, self.pose_captured,
+            meta = dict(self.meta or {})
+            meta["lexicon"] = ocr_fusion.build_lexicon(meta, self.label, self.text_runs)
+            self.result = self.bank.add_multiview(self.label, self.captured, meta, self.pose_captured,
                                                   color_vectors=self.color_captured)
             self.phase = "done"
             log.info("Multi-view enrolled %s: %s", self.label, {k: v for k, v in self.result.items() if k != "metadata"})
@@ -1649,6 +1730,19 @@ class AssetManager:
     def generate(self, label: str) -> dict:
         return self._explicit(label, lambda: cad_harvester.generate_from_specs(self._product(label)))
 
+    def attach_library(self, label: str, entry_id: str) -> dict:
+        return self._explicit(label, lambda: cad_harvester.use_library(label, entry_id))
+
+    def retry_missing(self, labels) -> list[str]:
+        """Re-resolve classes that ended NOT_FOUND (e.g. a matching library model was just added)."""
+        with self._lock:
+            missing = [x for x in labels if x in self._not_found and x not in self._inflight]
+            for x in missing:
+                self._not_found.pop(x, None)
+        for x in missing:
+            self._start(x, False)
+        return missing
+
     def prepare_static(self, labels: tuple[str, ...] = ()) -> None:
         """Background: vendored <model-viewer> and the cached / harvested GLBs of the enrolled classes."""
 
@@ -1961,6 +2055,8 @@ class Pipeline:
         self.detector = detector
         self.ocr = ocr if ocr is not None else ocr_fusion.OcrWorker(None)
         self._vocab_key: tuple | None = None
+        self._route: dict | None = None  # bifurcated-routing diagnostics of the last frame (telemetry)
+        self._ocr_cursor = 0  # last OCR pass handed to the enrollment lexicon
         self._lighting: dict = {"ok": True, "issue": None, "message": "", "mean_luma": None, "glare_fraction": None,
                                 "gate": LIGHT_GATE}
         self.pose_worker = PoseWorker(pose_embedder, bank) if pose_embedder is not None else None
@@ -2211,12 +2307,13 @@ class Pipeline:
                 self._detection = {"target": None, "objects": [], "crop": None, "crop_source": "center", "ms": 0.0,
                                    "skipped": "empty_scene" if empty else light["issue"]}
                 frame, views, best_view, category = FrameScore(None, 0.0, empty=empty), {}, None, None
-                arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None, "ocr": None}
+                arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None, "ocr": None,
+                       "route": None}
                 arr = None
             else:
                 box, detect_ms = self._locate(image)
                 crop_box = box or center_crop_box(*image.size)
-                if self.ocr.enabled and not enrolling:
+                if self.ocr.enabled:
                     size, left, top = crop_box
                     self.ocr.submit(np.asarray(image.crop((left, top, left + size, top + size))))
                 live_color = None
@@ -2240,6 +2337,12 @@ class Pipeline:
                 if self.mv.feed(vec, pose_desc, live_color) == "complete":
                     capturing = False
                 frame, views, best_view, category, arb = self._arbitrate(vec, live_color)
+            if self.ocr.enabled:
+                # Enrollment lexicon: hand the wizard every OCR pass made since the last frame (cursor kept current
+                # while idle, so text read before the session started never leaks in).
+                self._ocr_cursor, new_runs = self.ocr.runs_after(self._ocr_cursor)
+                if new_runs and self.mv.active:
+                    self.mv.add_text(new_runs)
             prev = (self.sm.state, self.sm.label)
             snap = self.sm.update(frame)
             state, label, score = snap["state"], snap["label"], snap["score"]
@@ -2256,10 +2359,16 @@ class Pipeline:
                 self._viewer_label = label
                 self.assets.get(label)
             pose = self._pose
+            if self.pose_worker is not None and arr is not None:
+                # One DINOv2 pass serves both the pose of the current label and the smartphone identity route.
+                want_pose = bool(frame.label) and state != SEARCHING and self.bank.has_pose_views(frame.label)
+                want_id = DINO_WEIGHT > 0 and (category == "smartphone" or arb.get("domain") == list(
+                    device_taxonomy.PHONE_DOMAIN)) and self.bank.has_pose_category("smartphone")
+                if want_pose or want_id:
+                    self.pose_worker.submit(frame.label if want_pose else None, arr)
             if frame.label and state != SEARCHING:
                 pose_sims, pose_src = views, "mobilenet-views"
                 if self.pose_worker is not None and arr is not None and self.bank.has_pose_views(frame.label):
-                    self.pose_worker.submit(frame.label, arr)
                     dino = self.pose_worker.latest(frame.label)
                     if dino:
                         pose_sims, pose_src = dino, "dinov2-npu"
@@ -2317,8 +2426,9 @@ class Pipeline:
         ranked = self.bank.rank(vec, domain) if domain else ranked_all
         info = {"domain": list(domain) if domain else None, "conflict": False, "front_dominant": False,
                 "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None,
-                "ocr": None}
-        ranked, fused, info["ocr"] = self._fuse(ranked, live_color)
+                "ocr": None, "route": None}
+        ranked, fused, info["ocr"] = self._fuse(ranked, live_color, domain)
+        info["route"] = self._route
         lead = ranked_all[0] if ranked_all else None
         lead_cat = self.bank.category(lead[0]) if lead else None
         conflict = bool(domain and lead and lead_cat and lead_cat not in domain and calibrate(lead[1]) >= C_SEARCH)
@@ -2348,37 +2458,97 @@ class Pipeline:
                 frame.prompt = device_taxonomy.disambiguation_prompt(self.bank.metadata(label), self.bank.metadata(top2))
         return frame, views, best_view, category, info
 
-    def _fuse(self, ranked: list, live_color=None) -> tuple[list, dict, dict | None]:
-        """Tri-modal late fusion over the top-5 candidates in calibrated space:
-        C = (0.60 C_vision + 0.25 C_text + 0.15 C_colour) / (sum of the weights of the modalities present).
+    def _fuse(self, ranked: list, live_color=None, domain: tuple[str, ...] | None = None) -> tuple[list, dict, dict | None]:
+        """Bifurcated routing + tri-modal late fusion over the top-5 candidates, in calibrated space.
+
+        Smartphone branch: when a fresh DINOv2 (NPU) descriptor exists, a phone's vision score is the ensemble
+        (1-w) C_mobilenet + w C_dinov2 (view-centric max-view cosine, dino_calibrate, w = DINO_WEIGHT).
+        Beverage branch: the rolling 5-pass OCR token buffer is matched against each can's keyword lexicon
+        (ocr_fusion.lexicon_match); a confirmed class (>= 1 discriminative word plus a brand word or a 2nd keyword,
+        no competing brand read, and a can actually detected or seen) is lifted to >= 85 % (max 95 %).
+        Then C = (0.60 C_vision + 0.25 C_text + 0.15 C_colour) / (sum of the weights of the modalities present).
         C_text comes from the (fuzzy-corrected) words OCR read on the crop in the last WINDOW_S, C_colour from the
         HSV-histogram intersection with the class's per-view colour signatures. A modality that has nothing to say
         about a class (no words seen / no colour reference) drops out instead of counting as 0, and below the
         SEARCHING floor vision is returned unchanged, so text or colour can never lift background into a match.
         Returns (ranked re-sorted by fused confidence with the raw cosines kept, {label: fused}, diagnostics)."""
-        recent = None
+        recent, roll = None, {}
         if self.ocr.enabled:
             key = tuple(self.bank.labels())
             if key != self._vocab_key:  # enrolled classes changed: their brand / variant words join the corrector vocab
                 self._vocab_key = key
                 self.ocr.set_vocabulary(self.bank.vocabulary())
             recent = self.ocr.recent()
+            roll = self.ocr.rolling()
         seen = set(recent["tokens"]) if recent else set()
-        if live_color is None and not seen:
+        dino = self._dino_identity()
+        lex = self._lexicon_route(ranked, roll, domain)
+        self._route = {"branch": "smartphone" if domain == device_taxonomy.PHONE_DOMAIN else
+                       "beverage" if domain == device_taxonomy.BEVERAGE_DOMAIN else None,
+                       "dinov2": {lab: round(c, 4) for lab, c in sorted(dino.items(), key=lambda kv: -kv[1])[:3]} or None,
+                       "lexicon": lex[1] | {"label": lex[0]} if lex else None,
+                       "rolling_tokens": sorted(roll, key=lambda t: (-roll[t], t))[:16]}
+        if live_color is None and not seen and not dino and not lex:
             return ranked, {}, self._ocr_info(recent, None, live_color)
         head, tail = ranked[:5], ranked[5:]
+        if lex and lex[0] not in {r[0] for r in head}:
+            row = next(r for r in ranked if r[0] == lex[0])
+            head, tail = head + [row], [r for r in tail if r[0] != lex[0]]
         scored = []
         for lab, s, view in head:
             cv = calibrate(s)
+            if lab in dino:
+                cv = (1.0 - DINO_WEIGHT) * cv + DINO_WEIGHT * dino[lab]
             ct = ocr_fusion.text_score(ocr_fusion.class_words(self.bank.metadata(lab), lab), seen) if seen else None
             cc = color_sig.score(live_color, self.bank.color_refs(lab)) if live_color is not None else None
-            scored.append((lab, s, view, ocr_fusion.fuse_calibrated(cv, ct, cc, gate=C_SEARCH), cv, ct, cc))
+            f = ocr_fusion.fuse_calibrated(cv, ct, cc, gate=C_SEARCH)
+            if lex and lab == lex[0]:
+                f = max(f, lex[1]["confidence"])
+            scored.append((lab, s, view, f, cv, ct, cc))
         scored.sort(key=lambda r: -r[3])
         fused = {r[0]: r[3] for r in scored}
         # Candidates outside the top-5 keep their vision-only calibrated score for ordering.
         merged = sorted([(lab, s, view) for lab, s, view, *_ in scored] + list(tail),
                         key=lambda r: -fused.get(r[0], calibrate(r[1])))
         return merged, fused, self._ocr_info(recent, scored[0] if scored else None, live_color)
+
+    def _dino_identity(self) -> dict[str, float]:
+        """Smartphone branch: {phone label: calibrated DINOv2 view-centric confidence} from the latest NPU descriptor."""
+        if self.pose_worker is None or DINO_WEIGHT <= 0:
+            return {}
+        desc = self.pose_worker.latest_desc()
+        if desc is None:
+            return {}
+        return {lab: dino_calibrate(s) for lab, (s, _v) in self.bank.dino_rank(desc, device_taxonomy.PHONE_DOMAIN).items()}
+
+    def _lexicon_route(self, ranked: list, roll: dict[str, int], domain) -> tuple[str, dict] | None:
+        """Beverage branch: the single can class confirmed by the rolling OCR token buffer, or None (none / ambiguous)."""
+        if not roll:
+            return None
+        seen = set(roll)
+        cans = self.bank.labels_in(device_taxonomy.BEVERAGE_DOMAIN)
+        if not cans:
+            return None
+        lexicons = {lab: set(self.bank.lexicon(lab)) for lab in cans}
+        can_seen = bool(domain) and any(c in device_taxonomy.BEVERAGE_DOMAIN for c in domain)
+        vision = {lab: calibrate(s) for lab, s, _v in ranked}
+        best, best_key, tie = None, None, False
+        for lab in cans:
+            if lab not in vision or not (can_seen or vision[lab] >= C_SEARCH):
+                continue
+            words = ocr_fusion.class_words(self.bank.metadata(lab), lab)
+            if ocr_fusion.text_score(words, seen) == 0.0:  # a competing brand was read and this one was not: veto
+                continue
+            others = set().union(*(lx for other, lx in lexicons.items() if other != lab))
+            m = ocr_fusion.lexicon_match(lexicons[lab], words["brand"], others, seen)
+            if not m["confirmed"]:
+                continue
+            k = (len(m["discriminative"]), len(m["hits"]))
+            if best_key is None or k > best_key:
+                best, best_key, tie = (lab, m), k, False
+            elif k == best_key:
+                tie = True
+        return None if tie else best
 
     @staticmethod
     def _ocr_info(recent: dict | None, top: tuple | None, live_color) -> dict | None:
@@ -2532,6 +2702,42 @@ class Pipeline:
         return {"ok": ok, "label": label, "status": result.get("status"), "reason": result.get("reason", ""),
                 "result": {k: v for k, v in result.items() if k not in ("path",)}, "asset": self.assets.peek(label)}
 
+    # -- local model library (static/models/library) + per-class cache browser ------------------------------------
+
+    def models_listing(self) -> dict:
+        enrolled = set(self.bank.labels())
+        cache = [{"class_id": r["class_id"], "title": r.get("title") or r["class_id"], "credit": r["credit"],
+                  "glb_url": r["glb_url"], "source": r.get("source", ""), "source_key": r.get("source_key", ""),
+                  "library_id": r.get("library_id"), "quality": r.get("quality"), "enrolled": r["class_id"] in enrolled}
+                 for r in cad_harvester.credits()]
+        return {"ok": True, "library": model_library.entries(), "cache": cache, "library_dir": str(model_library.library_dir()),
+                "viewer_label": self._viewer_label}
+
+    def library_add(self, data: bytes, name: str, filename: str = "", category: str = "", replace: bool = False) -> dict:
+        entry = model_library.add(data, name, filename=filename, category=category, replace=replace)
+        retry = getattr(self.assets, "retry_missing", None)
+        retried = retry(self.bank.labels()) if retry else []  # a NOT_FOUND class may match the new model
+        self._bump()
+        return {"ok": True, "entry": entry, "retried_classes": retried}
+
+    def library_delete(self, entry_id: str) -> dict:
+        out = model_library.delete(entry_id)
+        forget = getattr(self.assets, "forget", None) or cad_harvester.delete_cached
+        dropped = [x for x in out["linked_classes"] if forget(x)]
+        self._bump()
+        return {**out, "cad_deleted": dropped}
+
+    def library_attach(self, entry_id: str, label: str) -> dict:
+        self._cad_label(label)
+        result = self.assets.attach_library(label, model_library.valid_id(entry_id))
+        self._bump()
+        return {"ok": bool(result.get("glb_url")), "label": label, "library_id": entry_id, "asset": self.assets.peek(label)}
+
+    def cache_delete(self, label: str) -> dict:
+        removed = (getattr(self.assets, "forget", None) or cad_harvester.delete_cached)(label)
+        self._bump()
+        return {"ok": bool(removed), "class_id": label}
+
     def set_cad_mode(self, mode: str | None, source: str | None) -> dict:
         out = self.assets.set_mode(mode, source)
         if self._viewer_label and self._viewer_label in self.bank.centroids:
@@ -2572,7 +2778,7 @@ class Pipeline:
             "asset_spec": viewer.get("spec"),
             "asset_orientation": viewer.get("orientation"),
             "cad_mode": self.assets.mode() if hasattr(self.assets, "mode") else None,
-            "ocr": last.get("ocr"),
+            "ocr": last.get("ocr"), "route": last.get("route"),
             "lighting": last.get("lighting") or self._lighting,
             "mode": MODE,
             "privacy": self.privacy(),
@@ -2666,7 +2872,7 @@ class Pipeline:
                 "confidence": round(last["confidence"], 4), "label": last["label"],
                 "similarity_pct": round(last["confidence"] * 100, 1), "margin_pct": round(last["margin"] * 100, 1),
                 "state": last["state"], "empty_scene": last.get("empty", False), "saliency": last.get("saliency"),
-                "domain": last.get("domain"),
+                "domain": last.get("domain"), "pipeline": PIPELINE, "route": last.get("route"),
                 "accelerator": self.accelerator(),
                 "models": {
                     "embedder": self.extractor.info() if hasattr(self.extractor, "info") else {"runtime": self.extractor.name},
@@ -2791,6 +2997,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._telemetry_sse()
         if path == "/api/credits":
             return self._json(200, {"ok": True, "credits": cad_harvester.credits()})
+        if path == "/api/models":
+            return self._json(200, p.models_listing())
+        if path in ("/ATTRIBUTION.md", "/attribution"):
+            try:
+                return self._send(200, (Path(__file__).resolve().parent / "ATTRIBUTION.md").read_bytes(),
+                                  "text/markdown; charset=utf-8", "no-cache")
+            except OSError:
+                return self._json(404, {"ok": False, "error": "ATTRIBUTION.md missing"})
         if path == "/api/pose":
             snap = p.snapshot()
             return self._json(200, {"ok": True, "pose": snap["pose"], "label": snap["label"], "state": snap["state"],
@@ -2877,6 +3091,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         url = urllib.parse.urlsplit(self.path)
         parts = [urllib.parse.unquote(s) for s in url.path.split("/") if s]
+        if len(parts) == 4 and parts[:2] == ["api", "models"] and parts[2] in ("library", "cache"):
+            try:
+                if parts[2] == "library":
+                    out = self.pipeline.library_delete(parts[3])
+                else:
+                    out = self.pipeline.cache_delete(normalize_label(parts[3]))
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            return self._json(200 if out["ok"] else 404, {**out, **({} if out["ok"] else {"error": "model not found"})})
         if len(parts) != 3 or parts[:2] != ["api", "classes"]:
             return self._json(404, {"ok": False, "error": "not found"})
         query = urllib.parse.parse_qs(url.query)
@@ -2931,6 +3154,8 @@ class Handler(BaseHTTPRequestHandler):
         """Multi-view enrollment, db and CAD endpoints. Returns False when the path is not one of them."""
         p = self.pipeline
         parts = [urllib.parse.unquote(s) for s in path.split("/") if s]
+        if parts[:3] == ["api", "models", "library"]:
+            return self._library_post(parts[3:], body)
         if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] in ("fetch_cad", "refetch_cad"):
             try:
                 label = normalize_label(parts[2])
@@ -3036,6 +3261,37 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": str(exc)})
         return True
 
+    def _library_post(self, rest: list[str], body: bytes) -> bool:
+        """POST /api/models/library?name=&filename=&category=&replace=1 (raw GLB body) | /api/models/library/<id>/attach."""
+        p = self.pipeline
+        try:
+            if not rest:
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                arg = lambda k: query.get(k, [""])[0]  # noqa: E731
+                out = p.library_add(body, arg("name"), filename=arg("filename") or self.headers.get("X-Filename", ""),
+                                    category=arg("category"), replace=arg("replace") in ("1", "true", "yes"))
+                self._json(201, out)
+            elif len(rest) == 2 and rest[1] == "attach":
+                label = normalize_label(self._json_body(body).get("label"))
+                out = p.library_attach(rest[0], label)
+                self._json(200 if out["ok"] else 404, out)
+            else:
+                self._json(404, {"ok": False, "error": "not found"})
+        except NotEnrolled as exc:
+            self._json(404, {"ok": False, "error": f"class {exc.args[0]!r} is not enrolled"})
+        except FileExistsError as exc:
+            self._json(409, {"ok": False, "error": str(exc), "exists": True})
+        except FileNotFoundError as exc:
+            self._json(404, {"ok": False, "error": str(exc)})
+        except RuntimeError as exc:
+            self._json(409, {"ok": False, "error": str(exc)})
+        except (TypeError, ValueError) as exc:
+            self._json(422, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            log.exception("library request failed")
+            self._json(500, {"ok": False, "error": str(exc)})
+        return True
+
     def _cad_post(self, raw_id: str, action: str, body: bytes) -> bool:
         p = self.pipeline
         try:
@@ -3105,7 +3361,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         url = urllib.parse.urlsplit(self.path)
         path = url.path.rstrip("/") or "/"
-        body = self._read_body(MAX_UPLOAD_BYTES if path.endswith("/upload_cad") else MAX_FRAME_BYTES)
+        body = self._read_body(MAX_UPLOAD_BYTES if path.endswith("/upload_cad") or path == "/api/models/library" else MAX_FRAME_BYTES)
         if body is None:
             return
         if path in INGEST_ROUTES or path in SYNC_FRAME_ROUTES:

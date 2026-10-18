@@ -1515,5 +1515,296 @@ class DeviceTaxonomyTests(unittest.TestCase):
         self.assertIsNone(device_taxonomy.describe("nope"))
 
 
+class ModelLibraryTests(unittest.TestCase):
+    """Local model library (hand scans): quality gate, match keys, library-first harvest, recall and trash."""
+
+    LIME = "Kirkland Signature Sparkling Water Lime"
+
+    @classmethod
+    def setUpClass(cls):
+        import model_library
+        cls.lib = model_library
+        cls.GOOD = procedural_glb.build_can_spec(66.0, 115.2, 54.0)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="kz_lib_"))
+        self.patch = mock.patch.object(cad_harvester.mcp, "MODELS_DIR", self.tmp)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def product(self, text, cid):
+        return cad_harvester._with_class_id(entity_resolver.resolve(text), cid)
+
+    def test_add_validates_and_records_owner_attribution(self):
+        entry = self.lib.add(self.GOOD, self.LIME, filename="kirklime.glb", category="beverage_can")
+        self.assertEqual((entry["author"], entry["source_key"], entry["category"]), ("Hershey-Bar", "library", "beverage_can"))
+        self.assertIn("hand scan by Hershey-Bar", entry["attribution_text"])
+        self.assertEqual(entry["match_key"]["brand"], "kirkland")
+        self.assertIn("lime", entry["match_key"]["variant"])
+        self.assertTrue(entry["glb_url"].startswith("/static/") and "/library/" in entry["glb_url"], entry["glb_url"])
+        self.assertTrue((self.lib.library_dir() / f"{entry['id']}.glb").is_file())
+        self.assertEqual([e["id"] for e in self.lib.entries()], [entry["id"]])
+        with self.assertRaises(FileExistsError):
+            self.lib.add(self.GOOD, self.LIME, category="beverage_can")
+        self.assertEqual(self.lib.add(self.GOOD, self.LIME, category="beverage_can", replace=True)["id"], entry["id"])
+        with self.assertRaisesRegex(ValueError, "rejected"):
+            self.lib.add(b"<html>not a glb</html>", "Kirkland Sparkling Water Lemon", category="beverage_can")
+        with self.assertRaises(ValueError):
+            self.lib.add(self.GOOD, "")
+        self.assertEqual([p.name for p in self.lib.library_dir().glob("*.part")], [])
+        self.assertEqual(len(self.lib.entries()), 1)
+
+    def test_match_key_binds_flavour_not_brand(self):
+        entry = self.lib.add(self.GOOD, self.LIME, category="beverage_can")
+        self.assertEqual(self.lib.find(entity_resolver.resolve("kirkland lime sparkling water can"))["id"], entry["id"])
+        self.assertIsNone(self.lib.find(entity_resolver.resolve("kirkland lemon sparkling water can")))
+        self.assertIsNone(self.lib.find(entity_resolver.resolve("pepsi lime can")))
+        with self.assertRaises(ValueError):
+            self.lib.valid_id("../etc/passwd")
+
+    def test_harvest_is_library_first_even_offline_and_delete_unlinks(self):
+        entry = self.lib.add(self.GOOD, self.LIME, category="beverage_can")
+        prod = self.product("kirkland lime sparkling water", "kirkland_lime")
+        out = cad_harvester.harvest(prod, offline=True)
+        self.assertEqual((out["status"], out["source"]), ("cached", "library"), out)
+        attr = cad_harvester.read_attribution(prod.class_id)
+        self.assertEqual((attr["author"], attr["library_id"], attr["source_key"]), ("Hershey-Bar", entry["id"], "library"))
+        self.assertIn("Hershey-Bar", (self.tmp / "CREDITS.md").read_text(encoding="utf-8"))
+        self.assertEqual(self.lib.get(entry["id"])["linked_classes"], [prod.class_id])
+        sketch = cad_harvester.harvest(self.product("kirkland lime sparkling water", "kirkland_lime_sf"),
+                                       offline=True, source="sketchfab")
+        self.assertEqual(sketch["status"], "offline_missing")  # an explicit online source never silently uses the library
+        out = self.lib.delete(entry["id"])
+        self.assertEqual((out["ok"], out["linked_classes"]), (True, [prod.class_id]))
+        self.assertFalse(self.lib.delete(entry["id"])["ok"])
+        self.assertEqual(self.lib.entries(), [])
+
+    def test_use_library_overrides_a_cached_model(self):
+        entry = self.lib.add(self.GOOD, self.LIME, category="beverage_can")
+        cad_harvester.upload_glb("my_can", self.GOOD, "other.glb", "Other can")
+        out = cad_harvester.use_library("my_can", entry["id"])
+        self.assertEqual((out["status"], out["source"]), ("cached", "library"))
+        self.assertEqual(cad_harvester.read_attribution("my_can")["library_id"], entry["id"])
+        with self.assertRaises(FileNotFoundError):
+            cad_harvester.use_library("my_can", "missing_entry")
+
+
+class _FakeOcrEngine:
+    def __init__(self):
+        self.texts = []
+
+    def __call__(self, _bgr, use_cls=False):
+        return [[None, t, 0.95] for t in self.texts], None
+
+
+class LexiconRoutingTests(unittest.TestCase):
+    """Beverage branch: OCR keyword lexicon learned at enrollment + rolling token buffer (Kirkland lime/lemon/grapefruit)."""
+
+    KIRK = {"brand": "Kirkland Signature", "category": "beverage_can"}
+
+    def setUp(self):
+        import ocr_fusion
+        self.of = ocr_fusion
+
+    def meta(self, flavor):
+        return {**self.KIRK, "flavor": flavor, "raw_name": f"kirkland {flavor} sparkling water"}
+
+    def test_build_lexicon_learns_repeated_words_but_never_competitor_brands(self):
+        lex = self.of.build_lexicon(self.meta("lime"), "kirkland_lime",
+                                    {"natural": 3, "flavored": 2, "pepsi": 5, "355ml": 4, "once": 1, "12": 6})
+        self.assertIn("lime", lex)
+        self.assertIn("kirkland", lex)
+        self.assertIn("natural", lex)
+        self.assertIn("flavored", lex)
+        for bad in ("pepsi", "355ml", "once", "12"):
+            self.assertNotIn(bad, lex)
+        self.assertLessEqual(len(self.of.build_lexicon(self.meta("lime"), "x", {f"word{i:03d}": 9 for i in range(200)})),
+                             self.of.LEXICON_MAX)
+
+    def test_lexicon_match_needs_a_discriminative_word_plus_support(self):
+        lime = {"kirkland", "signature", "sparkling", "water", "lime"}
+        others = {"kirkland", "signature", "sparkling", "water", "lemon", "grapefruit"}
+        brand = {"kirkland"}
+        m = self.of.lexicon_match(lime, brand, others, {"lime"})
+        self.assertFalse(m["confirmed"])  # a lone flavour word (could be any lime drink)
+        m = self.of.lexicon_match(lime, brand, others, {"lime", "sparkling"})
+        self.assertEqual((m["confirmed"], m["confidence"], m["discriminative"]), (True, 0.85, ["lime"]))
+        self.assertTrue(self.of.lexicon_match(lime, brand, others, {"kirkland", "lime"})["confirmed"])
+        self.assertFalse(self.of.lexicon_match(lime, brand, others, {"kirkland", "sparkling", "water"})["confirmed"])
+        m = self.of.lexicon_match(lime, brand, others, lime)
+        self.assertEqual(m["confidence"], round(min(self.of.LEXICON_CAP, 0.85 + 0.03 * 3), 4))
+        big = {f"w{i}" for i in range(20)} | {"lime"}
+        self.assertEqual(self.of.lexicon_match(big, set(), set(), big)["confidence"], self.of.LEXICON_CAP)
+
+    def test_ocr_worker_rolling_buffer_and_run_cursor(self):
+        eng = _FakeOcrEngine()
+        w = self.of.OcrWorker(engine=eng)
+        w.set_vocabulary(["kirkland", "lime", "sparkling"])
+        crop = np.zeros((32, 64, 3), dtype=np.uint8)
+        for texts in (["KIRKLAND"], ["LIME", "SPARKLING"], ["LIME"]):
+            eng.texts = texts
+            w._recognise(crop)
+        roll = w.rolling()
+        self.assertEqual((roll.get("lime"), roll.get("kirkland"), roll.get("sparkling")), (2, 1, 1), roll)
+        self.assertNotIn("kirkland", w.rolling(n=2))
+        self.assertEqual(w.rolling(max_age=-1.0), {})
+        latest, runs = w.runs_after(1)
+        self.assertEqual((latest, len(runs)), (3, 2))
+        self.assertEqual(w.runs_after(latest), (3, []))
+
+
+@needs_torch
+class BifurcatedRouterTests(unittest.TestCase):
+    """receiver: smartphone branch (DINOv2 view-centric identity) and beverage branch (lexicon route) arbitration."""
+
+    def setUp(self):
+        import receiver
+        import test_comprehensive as tc
+        self.r, self.tc = receiver, tc
+        self.tmp = Path(tempfile.mkdtemp(prefix="kz_route_"))
+        self.bank = receiver.EmbeddingBank(self.tmp / "enrolled_classes.pt")
+        self.pipe = receiver.Pipeline(tc.FakeExtractor(), self.bank, receiver.LedDriver(lambda *a: True), tc.FakeAssets())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def add(self, label, seed, meta, pose=None):
+        vecs = {"front": [self.tc.unit(seed)], "back": [self.tc.unit(seed + 1)]}
+        self.bank.add_multiview(label, vecs, meta, pose_vectors=pose)
+
+    def add_kirkland(self):
+        import ocr_fusion
+        for i, flavor in enumerate(("lime", "lemon", "grapefruit")):
+            meta = {"brand": "Kirkland Signature", "category": "beverage_can", "flavor": flavor,
+                    "raw_name": f"kirkland {flavor} sparkling water"}
+            meta["lexicon"] = ocr_fusion.build_lexicon(meta, f"kirkland_{flavor}", {"sparkling": 3, "water": 3})
+            self.add(f"kirkland_{flavor}", 10 * (i + 1), meta)
+
+    def test_dino_calibration_knots(self):
+        lo, mid, hi = self.r.DINO_KNOTS
+        cal = self.r.dino_calibrate
+        self.assertEqual(cal(lo - 0.1), 0.0)
+        self.assertAlmostEqual(cal(mid), 0.80, places=3)
+        self.assertAlmostEqual(cal(hi), 0.95, places=3)
+        self.assertLessEqual(cal(1.0), 0.95)
+        xs = np.linspace(0, 1, 41)
+        ys = [cal(float(x)) for x in xs]
+        self.assertEqual(ys, sorted(ys))
+
+    def test_dino_rank_is_max_over_views_and_category_filtered(self):
+        rng = np.random.default_rng(0)
+        front, back = rng.standard_normal(768).astype(np.float32), rng.standard_normal(768).astype(np.float32)
+        self.add("iphone_15_pro", 1, {"category": "smartphone", "brand": "Apple"}, {"front": [front], "back": [back]})
+        self.add("pepsi", 5, {"category": "beverage_can", "brand": "Pepsi"}, {"front": [front]})
+        out = self.bank.dino_rank(back, device_taxonomy.PHONE_DOMAIN)
+        self.assertEqual(set(out), {"iphone_15_pro"})
+        self.assertAlmostEqual(out["iphone_15_pro"][0], 1.0, places=4)
+        self.assertEqual(out["iphone_15_pro"][1], "back")
+        self.assertTrue(self.bank.has_pose_category("smartphone"))
+        self.assertFalse(self.bank.has_pose_category("headphones"))
+
+    def test_lexicon_route_picks_the_flavour_read_on_the_can(self):
+        self.add_kirkland()
+        cans = device_taxonomy.BEVERAGE_DOMAIN
+        ranked = [(lab, 0.5, "front") for lab in ("kirkland_lemon", "kirkland_lime", "kirkland_grapefruit")]
+        route = self.pipe._lexicon_route
+        lab, m = route(ranked, {"lime": 2, "sparkling": 3}, cans)
+        self.assertEqual(lab, "kirkland_lime")
+        self.assertTrue(m["confirmed"] and m["confidence"] >= 0.85)
+        self.assertEqual(route(ranked, {"kirkland": 1, "grapefruit": 1}, cans)[0], "kirkland_grapefruit")
+        self.assertIsNone(route(ranked, {"kirkland": 3, "sparkling": 3}, cans))  # brand only: no flavour evidence
+        self.assertIsNone(route(ranked, {"kirkland": 1, "lime": 1, "lemon": 1}, cans))  # two flavours read: ambiguous
+        self.assertIsNone(route(ranked, {"pepsi": 2, "lime": 2}, cans))  # competitor brand read: veto
+        self.assertIsNone(route(ranked, {}, cans))
+        weak = [(lab, -1.0, "front") for lab, _s, _v in ranked]
+        self.assertIsNone(route(weak, {"lime": 2, "kirkland": 2}, None))  # no can detected and no vision support
+        self.assertEqual(route(weak, {"lime": 2, "kirkland": 2}, cans)[0], "kirkland_lime")
+
+    def test_enrollment_learns_lexicon_from_ocr_passes(self):
+        mv = self.pipe.mv
+        mv.add_text([frozenset({"lime", "natural"})])  # inactive wizard: ignored
+        self.assertEqual(dict(mv.text_runs), {})
+        mv.start({"raw_name": "kirkland lime sparkling water", "category": "beverage_can"}, frames_per_view=3)
+        for toks in ({"lime", "natural", "pepsi"}, {"natural", "flavored", "pepsi"}, {"once"}):
+            mv.add_text([frozenset(toks)])
+        mv.capture("front")
+        for k in range(3):
+            mv.feed(self.tc.unit(40 + k))
+        mv.finish()
+        lex = self.bank.lexicon(mv.label)
+        self.assertIn("natural", lex)  # read in 2 OCR passes during the wizard
+        self.assertIn("lime", lex)
+        self.assertNotIn("pepsi", lex)  # competitor brand in the background is never learned
+        self.assertNotIn("once", lex)
+
+    def test_bank_lexicon_falls_back_to_metadata(self):
+        self.add("kirkland_lime", 3, {"brand": "Kirkland Signature", "category": "beverage_can", "flavor": "lime"})
+        lex = self.bank.lexicon("kirkland_lime")
+        self.assertIn("lime", lex)
+        self.assertIn("kirkland", lex)
+        self.assertEqual(self.bank.labels_in(device_taxonomy.BEVERAGE_DOMAIN), ["kirkland_lime"])
+
+
+@needs_torch
+class LibraryRouteTests(unittest.TestCase):
+    """HTTP: /api/models (library + per-class cache), upload, trash, /ATTRIBUTION.md and the routing telemetry."""
+
+    setUp_base = EnrollmentAndLifecycleTests.setUp
+    tearDown_base = EnrollmentAndLifecycleTests.tearDown
+    call = EnrollmentAndLifecycleTests.call
+
+    def setUp(self):
+        self.models = Path(tempfile.mkdtemp(prefix="kz_libroute_"))
+        self.mpatch = mock.patch.object(cad_harvester.mcp, "MODELS_DIR", self.models)
+        self.mpatch.start()
+        self.setUp_base()
+
+    def tearDown(self):
+        self.tearDown_base()
+        self.mpatch.stop()
+        shutil.rmtree(self.models, ignore_errors=True)
+
+    def test_upload_list_conflict_and_trash(self):
+        good = procedural_glb.build_can_spec(66.0, 115.2, 54.0)
+        q = urllib.parse.urlencode({"name": "Kirkland Sparkling Water Grapefruit", "category": "beverage_can",
+                                    "filename": "kirkgrapefruit.glb"})
+        status, out = self.call("POST", f"/api/models/library?{q}", good)
+        self.assertEqual(status, 201, out)
+        eid = out["entry"]["id"]
+        self.assertEqual(self.call("POST", f"/api/models/library?{q}", good)[0], 409)
+        self.assertEqual(self.call("POST", "/api/models/library?name=Bad", b"x" * 200)[0], 422)
+        status, listing = self.call("GET", "/api/models")
+        self.assertEqual((status, [e["id"] for e in listing["library"]]), (200, [eid]))
+        self.assertEqual(listing["library"][0]["author"], "Hershey-Bar")
+        status, out = self.call("POST", f"/api/models/library/{eid}/attach", {"label": "not_enrolled"})
+        self.assertEqual(status, 404, out)
+        self.assertEqual(self.call("DELETE", f"/api/models/library/{eid}")[0], 200)
+        self.assertEqual(self.call("DELETE", f"/api/models/library/{eid}")[0], 404)
+        self.assertEqual(self.call("DELETE", "/api/models/library/..%2F..%2Fx")[0], 400)
+        self.assertEqual(self.call("GET", "/api/models")[1]["library"], [])
+
+    def test_cache_trash(self):
+        cad_harvester.upload_glb("some_can", procedural_glb.build_can_spec(66.0, 115.2, 54.0), "c.glb", "Can")
+        status, listing = self.call("GET", "/api/models")
+        self.assertIn("some_can", [c["class_id"] for c in listing["cache"]])
+        self.assertEqual(self.call("DELETE", "/api/models/cache/some_can")[0], 200)
+        self.assertFalse(cad_harvester.glb_path("some_can").exists())
+        self.assertEqual(self.call("DELETE", "/api/models/cache/some_can")[0], 404)
+
+    def test_attribution_and_pipeline_telemetry(self):
+        status, body = self.call("GET", "/ATTRIBUTION.md")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        for word in ("Hershey-Bar", "DINOv2", "YOLO", "PaddleOCR"):
+            self.assertIn(word, text)
+        status, tel = self.call("GET", "/api/telemetry")
+        self.assertEqual(status, 200)
+        self.assertIn("dinov2", tel["inference"]["pipeline"])
+        self.assertIn("route", tel["inference"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

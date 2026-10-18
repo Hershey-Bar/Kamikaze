@@ -27,7 +27,7 @@ VIEW_STEPS = {
     "beverage_can": {
         "front": ("Front branding (0°)", "Position the main brand logo directly facing the camera, centered and upright.",
                   "Primary brand graphics and flavour name."),
-        "back": ("Rear panel (180°)", "Rotate the can 180°. Show the nutrition facts grid, barcode and manufacturer text.",
+        "back": ("Rear panel - nutrition & barcode (180°)", "Rotate the can 180°. Show the nutrition facts grid, barcode and manufacturer text.",
                  "Ingredients table, barcode, regulatory markings."),
         "right": ("Side seam (90°)", "Turn the can 90°. Show the lateral seam, volume markings and side artwork.",
                   "Cylindrical curvature, side packaging text."),
@@ -48,15 +48,15 @@ VIEW_STEPS = {
                 "Cap colour and shape."),
     },
     "smartphone": {
-        "front": ("Front face (display)", "Face the screen directly toward the camera, centered and upright.",
+        "front": ("Front face (display & selfie camera)", "Face the screen directly toward the camera, centered and upright.",
                   "Screen surface, bezels, Dynamic Island / punch-hole camera."),
-        "back": ("Rear shell (180°)", "Rotate the phone 180°. Show the rear glass, camera bump, lenses and flash.",
+        "back": ("Rear back shell (180°)", "Rotate the phone 180°. Show the rear glass, camera bump, lenses and flash.",
                  "Lens cluster, LiDAR / sensors, rear logo."),
-        "right": ("Right rail (90°)", "Turn the phone 90° so its right edge faces the camera.",
+        "right": ("Right side profile (90°)", "Turn the phone 90° so its right edge faces the camera.",
                   "Button placement, rail curvature, frame material."),
-        "left": ("Left rail (270°)", "Turn the phone 90° the other way so its left edge faces the camera.",
+        "left": ("Left side profile (270°)", "Turn the phone 90° the other way so its left edge faces the camera.",
                  "Left-rail buttons, antenna bands."),
-        "top": ("Camera cluster (tilt 35-45°)",
+        "top": ("Top / camera cluster (tilt 35-45°)",
                 "Tilt the phone's top edge 35-45° toward the camera to expose lens elevation and depth.",
                 "Periscope cut-out, lens ring height, 3D contours."),
     },
@@ -71,7 +71,7 @@ PHONE_RAILS = {
                 "left": ("(no buttons - antenna bands only)", "Plain rail, antenna bands, frame material.")},
 }
 
-MSG_PHONE_FLIP = "Front screen detected. Flip phone 180° to expose camera island."
+MSG_PHONE_FLIP = "Screen detected. Flip phone 180° to expose camera island and sensors."
 MSG_PHONE_TILT = "Tilt phone 30° toward light to expose lens count and LiDAR sensor."
 
 _BRANDS = (

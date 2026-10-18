@@ -1,6 +1,8 @@
-"""On-device OCR (RapidOCR / ONNX Runtime, CPU) with dictionary autocorrect, fused with vision and colour.
+"""On-device OCR (RapidOCR PP-OCRv4: detector on the Hexagon NPU via ocr_npu, recogniser on ONNX Runtime CPU) with
+dictionary autocorrect, fused with vision and colour.
 
-The OCR engine is far slower than the NPU path (~160-175 ms per 320 px crop on the QCS8275's Kryo cores), so it runs in
+The OCR engine is slower than the vision path (~160-175 ms per 320 px crop all-CPU; the NPU detector removes ~95 ms
+of that), so it runs in
 its own latest-frame-wins worker thread at OCR_HZ and never blocks a video frame. Recognised words (confidence >=
 MIN_SCORE, >= 3 characters) pass a non-intrusive autocorrect (Corrector: glyph swaps c0ke -> coke, fuzzy matches of
 >= 5-letter words against the canonical + enrolled vocabulary) and the words from the last WINDOW_S seconds are matched
@@ -18,6 +20,13 @@ Tri-modal fusion happens in calibrated-confidence space (see fuse_calibrated):
 
 and only once vision alone is at least at the SEARCHING floor, so text / colour can confirm or veto an object the
 camera actually sees but never conjure one out of background print.
+
+Beverage-branch keyword lexicon (identical cans that differ only in flavour print, e.g. Kirkland lime / lemon /
+grapefruit): every OCR pass's corrected token set is kept in a rolling buffer (OcrWorker.rolling: the last ROLL_RUNS
+passes, each <= ROLL_MAX_AGE s old, so a word lost to cylindrical glare in one pass survives from its neighbours).
+build_lexicon learns a class's keywords at enrollment (metadata words + tokens read in >= LEXICON_MIN_RUNS separate
+passes during the wizard, never another brand's words); lexicon_match confirms a class when a discriminative word (one
+no other enrolled class has) plus a brand word or a second lexicon word were read.
 
 No frame or crop is ever written to disk: the worker holds one RGB array in RAM and drops it after recognition.
 """
@@ -42,6 +51,11 @@ WINDOW_S = float(os.environ.get("KAMIKAZE_OCR_WINDOW", "1.5"))
 MIN_SCORE = float(os.environ.get("KAMIKAZE_OCR_MIN_SCORE", "0.5"))
 OCR_SIDE = int(os.environ.get("KAMIKAZE_OCR_SIDE", "320"))
 OCR_THREADS = int(os.environ.get("KAMIKAZE_OCR_THREADS", "4"))
+ROLL_RUNS = int(os.environ.get("KAMIKAZE_OCR_ROLL", "5"))  # rolling token buffer: the last N OCR passes ...
+ROLL_MAX_AGE = float(os.environ.get("KAMIKAZE_OCR_ROLL_S", "3.0"))  # ... no older than this (s)
+LEXICON_MIN_RUNS = int(os.environ.get("KAMIKAZE_LEXICON_MIN_RUNS", "2"))
+LEXICON_MAX = 48
+LEXICON_BASE, LEXICON_CAP = 0.85, 0.95
 
 # brand -> words that identify it in print (lower case, alphanumerics only)
 BRAND_WORDS: dict[str, set[str]] = {
@@ -212,6 +226,42 @@ def text_score(words: dict, seen: set[str]) -> float | None:
     return None
 
 
+def lexicon_word_ok(word: str) -> bool:
+    """A token worth keeping in a class keyword lexicon: >= MIN_TOKEN chars, not a stop word / bare number / size."""
+    return (len(word) >= MIN_TOKEN and word not in _STOP and not word.isdigit()
+            and not re.fullmatch(r"\d+(ml|l|oz|cl|g|kcal|cal|mg)", word))
+
+
+def build_lexicon(meta: dict | None, label: str, run_counts: dict[str, int] | None = None,
+                  min_runs: int = LEXICON_MIN_RUNS) -> list[str]:
+    """Keyword lexicon of one class: its metadata words (brand + flavour / model) plus every token the OCR read in at
+    least `min_runs` separate OCR passes while the class was being enrolled (rear-panel text, slogans, flavour copy).
+    Words of a *different* known brand are never learned (a stray competitor can in the background)."""
+    words = class_words(meta, label)
+    own = words.get("brand_key")
+    foreign = {w for key, ws in BRAND_WORDS.items() if key != own for w in ws - _WEAK}
+    lex = {w for w in words["brand"] | words["detail"] if lexicon_word_ok(w)}
+    for word, n in (run_counts or {}).items():
+        if n >= min_runs and lexicon_word_ok(word) and word not in foreign:
+            lex.add(word)
+    return sorted(lex)[:LEXICON_MAX]
+
+
+def lexicon_match(lexicon: set[str], brand: set[str], others: set[str], seen: set[str]) -> dict:
+    """Keyword match of one class against the rolling OCR token buffer. Discriminative hits are lexicon words no other
+    enrolled class has (lime vs lemon vs grapefruit on otherwise identical Kirkland cans).
+
+    confirmed = >= 1 discriminative hit AND (a brand word was read OR >= 2 lexicon words were read);
+    confidence = 0.85 + 0.03 per hit beyond the second, capped at 0.95 (0 when not confirmed)."""
+    hits = lexicon & seen
+    disc = hits - others
+    brand_hit = bool(brand & seen)
+    confirmed = bool(disc) and (brand_hit or len(hits) >= 2)
+    conf = min(LEXICON_CAP, LEXICON_BASE + 0.03 * max(0, len(hits) - 2)) if confirmed else 0.0
+    return {"hits": sorted(hits), "discriminative": sorted(disc), "brand": brand_hit, "confirmed": confirmed,
+            "confidence": round(conf, 4)}
+
+
 def fuse(s_vision: float, s_text: float | None) -> float:
     """Two-modality blend (vision + text only), same weights as fuse_calibrated."""
     return fuse_calibrated(s_vision, s_text, None)
@@ -240,10 +290,12 @@ class OcrWorker:
         self._pending: np.ndarray | None = None
         self._reads: collections.deque = collections.deque(maxlen=64)  # (mono_time, text, score)
         self._lat: collections.deque = collections.deque(maxlen=120)
+        self._run_buf: collections.deque = collections.deque(maxlen=32)  # (run id, mono time, corrected token set)
         self._runs = 0
         self._last_run = 0.0
         self.error: str | None = None
         self.corrector = Corrector()
+        self.det_npu = None  # ocr_npu.HtpDetSession when the PP-OCRv4 detector runs on the HTP
         self._thread: threading.Thread | None = None
         if engine is not None:
             self._thread = threading.Thread(target=self._loop, name="ocr-worker", daemon=True)
@@ -261,8 +313,14 @@ class OcrWorker:
 
             engine = RapidOCR(det_limit_side_len=OCR_SIDE, intra_op_num_threads=OCR_THREADS,
                               inter_op_num_threads=1)
-            log.info("OCR ready: RapidOCR (ONNX Runtime CPU, %d threads, %d px, %.1f Hz)", OCR_THREADS, OCR_SIDE, OCR_HZ)
-            return cls(engine)
+            import ocr_npu
+
+            det = ocr_npu.accelerate(engine, OCR_SIDE)
+            log.info("OCR ready: RapidOCR PP-OCRv4 (det on %s, rec on ONNX Runtime CPU, %d threads, %d px, %.1f Hz)",
+                     "the Hexagon NPU" if det else "ONNX Runtime CPU", OCR_THREADS, OCR_SIDE, OCR_HZ)
+            worker = cls(engine)
+            worker.det_npu = det
+            return worker
         except Exception as exc:  # optional dependency: the pipeline runs vision-only without it
             worker = cls(None)
             worker.error = f"unavailable: {exc}"
@@ -312,13 +370,37 @@ class OcrWorker:
         result, _ = self.engine(bgr, use_cls=False)
         ms = (time.perf_counter() - t0) * 1000.0
         now = time.monotonic()
+        run_tokens: set[str] = set()
+        for item in result or []:
+            text, score = str(item[1]), float(item[2])
+            if score >= MIN_SCORE and text.strip():
+                run_tokens |= tokens_from_words(self.corrector.text(text.strip())[0])
         with self._cv:
             self._lat.append(ms)
             self._runs += 1
+            self._run_buf.append((self._runs, now, frozenset(run_tokens)))
             for item in result or []:
                 text, score = str(item[1]), float(item[2])
                 if score >= MIN_SCORE and text.strip():
                     self._reads.append((now, text.strip(), score))
+
+    def rolling(self, n: int = ROLL_RUNS, max_age: float = ROLL_MAX_AGE) -> dict[str, int]:
+        """Rolling token buffer: {corrected token: number of the last `n` OCR passes (each <= max_age s old) that read
+        it}. A word lost to cylindrical glare in one pass is still present from its neighbours."""
+        now = time.monotonic()
+        with self._cv:
+            runs = [toks for _i, t, toks in list(self._run_buf)[-n:] if now - t <= max_age]
+        counts: dict[str, int] = {}
+        for toks in runs:
+            for tok in toks:
+                counts[tok] = counts.get(tok, 0) + 1
+        return counts
+
+    def runs_after(self, run_id: int) -> tuple[int, list[frozenset]]:
+        """(latest run id, token sets of every buffered OCR pass with id > run_id) - for enrollment lexicon learning."""
+        with self._cv:
+            new = [toks for i, _t, toks in self._run_buf if i > run_id]
+            return self._runs, new
 
     def set_vocabulary(self, words) -> None:
         """Add enrolled class words (brand / flavour / model) to the autocorrect dictionary."""
@@ -350,5 +432,12 @@ class OcrWorker:
             "enabled": self.enabled, "texts": texts[:8], "corrected": corrected[:8], "corrections": fixes[:8],
             "tokens": sorted(seen), "runs": runs,
             "ms": round(lat[len(lat) // 2], 1) if lat else None, "hz": round(1.0 / self.period, 1),
-            "error": self.error, "engine": "RapidOCR / ONNX Runtime (CPU)" if self.enabled else None,
+            "error": self.error, "engine": self.engine_name(), "det": self.det_npu.info() if self.det_npu else None,
         }
+
+    def engine_name(self) -> str | None:
+        if not self.enabled:
+            return None
+        if self.det_npu is not None and self.det_npu.info()["device"] == "npu":
+            return "PP-OCRv4 (RapidOCR): det on Hexagon NPU (QNN HTP), rec on ONNX Runtime CPU"
+        return "PP-OCRv4 (RapidOCR): ONNX Runtime CPU"

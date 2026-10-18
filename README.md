@@ -205,9 +205,10 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
 
        C_fused = (0.60·C_vision + 0.25·C_text + 0.15·C_color) / (sum of the weights of the modalities present)
 
-   - **Text**: RapidOCR (ONNX Runtime, CPU) reads the crop in its own worker at ~3 Hz (`KAMIKAZE_OCR_HZ`). A read costs
-     ~160 ms on the QCS8275 Kryo cores, so a 20 ms OCR budget is not achievable on this board; it therefore never runs
-     in the frame path. Words then pass a non-intrusive autocorrect (~0.2 ms): OCR glyph swaps (`c0ke → coke`,
+   - **Text**: RapidOCR PP-OCRv4 reads the crop in its own worker at ~3 Hz (`KAMIKAZE_OCR_HZ`). The text **detector**
+     runs on the Hexagon NPU (HTP, LiteRT + QNN delegate, `ocr_npu.py`, exported by `export_ppocr.sh`: ~17 ms vs ~110 ms
+     on CPU); the recogniser stays on ONNX Runtime CPU (variable-width input, no HTP graph). A full read is still
+     ~340 ms on 1080p crops, so OCR never runs in the frame path (`KAMIKAZE_OCR_NPU=0` forces the CPU detector). Words then pass a non-intrusive autocorrect (~0.2 ms): OCR glyph swaps (`c0ke → coke`,
      `5prite → sprite`) are kept only when they land on a vocabulary word, and fuzzy matching (`difflib`, ratio ≥
      `KAMIKAZE_OCR_FUZZY` = 0.8) applies only to words of ≥ 5 letters, against the canonical brand vocabulary plus every
      enrolled class's words. Short words are never fuzzed (`cake` stays `cake`). `C_text` is 1.0 for brand + detail,
@@ -233,6 +234,21 @@ Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` 
    dashboard drives model-viewer's `orientation` (`roll pitch yaw`) with matching signs. Pitch comes from the Top-view weight plus the perspective taper of the object outline. Classes enrolled before the pose worker existed fall back to MobileNet view centroids
    (`pose.source` = `mobilenet-views` instead of `dinov2-npu`); re-enroll them for DINOv2 pose. `KAMIKAZE_POSE_DINO=0`
    disables the worker.
+6. **Bifurcated routing** (`Pipeline._fuse`; the telemetry `route` field and the dashboard route chips show which
+   branch decided). Pipeline: `raw frame -> YOLO-World NPU -> ROI crop (15% pad) -> routing switch -> label / confidence /
+   bbox / yaw-pitch -> Modulino Pixels`.
+   - **Smartphone branch**: the vision score becomes an ensemble `C = (1-w)·C_mobilenet + w·C_dino` (`KAMIKAZE_DINO_WEIGHT`,
+     0.5). `C_dino` is the **maximum** raw cosine of the live DINOv2 descriptor over each class's per-view DINOv2
+     centroids (rear camera island and screen are separate prototypes, never averaged), mapped through
+     `KAMIKAZE_DINO_KNOTS` (0.45 → 0, 0.78 → 0.80, 0.92 → 0.95 cap). The knots are starting values, not yet measured on
+     real phones; tune them after the first phone enrollments. The front-screen 35% cap still applies.
+   - **Beverage branch**: an OCR keyword lexicon per class, learned at enrollment (metadata words + tokens read in ≥ 2
+     OCR passes during the wizard, never another brand's words), matched against a rolling buffer of the last 5 OCR
+     passes (≤ 3 s; `KAMIKAZE_OCR_ROLL`, `KAMIKAZE_OCR_ROLL_S`) so a word lost to cylindrical glare in one pass survives
+     from its neighbours. A class is confirmed when a **discriminative** word (in no other enrolled can's lexicon, e.g.
+     *lime* vs *lemon* vs *grapefruit* on otherwise identical Kirkland cans) plus a brand word or a second lexicon word
+     were read; it then gets `C_fused ≥ 0.85` (+0.03 per extra word, cap 0.95). A competitor brand read vetoes, two
+     flavours read is a tie (no override), and the route needs a detected can or vision ≥ the SEARCHING floor.
 
 ## Dashboard
 
@@ -313,7 +329,17 @@ rotated CC-BY model is a modification, so the sidecar records `modified` + `orie
 *(re-oriented)*.
 
 Every model has a JSON sidecar with title, author, author URL, licence and source; credits are shown in the
-dashboard and written to `static/models/CREDITS.md`.
+dashboard and written to `static/models/CREDITS.md`. Third-party models, runtimes and libraries are credited in [ATTRIBUTION.md](ATTRIBUTION.md)
+(also served at `/ATTRIBUTION.md` and linked from the dashboard footer).
+
+**Local model library** (`model_library.py`, `static/models/library/`, git-ignored: owner scans are never committed).
+Hand scans or other owned GLBs are added from the dashboard **Model library** panel (or `POST /api/models/library`),
+pass the same quality gate, are auto-oriented and credited to their owner (*3D hand scan by Hershey-Bar*). Each entry
+has a match key (category + brand first word + flavour / phone model), so a newly enrolled `kirkland lime sparkling
+water` class binds to the lime scan **before any online search and also in offline mode**; an explicit Sketchfab /
+Poly Pizza pick skips the library. The panel lists every library model and per-class cached model with **View**
+(preview on the stage), **Use for class** and a trash-can **Delete** (deleting a library model also drops the
+per-class copies made from it). Scans keep their scanned scale; model-viewer frames them automatically.
 
 ## API
 
@@ -342,6 +368,11 @@ dashboard and written to `static/models/CREDITS.md`.
 | POST | `/api/classes/<id>/upload_cad?filename=x.glb` | raw GLB body (≤ `KAMIKAZE_CAD_UPLOAD_MB`, 35); 422 when it fails the quality gate |
 | POST | `/api/classes/<id>/generate_spec` | dimension-calibrated GLB from verified specs (404 + reason when no spec is found) |
 | GET | `/api/credits`, `/api/db/export`; POST `/api/db/save` | attribution, database export/save |
+| GET | `/api/models` | local model library + per-class cached models |
+| POST | `/api/models/library?name=&category=&filename=&replace=1` | raw GLB body → quality gate → library (201; 409 exists; 422 rejected) |
+| POST | `/api/models/library/<id>/attach` `{"label": ...}` | use a library model as a class's CAD |
+| DELETE | `/api/models/library/<id>`, `/api/models/cache/<class>` | trash a library model / a cached per-class model |
+| GET | `/ATTRIBUTION.md` | third-party credits |
 
 `mcp_server.py` exposes the same capabilities as FastMCP tools over stdio (`search_3d_asset`, `actuate_modulino`,
 `trigger_guidance`, `enroll_multiview`, `fetch_cad_asset`, `resolve_product`, `get_telemetry`, `get_pose_telemetry`, ...).

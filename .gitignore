@@ -17,3 +17,5 @@ enrolled_classes.*.bak.pt
 static/models/*.json
 static/models/base/
 static/models/CREDITS.md
+# owner-provided hand scans: local model library only, never committed
+static/models/library/

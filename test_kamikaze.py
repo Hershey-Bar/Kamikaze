@@ -412,7 +412,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(out["state"], receiver.GUIDING)
         self.assertLessEqual(out["score"], 0.35)
         self.assertEqual(receiver.guidance_message(out["state"], out["label"], out["score"], "flip"),
-                         "Front screen detected. Flip phone 180° to expose camera island.")
+                         "Screen detected. Flip phone 180° to expose camera island and sensors.")
 
     def test_low_similarity_searches(self):
         sm = receiver.StateMachine()
@@ -782,7 +782,7 @@ class PipelineHttpTests(unittest.TestCase):
         self.assertLessEqual(verdict["confidence"], 0.35)
         self.assertEqual(verdict["hint"], "flip")
         state = json.loads(self.call("GET", "/api/state")[1])
-        self.assertEqual(state["guidance"], "Front screen detected. Flip phone 180° to expose camera island.")
+        self.assertEqual(state["guidance"], "Screen detected. Flip phone 180° to expose camera island and sensors.")
         self.assertTrue(state["front_dominant"])
         time.sleep(0.3)
         self.assertEqual(self.leds_log[-1], (255, 120, 0, 40, 4))

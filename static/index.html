@@ -45,7 +45,7 @@
   #badge { position:absolute; left:10px; bottom:10px; right:10px; padding:8px 10px; border-radius:8px; background:rgba(7,11,22,.78); border:1px solid var(--line); font-size:11px; color:var(--mute); overflow-wrap:anywhere; backdrop-filter:blur(4px); }
   #badge:empty { display:none; }
   #badge a { color:#7dd3fc; }
-  #viewerLabel { position:absolute; left:10px; top:10px; padding:4px 10px; border-radius:999px; background:rgba(7,11,22,.75); border:1px solid var(--line); font-size:12px; }
+  #viewerLabel { position:absolute; left:10px; top:10px; max-width:calc(100% - 20px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:4px 10px; border-radius:999px; background:rgba(7,11,22,.75); border:1px solid var(--line); font-size:12px; }
   .tools { display:flex; gap:6px; flex-wrap:wrap; }
   button { background:#2563eb; border:0; color:#fff; padding:8px 14px; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.45; cursor:default; }
@@ -121,6 +121,21 @@
   .drop { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:4px; width:min(440px,90%); padding:22px; border:2px dashed var(--line); border-radius:12px; cursor:pointer; color:var(--mute); font-size:13px; transition:border-color .2s, background .2s; }
   .drop.over, .drop:hover { border-color:var(--blue); background:rgba(56,189,248,.07); color:var(--text); }
   .drop input { display:none; }
+.vstage.dragging::after { content:attr(data-drop); position:absolute; inset:0; display:flex; align-items:center; justify-content:center; border:2px dashed var(--blue); border-radius:10px; background:rgba(56,189,248,.10); color:var(--text); font-weight:600; pointer-events:none; }
+#previewBar { position:absolute; right:10px; top:10px; display:none; gap:6px; align-items:center; white-space:nowrap; }
+#previewBar.show { display:flex; }
+  .vstage.previewing #viewerLabel { max-width:calc(100% - 190px); }
+table.lib td.acts { white-space:nowrap; text-align:right; }
+table.lib td.acts button { margin-left:4px; }
+button.trash { background:transparent; border:1px solid var(--red); color:var(--red); padding:3px 8px; font-size:14px; line-height:1; }
+.libadd { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+.libadd input[type=text] { flex:1; min-width:200px; }
+.libadd label.ghostbtn { border:1px solid var(--line); border-radius:8px; padding:5px 10px; font-size:12px; cursor:pointer; }
+.libadd label.ghostbtn input { display:none; }
+.libsub { margin:12px 0 4px; color:var(--mute); font-size:10px; text-transform:uppercase; letter-spacing:.08em; }
+.lumabar { position:relative; height:6px; border-radius:3px; background:var(--panel2); overflow:hidden; margin-top:4px; }
+.lumabar > div { height:100%; background:var(--blue); }
+.lumabar > i { position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--amber); }
   #estBadge { position:absolute; right:10px; top:10px; padding:4px 10px; border-radius:999px; background:rgba(245,158,11,.18); border:1px solid var(--amber); color:#ffe7bf; font-size:11px; font-weight:600; display:none; }
   #estBadge.show { display:block; }
   .modal { position:fixed; inset:0; background:rgba(2,4,10,.72); display:none; align-items:center; justify-content:center; z-index:50; padding:20px; }
@@ -199,6 +214,9 @@
           <button id="finishBtn" class="ghost" disabled>Done (save captured views)</button>
           <button id="cancelBtn" class="ghost" disabled>Cancel</button>
         </div>
+        <div class="libsub" title="Captures are refused below luma 42 / 255 (amber marker) or above 18 % blown-out pixels">Lighting sensor · <span id="lumaTxt">—</span>
+          <div class="lumabar"><div id="lumaFill" style="width:0"></div><i style="left:16.5%"></i></div>
+        </div>
         <div class="steps" id="steps"></div>
         <div id="enrollMsg"></div>
         <div class="frow">
@@ -262,6 +280,7 @@
           <dt>Detector domain</dt><dd id="tDomain">—</dd>
           <dt>Pose (DINOv2)</dt><dd id="tPose">—</dd>
           <dt>OCR text fusion</dt><dd id="tOcr">—</dd>
+          <dt>Routing branch</dt><dd id="tRoute">—</dd>
           <dt>Lighting gate (luma / glare)</dt><dd id="tLight">—</dd>
         </dl>
       </section>
@@ -311,6 +330,7 @@
             </div>
           </div>
           <span id="viewerLabel">No model</span>
+          <span id="previewBar"><span class="pill on" id="previewPill">preview</span><button class="ghost" id="previewExit" type="button">Back to live</button></span>
           <span id="estBadge">ESTIMATED · spec-generated geometry</span>
           <div id="badge"></div>
         </div>
@@ -332,6 +352,25 @@
           <tbody id="classRows"></tbody>
         </table>
       </section>
+
+      <section class="panel">
+        <h2>Local model library <span><span class="pill" id="libCount">0 models</span></span></h2>
+        <div class="libadd">
+          <input type="text" id="libName" placeholder="Product name for a new .glb, e.g. Kirkland Sparkling Water Lemon" maxlength="80">
+          <label class="ghostbtn" title="Quality-checked, auto-oriented and stored on this device only (static/models/library, never committed)">Add .glb to library…<input type="file" id="libFile" accept=".glb,model/gltf-binary"></label>
+        </div>
+        <div class="mute" id="libMsg">Hand scans and owned models live here; a class whose brand + flavour / model matches uses its library model before any online search (also offline). Drop a .glb on the 3D stage to add it.</div>
+        <div class="libsub">Library</div>
+        <table class="classes lib">
+          <thead><tr><th>Model</th><th>Match</th><th>Size</th><th>Used by</th><th></th></tr></thead>
+          <tbody id="libRows"></tbody>
+        </table>
+        <div class="libsub">Per-class cache (harvested / uploaded)</div>
+        <table class="classes lib">
+          <thead><tr><th>Model</th><th>Source</th><th>Class</th><th></th></tr></thead>
+          <tbody id="cacheRows"></tbody>
+        </table>
+      </section>
   </div>
 </div>
 <div class="modal" id="modal"><div class="mbox">
@@ -340,7 +379,7 @@
   <div id="mBody"></div>
   <div class="frow" id="mActions" style="justify-content:flex-end"></div>
 </div></div>
-<footer>Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/classes/&lt;id&gt;/cad_candidates</code> · <code>/api/settings/mode</code> · <code>/api/credits</code>. 3D models are shown only when they are an exact verified match, a model you picked or uploaded, or geometry generated from verified published dimensions (badged ESTIMATED); otherwise the stage reports NOT FOUND.</footer>
+<footer>Training mode. YOLO-World open-vocabulary detection (beverage can / smartphone domain gate), 1280-d MobileNetV3-Large identity embeddings and DINOv2 ViT-S/14 viewpoint descriptors run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is a sigmoid calibration of the cosine score, smoothed with an EMA. No camera image is ever saved: only embedding vectors (1280-d identity, 768-d DINOv2 pose) reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/classes/&lt;id&gt;/cad_candidates</code> · <code>/api/settings/mode</code> · <code>/api/credits</code>. 3D models are shown only when they are an exact verified match, a model you picked or uploaded, or geometry generated from verified published dimensions (badged ESTIMATED); otherwise the stage reports NOT FOUND. <a href="/ATTRIBUTION.md" target="_blank" rel="noopener">Model &amp; asset attribution (ATTRIBUTION.md)</a>.</footer>
 
 <script>
   (function () {
@@ -363,7 +402,7 @@
 
   const ctx = $('cam').getContext('2d');
   const viewer = $('viewer');
-  let frameBusy = false, lastSrc = '', syncPose = false, autoRotate = true, state = null, pose = null, lastSse = 0, lastTel = 0;
+  let frameBusy = false, lastSrc = '', syncPose = false, autoRotate = true, state = null, pose = null, lastSse = 0, lastTel = 0, preview = null;
 
   function brackets(x, y, side, color) {
     const L = side * 0.16;
@@ -689,7 +728,13 @@
     $('tPose').textContent = pm ? `${pm.device === 'npu' ? 'NPU' : (pm.device || 'cpu').toUpperCase()} · ${fmt(pm.median_ms, 1, ' ms')} · ${pm.rate_hz} Hz cap`
       : 'off (MobileNet view centroids)';
     const om = models.ocr || {};
-    $('tOcr').textContent = om.enabled ? `CPU · ${fmt(om.ms, 0, ' ms')} median · ${om.hz} Hz cap · ${om.runs} runs` : (om.error ? 'off · ' + om.error : 'off');
+    $('tOcr').textContent = om.enabled ? `${om.det && om.det.device === 'npu' ? 'det NPU ' + fmt(om.det.median_ms, 1, ' ms') + ' + rec CPU' : 'CPU'} · ${fmt(om.ms, 0, ' ms')} median · ${om.hz} Hz cap · ${om.runs} runs` : (om.error ? 'off · ' + om.error : 'off');
+    const rt = inf.route || {};
+    const tr = $('tRoute');
+    tr.title = inf.pipeline || '';
+    tr.textContent = !rt.branch ? 'no detector gate (all classes)'
+      : rt.branch === 'smartphone' ? `smartphone → DINOv2 + MobileNetV3${rt.dinov2 ? '' : ' (DINOv2 idle)'}`
+      : `beverage → OCR lexicon${rt.lexicon ? ' ✓ ' + rt.lexicon.label.replace(/_/g, ' ') : ''} · ${(rt.rolling_tokens || []).length} tokens`;
     const li = inf.lighting;
     $('tLight').textContent = li && li.mean_luma != null
       ? `${fmt(li.mean_luma, 0)} / ${fmt(li.glare_fraction * 100, 1, ' %')}${li.ok ? ' · ok' : ' · ' + li.issue.replace('_', ' ')}` : '—';
@@ -797,10 +842,12 @@
     const name = s.confirmed_label || s.viewer_label;
     const glb = name && s.glb_url ? s.glb_url : '';
     const src = glb ? new URL(glb, location.href).href : '';
-    if (src !== lastSrc) { lastSrc = src; if (glb) viewer.setAttribute('src', glb); else viewer.removeAttribute('src'); }
-    $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${String(s.asset_status || '').replace('_', ' ')}` : 'No model';
+    if (!preview) {
+      if (src !== lastSrc) { lastSrc = src; if (glb) viewer.setAttribute('src', glb); else viewer.removeAttribute('src'); }
+      $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${String(s.asset_status || '').replace('_', ' ')}` : 'No model';
+      renderCredit(glb ? s.asset_attribution : null);
+    }
     $('refetchActiveBtn').disabled = !name;
-    renderCredit(glb ? s.asset_attribution : null);
     renderCad(s, name, glb);
     renderSignals(s);
     const poseTxt = pose && pose.valid ? `yaw ${Math.round(pose.yaw)}° · pitch ${Math.round(pose.pitch)}°${pose.source ? ' · ' + pose.source : ''}` : null;
@@ -825,8 +872,8 @@
 
   function renderOrient(s, glb) {
     const bar = $('orientBar');
-    bar.style.display = glb ? '' : 'none';
-    if (!glb) return;
+    bar.style.display = glb && !preview ? '' : 'none';
+    if (!glb || preview) return;
     const o = s.asset_orientation;
     bar.querySelectorAll('button').forEach((b) => { b.disabled = orientBusy; });
     const pill = $('orientPill');
@@ -844,8 +891,8 @@
       renderSources(m);
     }
     const nf = !!name && (s.asset_status === 'not_found' || s.asset_status === 'offline_missing');
-    $('emptyStage').classList.toggle('show', !name);
-    $('notFound').classList.toggle('show', nf);
+    $('emptyStage').classList.toggle('show', !name && !preview);
+    $('notFound').classList.toggle('show', nf && !preview);
     $('estBadge').classList.toggle('show', !!glb && !!s.asset_badge);
     $('browseBtn').disabled = !name || offline;
     $('nfOnline').style.display = offline ? '' : 'none';
@@ -906,12 +953,26 @@
     const known = li && li.mean_luma != null;
     lp.textContent = !known ? 'light: —' : li.ok ? `light: ok · ${Math.round(li.mean_luma)}` : `light: ${li.issue.replace('_', ' ')}`;
     lp.className = 'pill' + (!known ? '' : li.ok ? ' on' : ' bad');
+    if (known) {
+      const fill = $('lumaFill');
+      fill.style.width = Math.min(100, li.mean_luma / 2.55).toFixed(1) + '%';
+      fill.style.background = li.ok ? 'var(--green)' : 'var(--amber)';
+      $('lumaTxt').textContent = `luma ${Math.round(li.mean_luma)} / 255 (min 42) · glare ${(li.glare_fraction * 100).toFixed(1)} % (max 18 %)${li.ok ? '' : ' · ' + li.message}`;
+    }
     const box = $('ocrChips');
-    const o = s.ocr;
-    const sig = JSON.stringify(o ? [o.texts, o.corrections, o.applied, o.s_vision, o.s_text, o.s_color, o.fused, o.color, o.label] : null);
+    const o = s.ocr, rt = s.route || {};
+    const sig = JSON.stringify([o ? [o.texts, o.corrections, o.applied, o.s_vision, o.s_text, o.s_color, o.fused, o.color, o.label] : null, rt.lexicon, rt.dinov2]);
     if (box.dataset.sig === sig) return;
     box.dataset.sig = sig;
     box.replaceChildren();
+    if (rt.lexicon) {
+      chip(box, `OCR lexicon ✓ ${rt.lexicon.label.replace(/_/g, ' ')} · ${rt.lexicon.hits.join(' ')} · ${Math.round(rt.lexicon.confidence * 100)}%`, 'hit',
+        `Rolling 5-pass OCR buffer matched this can's keyword lexicon (discriminative: ${rt.lexicon.discriminative.join(', ')})`);
+    }
+    if (rt.dinov2) {
+      const [lab, c] = Object.entries(rt.dinov2)[0];
+      chip(box, `DINOv2 · ${lab.replace(/_/g, ' ')} ${Math.round(c * 100)}%`, '', 'Smartphone branch: view-centric DINOv2 (NPU) identity, ensembled with MobileNetV3');
+    }
     if (!o) return;
     const f2 = (x) => (x == null ? '—' : Number(x).toFixed(2));
     if (o.fused != null) {
@@ -1092,6 +1153,128 @@
   ['dragleave', 'drop'].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
   drop.addEventListener('drop', (e) => uploadGlb(e.dataTransfer.files[0]));
 
+  // ---- local model library + per-class cache browser --------------------------------------------------------
+  let libSig = '';
+  function startPreview(title, url, attr) {
+    preview = { title, url, attr };
+    viewer.setAttribute('src', url); lastSrc = '';
+    $('previewBar').classList.add('show'); viewer.closest('.vstage').classList.add('previewing');
+    $('previewPill').textContent = 'library preview'; $('previewPill').title = title;
+    $('viewerLabel').textContent = title + ' · recalled from local storage';
+    $('emptyStage').classList.remove('show'); $('notFound').classList.remove('show');
+    renderCredit(attr);
+  }
+  function stopPreview() {
+    preview = null; lastSrc = '';
+    $('previewBar').classList.remove('show'); viewer.closest('.vstage').classList.remove('previewing');
+    if (state) render(state);
+  }
+  $('previewExit').onclick = stopPreview;
+
+  function actBtn(text, cls, title, fn) {
+    const b = document.createElement('button'); b.type = 'button'; b.className = cls; b.textContent = text; b.title = title; b.onclick = fn; return b;
+  }
+  async function trash(url, what, extra) {
+    if (!confirm(`Delete ${what} from this device?${extra || ''}\n\nThis cannot be undone.`)) return;
+    try {
+      const r = await fetch(url, { method: 'DELETE' });
+      const j = await r.json().catch(() => ({}));
+      $('libMsg').textContent = j.ok ? `Deleted ${what}` + ((j.cad_deleted || []).length ? ` (and its copies in ${j.cad_deleted.join(', ')})` : '') + '.'
+        : (j.error || `Delete failed (HTTP ${r.status}).`);
+    } catch (e) { $('libMsg').textContent = 'Receiver unreachable.'; }
+    if (preview) stopPreview();
+    loadModels(true); pullState();
+  }
+  async function attachLib(e) {
+    const id = activeName();
+    if (!id) { $('libMsg').textContent = 'Identify or select an enrolled class first (the class on the 3D stage).'; return; }
+    const r = await fetch(`/api/models/library/${encodeURIComponent(e.id)}/attach`, { method: 'POST', body: JSON.stringify({ label: id }) });
+    const j = await r.json().catch(() => ({}));
+    $('libMsg').textContent = j.ok ? `${e.title} is now the 3D model for ${id}.` : (j.error || `Attach failed (HTTP ${r.status}).`);
+    if (preview) stopPreview();
+    loadModels(true); pullState();
+  }
+  function renderModels(j) {
+    const sig = JSON.stringify([j.library.map((e) => [e.id, e.glb_url, e.linked_classes]), j.cache.map((c) => [c.class_id, c.glb_url, c.enrolled]), activeName()]);
+    if (sig === libSig) return;
+    libSig = sig;
+    $('libCount').textContent = `${j.library.length} model${j.library.length === 1 ? '' : 's'}`;
+    const lib = $('libRows'); lib.replaceChildren();
+    const empty = (body, n, text) => { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = n; td.className = 'mute'; td.textContent = text; tr.appendChild(td); body.appendChild(tr); };
+    if (!j.library.length) empty(lib, 5, 'No local models yet. Add a hand scan (.glb) above or drop one on the 3D stage.');
+    j.library.forEach((e) => {
+      const tr = document.createElement('tr');
+      const cell = (text, title) => { const td = document.createElement('td'); td.textContent = text; if (title) td.title = title; tr.appendChild(td); return td; };
+      cell(e.title, e.credit);
+      const k = e.match_key;
+      cell(k ? `${k.brand} · ${k.variant}` : 'manual only', k ? `auto-binds to ${k.category.replace('_', ' ')} classes with brand "${k.brand}" and ${k.category === 'smartphone' ? 'model' : 'flavour'} "${k.variant}"` : 'Name too vague to auto-bind; use "Use for active"');
+      cell(`${e.size_mb} MB · ${((e.quality || {}).vertices || 0).toLocaleString()} v`);
+      cell((e.linked_classes || []).join(', ') || '—');
+      const acts = document.createElement('td'); acts.className = 'acts';
+      acts.append(actBtn('View', 'ghost', 'Recall this model on the 3D stage', () => startPreview(e.title, e.glb_url, e)),
+        actBtn('Use for active', 'ghost', 'Make this the 3D model of the class on stage', () => attachLib(e)),
+        actBtn('\u{1F5D1}', 'trash', 'Delete this library model', () => trash(`/api/models/library/${encodeURIComponent(e.id)}`, `library model "${e.title}"`,
+          (e.linked_classes || []).length ? `\nIts copies used by ${e.linked_classes.join(', ')} are removed too.` : '')));
+      tr.appendChild(acts); lib.appendChild(tr);
+    });
+    const cache = $('cacheRows'); cache.replaceChildren();
+    if (!j.cache.length) empty(cache, 4, 'No cached per-class models.');
+    j.cache.forEach((c) => {
+      const tr = document.createElement('tr');
+      const cell = (text, title) => { const td = document.createElement('td'); td.textContent = text; if (title) td.title = title; tr.appendChild(td); return td; };
+      cell(c.title, c.credit);
+      cell(c.source || c.source_key || '—');
+      cell(c.class_id + (c.enrolled ? '' : ' (not enrolled)'));
+      const acts = document.createElement('td'); acts.className = 'acts';
+      acts.append(actBtn('View', 'ghost', 'Recall this model on the 3D stage', () => startPreview(c.title, c.glb_url, c)),
+        actBtn('\u{1F5D1}', 'trash', 'Delete this cached model', () => trash(`/api/models/cache/${encodeURIComponent(c.class_id)}`, `the cached model of ${c.class_id}`,
+          c.enrolled ? '\nThe class stays enrolled; its model is re-resolved (library first, then online) next time it is shown.' : '')));
+      tr.appendChild(acts); cache.appendChild(tr);
+    });
+  }
+  let modelsAt = 0;
+  async function loadModels(force) {
+    if (!force && Date.now() - modelsAt < 4000) return;
+    modelsAt = Date.now();
+    try { renderModels(await (await fetch('/api/models', { cache: 'no-store' })).json()); } catch (e) {}
+  }
+  async function addLibrary(file, name) {
+    if (!file) return;
+    if (!/\.glb$/i.test(file.name)) { $('libMsg').textContent = 'Only binary glTF (.glb) files are accepted.'; return; }
+    name = (name || '').trim() || file.name.replace(/\.glb$/i, '').replace(/[_-]+/g, ' ');
+    $('libMsg').textContent = `Adding ${file.name} as "${name}" (${(file.size / 1048576).toFixed(1)} MB): quality gate + auto-orient…`;
+    const go = async (replace) => {
+      const r = await fetch(`/api/models/library?name=${encodeURIComponent(name)}&filename=${encodeURIComponent(file.name)}${replace ? '&replace=1' : ''}`,
+        { method: 'POST', headers: { 'Content-Type': 'model/gltf-binary', 'X-Filename': file.name }, body: file });
+      return [r, await r.json().catch(() => ({}))];
+    };
+    try {
+      let [r, j] = await go(false);
+      if (r.status === 409 && j.exists && confirm(`${j.error}.\nReplace it with ${file.name}?`)) [r, j] = await go(true);
+      $('libMsg').textContent = j.ok ? `Added "${j.entry.title}" to the local library` + (j.entry.match_key ? ` (auto-binds to ${j.entry.match_key.brand} ${j.entry.match_key.variant})` : ' (manual use only)')
+        + ((j.retried_classes || []).length ? `; re-resolving ${j.retried_classes.join(', ')}.` : '.') : (j.error || `Add failed (HTTP ${r.status}).`);
+    } catch (e) { $('libMsg').textContent = 'Upload failed: receiver unreachable.'; }
+    $('libFile').value = '';
+    loadModels(true); pullState();
+  }
+  $('libFile').onchange = () => addLibrary($('libFile').files[0], $('libName').value);
+  const vstage = document.querySelector('.vstage');
+  ['dragenter', 'dragover'].forEach((ev) => vstage.addEventListener(ev, (e) => {
+    if (!e.dataTransfer || ![...e.dataTransfer.types].includes('Files')) return;
+    e.preventDefault();
+    const id = activeName();
+    vstage.dataset.drop = id && !(state && state.asset_status === 'ready') ? `Drop to install as the 3D model of ${id}` : 'Drop to add to the local model library';
+    vstage.classList.add('dragging');
+  }));
+  ['dragleave', 'drop'].forEach((ev) => vstage.addEventListener(ev, (e) => { if (ev === 'drop' || !vstage.contains(e.relatedTarget)) vstage.classList.remove('dragging'); }));
+  vstage.addEventListener('drop', (e) => {
+    if (e.target.closest && e.target.closest('#drop')) return;  // the NOT FOUND drop box handles its own drops
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    const id = activeName();
+    if (id && !(state && state.asset_status === 'ready')) uploadGlb(file); else addLibrary(file, $('libName').value);
+  });
+
   async function pullState() {
     try { render(await (await fetch('/api/state', { cache: 'no-store' })).json()); }
     catch (e) { $('conn').textContent = 'receiver unreachable'; }
@@ -1175,6 +1358,8 @@
   requestAnimationFrame(tick);
   connectEvents();
   setInterval(() => { if (Date.now() - lastTel > 3000) pollTelemetry(); }, 1000);
+  setInterval(() => loadModels(false), 5000);
+  loadModels(true);
   pollTelemetry();
   streamFeed();
   pullState();

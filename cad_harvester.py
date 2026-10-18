@@ -181,6 +181,17 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+write_json = _write_json
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 def attribution_line(attr: dict) -> str:
     """One-line human credit: '"Coke Zero" by <author> (<url>) - licensed under CC Attribution (<url>) - via Sketchfab (<url>)'."""
     changed = " - modified: re-oriented by Kamikaze" if (
@@ -681,7 +692,8 @@ def _search_polypizza(product, queries: list[str], level: str, deadline: float) 
     return list(best.values())
 
 
-SOURCE_NAMES = {"sketchfab": "Sketchfab", "polypizza": "Poly Pizza", "local": "Local Cache", "upload": "Custom Scan Upload"}
+SOURCE_NAMES = {"sketchfab": "Sketchfab", "polypizza": "Poly Pizza", "local": "Local Cache", "upload": "Custom Scan Upload",
+                "library": "Local Library"}
 
 
 def _fetch(cand: Candidate, slug: str) -> bool:
@@ -887,6 +899,14 @@ def _finish(product, cand: Candidate, source_name: str, status: str, extra: dict
     return _result(product, attr, status, cand.provider, False, cand.extra.get("query", ""))
 
 
+def _library_match(product) -> dict | None:
+    try:
+        return model_library.find(product)
+    except (OSError, ValueError) as exc:
+        log.warning("local library lookup failed for %s: %s", product.class_id, exc)
+        return None
+
+
 def harvest(product, force: bool = False, offline: bool = False, budget_s: float | None = None,
             source: str = "auto") -> dict:
     """Resolve + cache a GLB for `product` (CanonicalProduct | metadata dict | free text) and write its attribution.
@@ -911,6 +931,11 @@ def harvest(product, force: bool = False, offline: bool = False, budget_s: float
                 dest.unlink()  # a GLB without attribution cannot be shown - re-harvest it
             except OSError:
                 pass
+        if (source or "auto").lower() not in PROVIDERS:  # an explicit Sketchfab / Poly Pizza pick skips the library
+            lib = _library_match(product)
+            if lib is not None:
+                attr = model_library.install(lib["id"], product.class_id)
+                return _result(product, attr, "cached", "library", True)
         if offline:
             return not_found(product.class_id, product.canonical_name,
                              "offline mode: no local 3D model is cached for this class", "offline_missing")
@@ -1012,6 +1037,15 @@ def upload_glb(class_id: str, data: bytes, filename: str = "", title: str = "", 
     return _result(product, attr, "cached", "upload", True)
 
 
+def use_library(class_id: str, entry_id: str) -> dict:
+    """Explicit operator choice: make library model `entry_id` the CAD of `class_id` (replaces any cached model)."""
+    with _lock_for(_slug(class_id)):
+        delete_cached(class_id)
+        attr = model_library.install(entry_id, class_id)
+    product = SimpleNamespace(class_id=class_id, canonical_name=attr.get("title") or class_id)
+    return _result(product, attr, "cached", "library", True)
+
+
 def generate_from_specs(product, profile: str | None = None) -> dict:
     """Build a dimension-calibrated GLB from verified published specs (explicit user action only)."""
     product = _coerce(product)
@@ -1065,3 +1099,6 @@ def product_for(label: str, meta: dict | None = None) -> entity_resolver.Canonic
     """CanonicalProduct for a bank label (raises taxonomy.MetadataError when it cannot be parsed)."""
     product = entity_resolver.resolve_metadata(meta) if meta else entity_resolver.resolve(label.replace("_", " "))
     return _with_class_id(product, label)
+
+
+import model_library  # noqa: E402  (circular: model_library needs every definition above)
