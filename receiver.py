@@ -17,6 +17,8 @@ One process, one port (0.0.0.0:5000):
   GET  /api/classes                  enrolled classes: metadata, view count, created_at, CAD status/credit
   DELETE /api/classes/<id>[?delete_cad=0]   remove one class + its cached GLB/attribution (keep the GLB with delete_cad=0)
   POST /api/classes/reset            {"delete_cad": true} drop every enrolled class (and their cached GLBs)
+  POST /api/classes/purge            {"delete_cad": true} hard reset: drop every class AND delete enrolled_classes.pt
+  POST /api/classes/<id>/fetch_cad   202: re-harvest that class's CAD model in the background and show it in the viewer
   POST /api/resolve                  {"text": "coke zero can 330ml"} -> canonical product (class_id, brand, tier, CAD terms)
   GET  /api/telemetry                SoC identity, thermals, per-core freq/load, RAM, uptime, router IPC, bridge latency,
                                      Wire1/Modulino status, NPU (cDSP/NSP), detector + embedder median/p95, cosine/margin, FPS
@@ -45,7 +47,8 @@ Router socket (STM32 firmware untouched), background 3D CAD retrieval and physic
 
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
 KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE, KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
-KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_T_IDENT/T_SEARCH/MARGIN,
+KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_CAL_FLOOR / C_IDENT / C_SEARCH / MARGIN
+(calibrated confidence), KAMIKAZE_SCENE_GATE (1|0) / LAPLACIAN_MIN / EDGE_MIN (empty-reticle gate), KAMIKAZE_PHONE_MARGIN,
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s),
 KAMIKAZE_STALE_S, KAMIKAZE_STREAM_FPS, KAMIKAZE_ASSET_CACHE_MB (RAM cache for GLBs/JS), KAMIKAZE_RING_GB (default 0).
 
@@ -88,7 +91,13 @@ try:
 except ImportError:  # the state machine / HTTP layer stay importable without torch (e.g. on a laptop)
     torch = None
 
+try:
+    import cv2
+except ImportError:  # numpy fallback for the empty-scene gate
+    cv2 = None
+
 import cad_harvester
+import device_taxonomy
 import entity_resolver
 import npu as npu_mod
 import pose as pose_mod
@@ -125,13 +134,23 @@ EMBEDDER_ID = "mobilenet_v3_large-fc1280"  # torchvision weights (ExecuTorch / e
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-T_IDENT = float(os.environ.get("KAMIKAZE_T_IDENT", "0.75"))
-T_SEARCH = float(os.environ.get("KAMIKAZE_T_SEARCH", "0.40"))
-MIN_MARGIN = float(os.environ.get("KAMIKAZE_MARGIN", "0.12"))
+# Calibrated confidence: C = 0 for raw cosine <= CAL_FLOOR, else (S - CAL_FLOOR) / (1 - CAL_FLOOR). High-dimensional
+# embeddings sit at a 0.35-0.50 cosine baseline for arbitrary scenes, so raw cosine is not a usable confidence.
+CAL_FLOOR = float(os.environ.get("KAMIKAZE_CAL_FLOOR", "0.52"))
+C_IDENT = float(os.environ.get("KAMIKAZE_C_IDENT", "0.70"))
+C_SEARCH = float(os.environ.get("KAMIKAZE_C_SEARCH", "0.25"))
+MIN_MARGIN = float(os.environ.get("KAMIKAZE_MARGIN", "0.15"))  # calibrated top-1 minus top-2
+T_IDENT = CAL_FLOOR + C_IDENT * (1.0 - CAL_FLOOR)  # raw cosine equivalents (0.856 / 0.640)
+T_SEARCH = CAL_FLOOR + C_SEARCH * (1.0 - CAL_FLOOR)
 WINDOW = 5
 IDENT_FRAMES = 3
-GUIDE_FRAMES = 4
+GUIDE_FRAMES = 3
 SEARCH_FRAMES = 3
+# Empty-scene gate on the 60% center crop (resampled to SALIENCY_SIZE px so thresholds do not depend on resolution)
+SCENE_GATE = os.environ.get("KAMIKAZE_SCENE_GATE", "1") != "0"
+LAPLACIAN_MIN = float(os.environ.get("KAMIKAZE_LAPLACIAN_MIN", "18"))
+EDGE_MIN = float(os.environ.get("KAMIKAZE_EDGE_MIN", "0.002"))
+SALIENCY_SIZE = 256
 ENROLL_FRAMES = 12
 ENROLL_STALE_S = 15.0
 
@@ -147,9 +166,11 @@ MSG_GUIDE_CAN = "Rotate can 90° slowly to align the front branding with the cam
 MSG_GUIDE_PHONE = "Flip phone over to reveal the rear camera island and lenses."
 MSG_GUIDE_GENERAL = "Center the item within the reticle and adjust distance for optimal lighting."
 MSG_GUIDE_BOTTLE = "Rotate bottle slowly to show the front label to the camera."
+MSG_EMPTY = "Awaiting object inside center reticle..."
 MSG_PHONE_FLIP = taxonomy.MSG_PHONE_FLIP
 MSG_PHONE_TILT = taxonomy.MSG_PHONE_TILT
-PHONE_AMBIG_MARGIN = float(os.environ.get("KAMIKAZE_PHONE_MARGIN", "0.20"))
+MSG_VERIFY = device_taxonomy.MSG_VERIFY_GEOMETRY
+PHONE_AMBIG_MARGIN = float(os.environ.get("KAMIKAZE_PHONE_MARGIN", "0.15"))  # calibrated
 FRAMES_PER_VIEW = 10
 MIN_VIEW_FRAMES = 4
 MV_IDLE_EXPIRE_S = 900.0
@@ -182,6 +203,34 @@ def preprocess(image: Image.Image, box: tuple[int, int, int] | None = None) -> n
     crop = image.crop((left, top, left + size, top + size)).resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
     arr = (np.asarray(crop, dtype=np.float32) * (1.0 / 255.0) - IMAGENET_MEAN) / IMAGENET_STD
     return np.ascontiguousarray(arr.transpose(2, 0, 1)[None])
+
+
+def calibrate(sim: float) -> float:
+    """Raw cosine -> calibrated confidence in [0, 1] (0 at or below CAL_FLOOR)."""
+    if sim <= CAL_FLOOR:
+        return 0.0
+    return min(1.0, (sim - CAL_FLOOR) / (1.0 - CAL_FLOOR))
+
+
+def scene_saliency(image: Image.Image) -> dict:
+    """Laplacian variance + Canny edge density of the 60% center crop. empty=True for blank walls, bare desks, a
+    covered lens or a dark room, so the detector and embedder never score background noise."""
+    size, left, top = center_crop_box(*image.size)
+    crop = image.crop((left, top, left + size, top + size)).convert("L")
+    if size != SALIENCY_SIZE:
+        crop = crop.resize((SALIENCY_SIZE, SALIENCY_SIZE), Image.BILINEAR)
+    gray = np.asarray(crop, dtype=np.uint8)
+    if cv2 is not None:
+        lap = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        edges = float(np.count_nonzero(cv2.Canny(gray, 50, 150))) / gray.size
+    else:
+        g = gray.astype(np.float64)
+        lap = float((g[1:-1, :-2] + g[1:-1, 2:] + g[:-2, 1:-1] + g[2:, 1:-1] - 4.0 * g[1:-1, 1:-1]).var())
+        gx = g[1:-1, 2:] - g[1:-1, :-2]
+        gy = g[2:, 1:-1] - g[:-2, 1:-1]
+        edges = float(np.count_nonzero(np.hypot(gx, gy) > 100.0)) / gray.size
+    return {"laplacian_var": round(lap, 2), "edge_density": round(edges, 5),
+            "empty": lap < LAPLACIAN_MIN or edges < EDGE_MIN}
 
 
 def build_eager_model():
@@ -334,19 +383,23 @@ class EmbeddingBank:
         self.cad: dict[str, dict | None] = {}
         self.created: dict[str, str] = {}
         self._rows: list[str] = []
+        self._row_views: list[str | None] = []
         self._labels: list[str] = []
         self._matrix = None
 
     def _rebuild(self) -> None:
         self._labels = list(self.centroids)
-        rows, vecs = [], []
+        rows, row_views, vecs = [], [], []
         for label in self._labels:
             rows.append(label)
+            row_views.append(None)
             vecs.append(self.centroids[label])
-            for view_vec in self.views.get(label, {}).values():
+            for view_name, view_vec in self.views.get(label, {}).items():
                 rows.append(label)
+                row_views.append(view_name)
                 vecs.append(view_vec)
         self._rows = rows
+        self._row_views = row_views
         self._matrix = torch.stack(vecs) if vecs else None
 
     def labels(self) -> list[str]:
@@ -428,17 +481,52 @@ class EmbeddingBank:
             self.save()
             return n
 
-    def scores(self, vec) -> list[tuple[str, float]]:
-        """Best cosine similarity per label over its global + view centroids, best first."""
+    def purge(self) -> int:
+        """Drop every enrolled class and delete the database file (plus old-embedder backups) from disk."""
+        with self._lock:
+            n = len(self.centroids)
+            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.meta, self.cad, self.created):
+                table.clear()
+            self._rebuild()
+            if self.path is not None:
+                victims = [self.path, self.path.with_suffix(".tmp"),
+                           *self.path.parent.glob(f"{self.path.stem}.*.bak{self.path.suffix}")]
+                for victim in victims:
+                    try:
+                        victim.unlink()
+                    except FileNotFoundError:
+                        pass
+            return n
+
+    def rank(self, vec, domain: tuple[str, ...] | None = None) -> list[tuple[str, float, str | None]]:
+        """(label, score, matched view) best first. Smartphone classes with view centroids use rear-weighted view
+        reliability (device_taxonomy); other classes take the best cosine over their global + view centroids.
+        `domain` restricts the search to those categories (classes without a category always stay eligible)."""
         with self._lock:
             if self._matrix is None:
                 return []
             sims = (self._matrix @ vec).tolist()
-            best: dict[str, float] = {}
-            for label, sim in zip(self._rows, sims):
-                if sim > best.get(label, -2.0):
-                    best[label] = sim
-            return sorted(best.items(), key=lambda kv: -kv[1])
+            per: dict[str, dict] = {}
+            for label, view, sim in zip(self._rows, self._row_views, sims):
+                per.setdefault(label, {})["global" if view is None else view] = sim
+            out = []
+            for label, table in per.items():
+                category = (self.meta.get(label) or {}).get("category")
+                if domain and category and category not in domain:
+                    continue
+                views = {k: v for k, v in table.items() if k != "global"}
+                if category == "smartphone" and views:
+                    score, view = device_taxonomy.weighted_phone_score(views)
+                else:
+                    view = max(table, key=table.get)
+                    score = table[view]
+                    view = None if view == "global" else view
+                out.append((label, score, view))
+            return sorted(out, key=lambda item: -item[1])
+
+    def scores(self, vec, domain: tuple[str, ...] | None = None) -> list[tuple[str, float]]:
+        """Per-label match score (see rank), best first."""
+        return [(label, score) for label, score, _ in self.rank(vec, domain)]
 
     def view_sims(self, label: str, vec) -> dict[str, float]:
         with self._lock:
@@ -467,10 +555,16 @@ class EmbeddingBank:
         meta = dict(self.meta.get(k) or {})
         cad = self.cad.get(k)
         counts = dict(self.view_counts.get(k, {}))
+        glb = cad_harvester.glb_path(k)
+        try:
+            cad_path = str(glb.relative_to(BASE_DIR)).replace("\\", "/") if glb.is_file() else None
+        except ValueError:
+            cad_path = str(glb)
         return {
             "label": k, "class_id": k, "canonical_name": taxonomy.display_name(meta) if meta else k.replace("_", " ").title(),
             "vectors": len(self.exemplars.get(k, [])), "views": counts, "view_count": len(counts),
             "metadata": meta, "category": meta.get("category"), "created_at": self.created.get(k),
+            "phone_tier": device_taxonomy.tier_for(meta), "cad_path": cad_path,
             "cad_asset": cad, "cad_model_url": (cad or {}).get("glb_url") or None,
             "cad_status": "ready" if cad and cad.get("glb_url") else "missing",
             "cad_source": (cad or {}).get("source"), "cad_credit": (cad or {}).get("credit"),
@@ -564,6 +658,10 @@ class Enroller:
         self._last_activity = 0.0
         self._result: dict | None = None
         self._error: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._active
 
     def start(self, label: str, frames: int = ENROLL_FRAMES, append: bool = False) -> dict:
         with self._lock:
@@ -794,34 +892,57 @@ class MultiViewEnroller:
 @dataclass
 class FrameScore:
     label: str | None
-    s1: float
-    s2: float = 0.0
+    s1: float  # raw cosine of the best class
+    s2: float = 0.0  # raw cosine of the runner-up
     top2: str | None = None
-    hint: str | None = None  # "flip" | "tilt": the match is ambiguous and needs another look at the phone
+    hint: str | None = None  # "flip" | "tilt" | "verify": the match needs another look before it can be trusted
+    cap: float | None = None  # calibrated-confidence ceiling (front-screen penalty)
+    prompt: str | None = None  # model-specific guidance text for the hint
+    empty: bool = False  # the empty-scene gate fired: nothing inside the reticle
+
+    @property
+    def c1(self) -> float:
+        if self.empty or self.label is None:
+            return 0.0
+        c = calibrate(self.s1)
+        return min(c, self.cap) if self.cap is not None else c
+
+    @property
+    def c2(self) -> float:
+        return calibrate(self.s2) if self.top2 else 0.0
 
     @property
     def margin(self) -> float:
-        return self.s1 - self.s2
+        """Calibrated top-1 minus top-2 (0 when there is no candidate)."""
+        if self.empty or self.label is None:
+            return 0.0
+        return max(0.0, calibrate(self.s1) - self.c2)
 
 
 class StateMachine:
-    """5-frame sliding window with hysteresis between SEARCHING / GUIDING / IDENTIFIED."""
+    """5-frame sliding window over calibrated confidence with hysteresis between SEARCHING / GUIDING / IDENTIFIED."""
 
     def __init__(self) -> None:
         self.window: collections.deque = collections.deque(maxlen=WINDOW)
         self.state = SEARCHING
         self.label: str | None = None
         self.hint: str | None = None
+        self.prompt: str | None = None
+        self.empty = False
 
     def reset(self) -> None:
         self.window.clear()
-        self.state, self.label, self.hint = SEARCHING, None, None
+        self.state, self.label, self.hint, self.prompt, self.empty = SEARCHING, None, None, None, False
 
     @staticmethod
     def frame_kind(frame: FrameScore) -> str:
-        if frame.label is None or frame.s1 < T_SEARCH:
+        if frame.empty or (frame.label is None and not frame.hint):
             return "search"
-        if frame.s1 >= T_IDENT and frame.margin >= MIN_MARGIN and not frame.hint:
+        if frame.hint:
+            return "guide"
+        if frame.c1 < C_SEARCH:
+            return "search"
+        if frame.c1 >= C_IDENT and frame.margin >= MIN_MARGIN:
             return "ident"
         return "guide"
 
@@ -835,8 +956,8 @@ class StateMachine:
 
     def update(self, frame: FrameScore) -> dict:
         kind = self.frame_kind(frame)
-        self.hint = frame.hint
-        self.window.append((kind, frame.label, frame.s1, frame.margin))
+        self.hint, self.prompt, self.empty = frame.hint, frame.prompt, frame.empty
+        self.window.append((kind, frame.label, frame.c1, frame.margin))
         if kind == "ident" and self._streak(lambda w: w[0] == "ident" and w[1] == frame.label) >= IDENT_FRAMES:
             self.state, self.label = IDENTIFIED, frame.label
         elif kind == "guide" and self._streak(lambda w: w[0] == "guide") >= GUIDE_FRAMES:
@@ -846,25 +967,39 @@ class StateMachine:
         elif self.state == GUIDING and kind != "search":
             self.label = frame.label
 
+        if self.state == SEARCHING and kind == "search":
+            return {"state": self.state, "label": None, "score": 0.0 if frame.empty else frame.c1,
+                    "margin": 0.0 if frame.empty else frame.margin}
         subject = self.label if self.state != SEARCHING else frame.label
-        picks = [w for w in self.window if w[1] == subject] or [self.window[-1]]
+        # Average the current run only, so frames from a previous pose (e.g. a capped front view) don't drag the score.
+        picks = []
+        for w in reversed(self.window):
+            if w[1] != subject or w[0] != kind:
+                break
+            picks.append(w)
+        picks = picks or [w for w in self.window if w[1] == subject] or [self.window[-1]]
+        score = sum(w[2] for w in picks) / len(picks)
+        if frame.cap is not None:
+            score = min(score, frame.cap)
         return {
             "state": self.state,
             "label": self.label,
-            "score": sum(w[2] for w in picks) / len(picks),
+            "score": score,
             "margin": sum(w[3] for w in picks) / len(picks),
         }
 
 
 def guidance_message(state: str, label: str | None, score: float, hint: str | None = None,
-                     category: str | None = None) -> str:
+                     category: str | None = None, prompt: str | None = None, empty: bool = False) -> str:
     if state == IDENTIFIED:
         return f"Object Verified: {label} ({max(0, round(score * 100))}%)"
     if state == GUIDING:
-        if hint == "tilt":
-            return MSG_PHONE_TILT
+        if hint == "verify":
+            return MSG_VERIFY
         if hint == "flip":
             return MSG_PHONE_FLIP
+        if hint == "tilt":
+            return prompt or MSG_PHONE_TILT
         if category == "smartphone":
             return MSG_GUIDE_PHONE
         if category == "beverage_can":
@@ -877,14 +1012,19 @@ def guidance_message(state: str, label: str | None, score: float, hint: str | No
         if any(k in name for k in ("s25", "phone", "galaxy", "iphone", "pixel")):
             return MSG_GUIDE_PHONE
         return MSG_GUIDE_GENERAL
-    return MSG_SEARCHING
+    return MSG_EMPTY if empty else MSG_SEARCHING
 
 
-def phone_hint(category: str | None, best_view: str | None, margin: float) -> str | None:
-    """Smartphone matches that are too close to a sibling model need the rear island / lens count to be shown."""
-    if category != "smartphone" or margin >= PHONE_AMBIG_MARGIN:
+def phone_hint(category: str | None, best_view: str | None, margin: float, front: bool | None = None) -> str | None:
+    """Smartphones: the front screen is nearly identical across models -> "flip"; a rear match too close to a
+    sibling model (calibrated margin) -> "tilt" to expose the camera island / lens count."""
+    if category != "smartphone":
         return None
-    return "flip" if best_view in (None, "front") else "tilt"
+    if front if front is not None else best_view == "front":
+        return "flip"
+    if margin < PHONE_AMBIG_MARGIN:
+        return "tilt"
+    return None
 
 
 def led_params(state: str, score: float) -> tuple[int, int, int, int, int]:
@@ -1001,12 +1141,29 @@ class AssetManager:
         with self._lock:
             info = dict(self._info.get(label, {}))
             busy = label in self._inflight
-        if is_valid_glb(local_glb_path(slug)):
+        glb = local_glb_path(slug)
+        if is_valid_glb(glb):
             attr = cad_harvester.read_attribution(label) or {}
-            return {"glb_url": f"/static/models/{slug}.glb", "status": "ready", "title": attr.get("title") or info.get("title", label),
-                    "attribution": attr or None, "credit": cad_harvester.attribution_line(attr) if attr else ""}
+            try:
+                version = glb.stat().st_mtime_ns
+            except OSError:
+                version = 0
+            return {"glb_url": f"/static/models/{slug}.glb?v={version}", "status": "ready",
+                    "title": attr.get("title") or info.get("title", label), "attribution": attr or None,
+                    "credit": cad_harvester.attribution_line(attr) if attr else ""}
         return {"glb_url": DEFAULT_GLB_URL, "status": "resolving" if busy else "pending", "title": info.get("title", label),
                 "attribution": None, "credit": ""}
+
+    def refetch(self, label: str) -> bool:
+        """Force a fresh CAD harvest for `label` in the background (replaces static/models/<label>.glb).
+        Returns False when a harvest for that class is already running."""
+        with self._lock:
+            if label in self._inflight:
+                return False
+            self._inflight.add(label)
+            self._failed_at.pop(label, None)
+        threading.Thread(target=self._resolve, args=(label, True), name=f"refetch-{label}", daemon=True).start()
+        return True
 
     def get(self, label: str) -> dict:
         entry = self.peek(label)
@@ -1020,12 +1177,12 @@ class AssetManager:
         threading.Thread(target=self._resolve, args=(label,), name=f"asset-{label}", daemon=True).start()
         return {**entry, "status": "resolving"}
 
-    def _resolve(self, label: str) -> None:
+    def _resolve(self, label: str, force: bool = False) -> None:
         with self._lock:
             gen = self._gen.get(label, 0)
         try:
             meta = self.meta_lookup(label) if self.meta_lookup else None
-            result = cad_harvester.retrieve(label, meta)
+            result = cad_harvester.retrieve(label, meta, force=force)
             with self._lock:
                 if self._gen.get(label, 0) != gen:
                     log.info("Discarding CAD result for %s: the class was deleted while harvesting", label)
@@ -1363,7 +1520,7 @@ class Pipeline:
         self._ver_cv = threading.Condition()
         if hasattr(assets, "meta_lookup"):
             assets.meta_lookup = bank.metadata
-            assets.on_resolved = bank.set_cad
+            assets.on_resolved = self._cad_resolved
         self.sm = StateMachine()
         self._infer_lock = threading.Lock()
         self._frame_lock = threading.Lock()
@@ -1392,8 +1549,10 @@ class Pipeline:
         self._last_frame_mono = 0.0
         self._viewer_label: str | None = None
         self._last = {
-            "label": None, "similarity": 0.0, "confidence": 0.0, "margin": 0.0, "top2": None,
+            "label": None, "similarity": 0.0, "confidence": 0.0, "margin": 0.0, "top2": None, "frame_confidence": 0.0,
             "embed_ms": 0.0, "detect_ms": 0.0, "total_ms": 0.0, "state": SEARCHING, "guidance": MSG_SEARCHING,
+            "hint": None, "empty": False, "saliency": None, "domain": None, "conflict": False, "front_dominant": False,
+            "raw_top1": None,
         }
 
     @property
@@ -1509,6 +1668,10 @@ class Pipeline:
             self._ver_cv.wait_for(lambda: self._version != last, timeout)
             return self._version
 
+    def _cad_resolved(self, label: str, info: dict | None) -> None:
+        self.bank.set_cad(label, info)
+        self._bump()  # push the new GLB URL to the 3D viewer even when no frames are streaming
+
     def _mv_complete(self, label: str) -> None:
         self.sm.reset()
         self.pose_est.reset()
@@ -1529,29 +1692,35 @@ class Pipeline:
         del data
         self.ring.push(image)
         with self._infer_lock:
-            box, detect_ms = self._locate(image)
-            arr = preprocess(image, box)
-            t1 = time.perf_counter()
-            vec = self.extractor.embed_array(arr)
-            t2 = time.perf_counter()
-            if self.enroller.feed(vec):
-                self.sm.reset()
+            enrolling = self.mv.capturing or self.enroller.active
+            saliency = scene_saliency(image) if SCENE_GATE else {"laplacian_var": None, "edge_density": None, "empty": False}
+            empty = bool(saliency["empty"]) and not enrolling
             capturing = self.mv.capturing
-            mv_event = self.mv.feed(vec)
-            if mv_event == "complete":
-                capturing = False
-            ranked = self.bank.scores(vec)
-            top1 = ranked[0] if ranked else (None, 0.0)
-            top2 = ranked[1] if len(ranked) > 1 else (None, 0.0)
-            category = self.bank.category(top1[0])
-            views = self.bank.view_sims(top1[0], vec) if top1[0] else {}
-            best_view = max(views, key=views.get) if views else None
-            hint = phone_hint(category, best_view, top1[1] - top2[1]) if top1[1] >= T_SEARCH else None
-            frame = FrameScore(top1[0], top1[1], top2[1], top2[0], hint)
+            if empty:
+                # Nothing inside the reticle: skip the detector + embedder entirely (no background noise scoring).
+                t1 = t2 = time.perf_counter()
+                box, detect_ms = None, 0.0
+                self.crop_tracker.reset()
+                self._detection = {"target": None, "objects": [], "crop": None, "crop_source": "center", "ms": 0.0,
+                                   "skipped": "empty_scene"}
+                frame, views, best_view, category = FrameScore(None, 0.0, empty=True), {}, None, None
+                arb = {"domain": None, "conflict": False, "front_dominant": False, "raw_top1": None}
+            else:
+                box, detect_ms = self._locate(image)
+                arr = preprocess(image, box)
+                t1 = time.perf_counter()
+                vec = self.extractor.embed_array(arr)
+                t2 = time.perf_counter()
+                if self.enroller.feed(vec):
+                    self.sm.reset()
+                if self.mv.feed(vec) == "complete":
+                    capturing = False
+                frame, views, best_view, category, arb = self._arbitrate(vec)
             prev = (self.sm.state, self.sm.label)
             snap = self.sm.update(frame)
             state, label, score = snap["state"], snap["label"], snap["score"]
-            message = guidance_message(state, label, score, hint if state == GUIDING else None, category)
+            hint = frame.hint if state == GUIDING else None
+            message = guidance_message(state, label, score, hint, category, frame.prompt, frame.empty)
             if self.mv.active:
                 mv = self.mv.status()
                 self.leds.set(capture_led_params(mv["collected"], mv["frames_per_view"]) if capturing else led_params(SEARCHING, 0.0))
@@ -1576,31 +1745,71 @@ class Pipeline:
                 self._fps = 0.0
             self._last_frame_mono = now
             total_ms = (time.perf_counter() - t0) * 1000.0
-            self._embed_lat.append((t2 - t1) * 1000.0)
+            if not empty:
+                self._embed_lat.append((t2 - t1) * 1000.0)
             self._total_lat.append(total_ms)
             with self._snap_lock:
                 self._last = {
                     "label": frame.label, "similarity": frame.s1, "confidence": score, "margin": snap["margin"],
-                    "top2": {"label": top2[0], "score": top2[1]} if top2[0] else None,
+                    "frame_confidence": frame.c1,
+                    "top2": {"label": frame.top2, "score": frame.s2, "confidence": frame.c2} if frame.top2 else None,
                     "embed_ms": (t2 - t1) * 1000.0, "detect_ms": detect_ms, "total_ms": total_ms, "state": state,
-                    "guidance": message,
+                    "guidance": message, "hint": hint, "empty": frame.empty, "saliency": saliency, **arb,
                 }
             frames_seen = self._frames
         if LOG_FRAMES:
             log.info(
-                "[Frame %05d] %s | %s s1=%.3f margin=%.3f | detect %.1fms embed %.1fms total %.1fms",
-                frames_seen, state, frame.label or "-", frame.s1, frame.margin,
-                detect_ms, (t2 - t1) * 1000, total_ms,
+                "[Frame %05d] %s | %s s1=%.3f C=%.2f margin=%.2f lap=%s edge=%s | detect %.1fms embed %.1fms total %.1fms",
+                frames_seen, state, frame.label or "-", frame.s1, frame.c1, frame.margin, saliency["laplacian_var"],
+                saliency["edge_density"], detect_ms, (t2 - t1) * 1000, total_ms,
             )
         if (state, label) != prev:
             self._announce(state, label, score, snap["margin"], message)
         self._bump()
         return {
             "ok": True, "state": state, "label": frame.label, "confidence": round(score, 3),
-            "similarity": round(frame.s1, 3), "margin": round(snap["margin"], 3),
+            "similarity": round(frame.s1, 3), "margin": round(snap["margin"], 3), "hint": hint, "empty": frame.empty,
             "embed_ms": round((t2 - t1) * 1000, 1), "detect_ms": round(detect_ms, 1), "latency_ms": round(total_ms, 1),
-            "detection": self._detection["target"],
+            "detection": self._detection["target"], "saliency": saliency, "domain": arb["domain"],
         }
+
+    def _arbitrate(self, vec) -> tuple[FrameScore, dict, str | None, str | None, dict]:
+        """Rank enrolled classes inside the detector's domain gate and attach phone / conflict guidance.
+        Returns (frame score, view sims of top-1, best view, top-1 category, diagnostics)."""
+        target = self._detection.get("target")
+        domain = device_taxonomy.domain_for(target)
+        ranked_all = self.bank.rank(vec)
+        ranked = self.bank.rank(vec, domain) if domain else ranked_all
+        info = {"domain": list(domain) if domain else None, "conflict": False, "front_dominant": False,
+                "raw_top1": {"label": ranked_all[0][0], "score": round(ranked_all[0][1], 4)} if ranked_all else None}
+        lead = ranked_all[0] if ranked_all else None
+        lead_cat = self.bank.category(lead[0]) if lead else None
+        conflict = bool(domain and lead and lead_cat and lead_cat not in domain and calibrate(lead[1]) >= C_SEARCH)
+        if not ranked:
+            info["conflict"] = conflict
+            return FrameScore(None, 0.0, hint="verify" if conflict else None), {}, None, None, info
+        label, s1, best_view = ranked[0]
+        top2, s2 = (ranked[1][0], ranked[1][1]) if len(ranked) > 1 else (None, 0.0)
+        category = self.bank.category(label)
+        views = self.bank.view_sims(label, vec)
+        if best_view is None and views:
+            best_view = max(views, key=views.get)
+        frame = FrameScore(label, s1, s2, top2)
+        if conflict:
+            info["conflict"] = True
+            frame.hint = "verify"
+        elif category == "smartphone":
+            front = device_taxonomy.front_dominates(views)
+            front_live = front and (frame.c1 >= C_SEARCH or domain == device_taxonomy.PHONE_DOMAIN
+                                    or calibrate(views.get("front", 0.0)) >= C_SEARCH)
+            info["front_dominant"] = bool(front_live)
+            if front_live:
+                frame.hint, frame.cap = "flip", device_taxonomy.FRONT_CONFIDENCE_CAP
+            elif frame.c1 >= C_SEARCH and top2 and self.bank.category(top2) == "smartphone" \
+                    and phone_hint(category, best_view, frame.margin, front=False) == "tilt":
+                frame.hint = "tilt"
+                frame.prompt = device_taxonomy.disambiguation_prompt(self.bank.metadata(label), self.bank.metadata(top2))
+        return frame, views, best_view, category, info
 
     def _locate(self, image: Image.Image) -> tuple[tuple[int, int, int] | None, float]:
         """NPU object detection -> smoothed square crop around the target inside the reticle (None = center crop)."""
@@ -1640,32 +1849,62 @@ class Pipeline:
         else:
             log.info("SEARCHING: %s", message)
 
+    def _clear_verdict(self) -> None:
+        self.sm.reset()
+        self.pose_est.reset()
+        with self._snap_lock:
+            self._last.update(label=None, similarity=0.0, confidence=0.0, margin=0.0, top2=None, frame_confidence=0.0,
+                              state=SEARCHING, guidance=MSG_SEARCHING, hint=None, conflict=False, front_dominant=False,
+                              raw_top1=None)
+        self.leds.set(led_params(SEARCHING, 0.0))
+
     def unenroll(self, label: str) -> bool:
         with self._infer_lock:
             removed = self.bank.remove(label)
             if removed:
-                self.sm.reset()
-                self.pose_est.reset()
                 if self._viewer_label == label:
                     self._viewer_label = None
-                with self._snap_lock:
-                    self._last.update(label=None, similarity=0.0, confidence=0.0, margin=0.0, top2=None,
-                                      state=SEARCHING, guidance=MSG_SEARCHING)
-                self.leds.set(led_params(SEARCHING, 0.0))
+                self._clear_verdict()
             return removed
 
     def reset_bank(self) -> int:
         with self._infer_lock:
             n = self.bank.reset()
-            self.sm.reset()
-            self.pose_est.reset()
             self._viewer_label = None
-            with self._snap_lock:
-                self._last.update(label=None, similarity=0.0, confidence=0.0, margin=0.0, top2=None,
-                                  state=SEARCHING, guidance=MSG_SEARCHING)
-            self.leds.set(led_params(SEARCHING, 0.0))
+            self._clear_verdict()
         self._bump()
         return n
+
+    def purge(self, delete_cad: bool = True) -> dict:
+        """Hard reset of the training database: every class, the .pt file on disk and (optionally) cached CAD."""
+        with self._infer_lock:
+            labels = list(self.bank.centroids)
+            self.enroller.cancel("database purged")
+            self.mv.cancel("database purged")
+            n = self.bank.purge()
+            self._viewer_label = None
+            self._clear_verdict()
+        cad_removed = 0
+        if delete_cad:
+            for label in labels:
+                if hasattr(self.assets, "forget") and self.assets.forget(label):
+                    cad_removed += 1
+        self._bump()
+        path = self.bank.path
+        log.warning("Training database purged: %d classes removed, %d CAD caches deleted, %s %s", n, cad_removed,
+                    path, "deleted" if path is None or not path.exists() else "STILL PRESENT")
+        return {"ok": True, "removed": n, "labels": labels, "cad_removed": cad_removed,
+                "db_file": str(path) if path else None, "db_file_exists": bool(path and path.exists())}
+
+    def refetch_cad(self, label: str) -> dict:
+        """Re-harvest the CAD model of an enrolled class in the background and point the 3D viewer at it."""
+        if label not in self.bank.centroids:
+            raise KeyError(label)
+        started = self.assets.refetch(label) if hasattr(self.assets, "refetch") else False
+        self._viewer_label = label
+        self._bump()
+        return {"ok": True, "label": label, "started": started, "status": "resolving" if started else "busy",
+                "asset": self.assets.peek(label)}
 
     def snapshot(self) -> dict:
         with self._snap_lock:
@@ -1683,6 +1922,7 @@ class Pipeline:
             "state": state,
             "label": last["label"],
             "confirmed_label": self.sm.label if state == IDENTIFIED else None,
+            "viewer_label": self._viewer_label,
             "confidence": round(last["confidence"], 3),
             "similarity": round(last["similarity"], 3),
             "margin": round(last["margin"], 3),
@@ -1710,13 +1950,25 @@ class Pipeline:
             "pose": self._pose,
             "category": self._category,
             "best_view": self._best_view,
-            "hint": "flip" if last["guidance"] == MSG_PHONE_FLIP else ("tilt" if last["guidance"] == MSG_PHONE_TILT else None),
+            "hint": last.get("hint"),
+            "empty_scene": last.get("empty", False),
+            "saliency": last.get("saliency"),
+            "frame_confidence": round(last.get("frame_confidence", 0.0), 3),
+            "domain": last.get("domain"),
+            "domain_conflict": last.get("conflict", False),
+            "front_dominant": last.get("front_dominant", False),
+            "raw_top1": last.get("raw_top1"),
             "crop_fraction": CROP_FRACTION,
             "system": self.stats.read(),
             "bank": self.bank.info(),
             "classes": self.bank.counts(),
             "backend": self.extractor.name,
-            "thresholds": {"identified": T_IDENT, "searching": T_SEARCH, "margin": MIN_MARGIN},
+            "thresholds": {"calibration_floor": CAL_FLOOR, "identified": C_IDENT, "searching": C_SEARCH,
+                           "margin": MIN_MARGIN, "identified_raw_cosine": round(T_IDENT, 4),
+                           "searching_raw_cosine": round(T_SEARCH, 4), "phone_margin": PHONE_AMBIG_MARGIN,
+                           "front_cap": device_taxonomy.FRONT_CONFIDENCE_CAP, "scene_gate": SCENE_GATE,
+                           "laplacian_min": LAPLACIAN_MIN, "edge_min": EDGE_MIN,
+                           "detector_gate": device_taxonomy.DETECTOR_GATE_MIN},
         }
 
     def privacy(self) -> dict:
@@ -1766,6 +2018,9 @@ class Pipeline:
                 "samples": len(embed), "fps": self.stream_stats()["infer_fps"], "frames": self._frames,
                 "cosine_similarity": round(last["similarity"], 4), "margin": round(last["margin"], 4),
                 "confidence": round(last["confidence"], 4), "label": last["label"],
+                "similarity_pct": round(last["confidence"] * 100, 1), "margin_pct": round(last["margin"] * 100, 1),
+                "state": last["state"], "empty_scene": last.get("empty", False), "saliency": last.get("saliency"),
+                "domain": last.get("domain"),
                 "accelerator": self.accelerator(),
                 "models": {
                     "embedder": self.extractor.info() if hasattr(self.extractor, "info") else {"runtime": self.extractor.name},
@@ -1995,12 +2250,25 @@ class Handler(BaseHTTPRequestHandler):
     def _post_api(self, path: str, body: bytes) -> bool:
         """Multi-view enrollment, db and CAD endpoints. Returns False when the path is not one of them."""
         p = self.pipeline
+        parts = [urllib.parse.unquote(s) for s in path.split("/") if s]
+        if len(parts) == 4 and parts[:2] == ["api", "classes"] and parts[3] in ("fetch_cad", "refetch_cad"):
+            try:
+                label = normalize_label(parts[2])
+                self._json(202, p.refetch_cad(label))
+            except KeyError:
+                self._json(404, {"ok": False, "error": f"class {parts[2]!r} is not enrolled"})
+            except ValueError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+            return True
         if path not in ("/api/enroll/start", "/api/enroll/capture", "/api/enroll/finish", "/api/enroll/cancel",
-                        "/api/db/save", "/api/cad/fetch", "/api/classes/reset", "/api/resolve"):
+                        "/api/db/save", "/api/cad/fetch", "/api/classes/reset", "/api/classes/purge", "/api/resolve"):
             return False
         try:
             req = self._json_body(body)
-            if path == "/api/enroll/start":
+            if path == "/api/classes/purge":
+                result = p.purge(delete_cad=bool(req.get("delete_cad", True)))
+                self._json(200, {**result, "classes": p.bank.counts()})
+            elif path == "/api/enroll/start":
                 meta = taxonomy.parse_metadata(req)
                 frames = int(req.get("frames_per_view", FRAMES_PER_VIEW))
                 with p._infer_lock:

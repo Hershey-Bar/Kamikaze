@@ -33,8 +33,13 @@ ROUTER_SOCK = "/var/run/arduino-router.sock"
 
 
 def jpeg(size=(320, 240)):
+    """Textured frame (a solid colour would be gated as an empty reticle)."""
+    arr = np.full((size[1], size[0], 3), (120, 80, 40), dtype=np.uint8)
+    yy, xx = np.mgrid[0:size[1], 0:size[0]]
+    mask = ((yy // 12 + xx // 12) % 2).astype(bool)
+    arr[mask] = 255 - arr[mask]
     buf = io.BytesIO()
-    Image.new("RGB", size, (120, 80, 40)).save(buf, "JPEG")
+    Image.fromarray(arr).save(buf, "JPEG")
     return buf.getvalue()
 
 
@@ -147,10 +152,14 @@ class LedMappingTests(unittest.TestCase):
     def test_phone_hints(self):
         self.assertEqual(receiver.phone_hint("smartphone", "front", 0.05), "flip")
         self.assertEqual(receiver.phone_hint("smartphone", "back", 0.05), "tilt")
-        self.assertIsNone(receiver.phone_hint("smartphone", "front", 0.5))
+        self.assertEqual(receiver.phone_hint("smartphone", "front", 0.5), "flip")  # the screen never verifies a phone
+        self.assertIsNone(receiver.phone_hint("smartphone", "back", 0.5))
+        self.assertIsNone(receiver.phone_hint("smartphone", "front", 0.5, front=False))
         self.assertIsNone(receiver.phone_hint("beverage_can", "front", 0.0))
         self.assertEqual(receiver.guidance_message(receiver.GUIDING, "x", 0.5, "flip"), taxonomy.MSG_PHONE_FLIP)
         self.assertEqual(receiver.guidance_message(receiver.GUIDING, "x", 0.5, "tilt"), taxonomy.MSG_PHONE_TILT)
+        self.assertEqual(receiver.guidance_message(receiver.GUIDING, "x", 0.5, "tilt", prompt="custom"), "custom")
+        self.assertEqual(receiver.guidance_message(receiver.GUIDING, "x", 0.5, "verify"), receiver.MSG_VERIFY)
 
     @unittest.skipUnless(os.path.exists(ROUTER_SOCK), "arduino-router socket not present (not on the board)")
     def test_hardware_rpc_roundtrip(self):

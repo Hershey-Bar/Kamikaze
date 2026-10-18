@@ -115,6 +115,40 @@ Tips: plain background, even light, object filling about 60–70% of the reticle
 Classes enrolled with another embedder (for example the earlier torchvision backbone) are not mixed: the old database is
 kept as `enrolled_classes.<embedder>.bak.pt` and the objects must be re-enrolled.
 
+**PURGE DATABASE** (dashboard, or `POST /api/classes/purge`) deletes every class, removes `enrolled_classes.pt` (and its
+`.tmp` / `.bak.pt` siblings) from disk and clears the cached CAD models: a clean slate before a fresh training run.
+
+## Recognition logic
+
+Every frame passes these stages in order (`receiver.py` `Pipeline.process_jpeg` / `_arbitrate`):
+
+1. **Empty-scene gate.** The 60% reticle crop is scored for structure (Laplacian variance and Canny edge density). Below
+   `KAMIKAZE_LAPLACIAN_MIN` (default 18) or `KAMIKAZE_EDGE_MIN` (0.002) the frame is a blank wall / dark scene: detector and
+   embedder are skipped, the state is **SEARCHING** with confidence 0% / margin 0%, the banner reads
+   *Awaiting object inside center reticle...* and one cyan LED is lit `(0,100,150,15,1)`. Disable with `KAMIKAZE_SCENE_GATE=0`.
+2. **Detector = domain gate.** YOLO26n on the NPU only restricts *which classes may match*: `cell phone` ≥ 0.50 → smartphones
+   only, `cup` / `bottle` ≥ 0.50 → beverage cans/bottles only. If the unrestricted top-1 is from the other domain the frame is
+   **GUIDING** with *Verifying object geometry... Hold steady in center.*
+3. **Calibrated confidence.** Raw cosine `S` maps to `C = max(0, (S − 0.52) / 0.48)` (`KAMIKAZE_CAL_FLOOR`), so the empty
+   background (raw 0.38–0.45) reads 0%. **IDENTIFIED** needs `C ≥ 0.70` (raw ≈ 0.856) *and* margin `Δ ≥ 0.15` for 3 consecutive
+   frames; `0.25 ≤ C < 0.70` or `Δ < 0.15` is **GUIDING**; `C < 0.25` is **SEARCHING**.
+4. **Smartphones.** Views are weighted back 0.65 / side 0.15 / top 0.10 / front 0.10 (`device_taxonomy.py`). Because the camera
+   sees one face at a time, the weights act as per-view reliability (back × 1.00, side × 0.81, top/front × 0.79): only the rear
+   shell can push a phone over the IDENTIFIED floor. If the live frame matches a phone's screen better than its back,
+   confidence is capped at 35%, LEDs go amber and the banner says *Front screen detected. Flip phone 180° to expose camera
+   island and sensors.* When two enrolled phones are within Δ 0.15, the tier taxonomy picks the cue that separates them
+   (Pro LiDAR aperture, Ultra boxy corners + periscope, iPhone lens layout, Apple vs Samsung island).
+
+## Dashboard
+
+Row 1: live camera with the 60% corner-bracket reticle, status pill and guidance banner (45%) | interactive 3D CAD stage
+(55%, `<model-viewer>`, Auto Rotate / Sync Live Pose / Re-Fetch CAD for Active, author + licence badge).
+Row 2: four telemetry cards — Host QCS8275 (junction °C, per-core GHz, load), Memory (16 GB LPDDR5 used/total), STM32H5F5
+bridge (`set_pixels` RPC ms, LEDs, router socket) and Edge-AI pipeline (NPU runtime, embed/detect ms, fps, calibrated
+similarity %, margin %, scene-gate values, active detector domain).
+Row 3: training console (name + category, Capture Front 0° → Back 180° → Side 90° → Top) | enrolled classes table
+(Name · Category · Views · CAD · Re-Fetch CAD · Delete) and **PURGE DATABASE**.
+
 ## 3D models and attribution
 
 `cad_harvester.build_search_queries()` turns plain text into a cascade of queries, most specific first
@@ -137,8 +171,10 @@ with title, author, author URL, licence and source; credits are shown in the das
 | GET | `/api/events` (`?telemetry=1` adds `event: telemetry`) | state SSE (the dashboard's single event connection) |
 | GET | `/api/telemetry`, `/api/telemetry/stream` | SoC, thermals, RAM, CPU, NPU, LED bridge, inference (JSON / SSE) |
 | POST | `/api/enroll/start` / `capture` / `finish` / `cancel`, GET `/api/enroll/status` | guided enrollment |
-| GET | `/api/classes` | enrolled classes |
+| GET | `/api/classes` | enrolled classes (views, phone tier, CAD status and `cad_path`) |
 | DELETE | `/api/classes/<id>` | delete a class and its CAD cache (`?delete_cad=0` keeps the model) |
+| POST | `/api/classes/<id>/fetch_cad` | force a background CAD re-harvest for one class (202; 404 if not enrolled) |
+| POST | `/api/classes/purge` | wipe all classes, delete `enrolled_classes.pt` and the CAD cache (`{"delete_cad": false}` keeps models) |
 | POST | `/api/classes/reset` | delete all classes and their CAD cache |
 | POST | `/api/resolve`, `/api/cad/fetch` | plain-text resolution, CAD retrieval |
 | GET | `/api/credits`, `/api/db/export`; POST `/api/db/save` | attribution, database export/save |

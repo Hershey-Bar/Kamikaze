@@ -5,104 +5,195 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kamikaze · Edge Visual Retrieval</title>
 <style>
-  :root { --bg:#0b1020; --panel:#121a30; --line:#24304f; --text:#e5e9f5; --mute:#8b97b8; --green:#10b981; --amber:#f59e0b; --blue:#3b82f6; --red:#ef4444; }
-  * { box-sizing: border-box; }
+  :root { --bg:#070b16; --panel:#0f1629; --panel2:#0b1122; --line:#1f2a47; --text:#e5e9f5; --mute:#8391b5; --green:#10b981; --amber:#f59e0b; --blue:#38bdf8; --red:#ef4444; --violet:#e879f9; }
+  * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
-  header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; border-bottom:1px solid var(--line); }
-  header h1 { margin:0; font-size:18px; letter-spacing:.08em; }
-  header span { color:var(--mute); font-size:12px; }
-  #hud { margin:14px 20px 0; padding:14px 18px; border-radius:10px; font-size:18px; font-weight:600; background:var(--blue); transition:background .25s; display:flex; gap:14px; align-items:center; }
-  #hud.IDENTIFIED { background:var(--green); }
-  #hud.GUIDING { background:var(--amber); color:#1a1200; animation:pulse 1.1s ease-in-out infinite; }
-  #hudIcon { font-size:30px; line-height:1; display:none; }
-  #hudIcon.on { display:block; }
-  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.65; } }
-  @keyframes spin { to { transform:rotate(360deg); } }
-  #hudIcon.rotate.on { animation:spin 2s linear infinite; display:block; }
-  main { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:16px; padding:16px 20px; }
-  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
-  .panel h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase; letter-spacing:.1em; color:var(--mute); display:flex; justify-content:space-between; align-items:center; }
-  .stage { position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:8px; overflow:hidden; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 22px; border-bottom:1px solid var(--line); background:#090f1e; }
+  header h1 { margin:0; font-size:17px; letter-spacing:.14em; }
+  header h1 small { font-size:11px; color:var(--mute); letter-spacing:.06em; font-weight:500; margin-left:10px; }
+  #conn { color:var(--mute); font-size:12px; }
+  .wrap { padding:16px 22px 8px; display:flex; flex-direction:column; gap:16px; }
+  .row1 { display:grid; grid-template-columns:minmax(0,45fr) minmax(0,55fr); gap:16px; }
+  .row2 { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; }
+  .row3 { display:grid; grid-template-columns:minmax(0,45fr) minmax(0,55fr); gap:16px; }
+  @media (max-width:1100px) { .row1, .row3 { grid-template-columns:1fr; } .row2 { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  @media (max-width:640px) { .row2 { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; min-width:0; }
+  .panel h2 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.12em; color:var(--mute); display:flex; justify-content:space-between; align-items:center; gap:8px; font-weight:600; }
+  .stage { position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:10px; overflow:hidden; }
   .stage canvas { position:absolute; inset:0; width:100%; height:100%; }
-  model-viewer { width:100%; aspect-ratio:4/3; background:radial-gradient(circle at 50% 40%, #1b2747, #0b1020); border-radius:8px; --poster-color:transparent; }
-  .mute { color:var(--mute); font-size:12px; }
-  .grid { display:grid; grid-template-columns: repeat(3,1fr); gap:8px; }
-  .stat { background:#0d1428; border:1px solid var(--line); border-radius:8px; padding:8px 10px; min-width:0; }
-  .stat b { display:block; font-size:11px; color:var(--mute); text-transform:uppercase; letter-spacing:.08em; font-weight:500; }
-  .stat span { font-size:16px; font-variant-numeric: tabular-nums; overflow-wrap:anywhere; }
-  .leds { display:flex; gap:6px; margin-top:10px; align-items:center; }
-  .led { width:18px; height:18px; border-radius:50%; background:#1b2340; border:1px solid var(--line); transition:background .2s, box-shadow .2s; }
-  .led.on { box-shadow:0 0 10px currentColor; }
-  .row { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
-  input[type=text], select { flex:1; min-width:120px; background:#0d1428; border:1px solid var(--line); color:var(--text); padding:8px 10px; border-radius:8px; font:inherit; }
-  button { background:var(--blue); border:0; color:#fff; padding:8px 14px; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; }
-  button:disabled { opacity:.5; cursor:default; }
-  button.ghost { background:transparent; border:1px solid var(--line); color:var(--mute); padding:2px 8px; font-weight:500; }
-  button.sel { background:var(--green); }
-  .bar { height:8px; background:#0d1428; border-radius:4px; overflow:hidden; margin-top:6px; }
+  #statusPill { position:absolute; top:10px; left:10px; padding:4px 12px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.08em; background:rgba(56,189,248,.18); color:var(--blue); border:1px solid var(--blue); backdrop-filter:blur(4px); }
+  #statusPill.IDENTIFIED { background:rgba(16,185,129,.2); color:var(--green); border-color:var(--green); }
+  #statusPill.GUIDING { background:rgba(245,158,11,.2); color:var(--amber); border-color:var(--amber); }
+  #banner { margin-top:10px; padding:12px 14px; border-radius:10px; font-size:16px; font-weight:600; background:rgba(56,189,248,.12); border:1px solid rgba(56,189,248,.45); color:#cfeaff; display:flex; gap:12px; align-items:center; min-height:52px; transition:background .25s,border-color .25s; }
+  #banner.IDENTIFIED { background:rgba(16,185,129,.16); border-color:var(--green); color:#c9f7e4; }
+  #banner.GUIDING { background:rgba(245,158,11,.16); border-color:var(--amber); color:#ffe7bf; animation:pulse 1.2s ease-in-out infinite; }
+  #hudIcon { font-size:26px; line-height:1; display:none; }
+  #hudIcon.on { display:block; }
+  #hudIcon.rotate.on { animation:spin 2s linear infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.72; } }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .mini { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:10px; }
+  .stat { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:8px 10px; min-width:0; }
+  .stat b { display:block; font-size:10px; color:var(--mute); text-transform:uppercase; letter-spacing:.1em; font-weight:600; }
+  .stat span { font-size:16px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  .bar { height:6px; background:#060a15; border-radius:3px; overflow:hidden; margin-top:6px; }
   .bar > div { height:100%; width:0; background:var(--green); transition:width .15s; }
-  .gauge > div { background:var(--blue); }
-  .steps { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:10px; }
-  .step { background:#0d1428; border:1px solid var(--line); border-radius:8px; padding:8px; font-size:12px; }
-  .step.current { border-color:var(--amber); }
+  .bar.m > div { background:var(--blue); }
+  model-viewer { width:100%; min-height:560px; height:560px; display:block; background:radial-gradient(circle at 50% 38%, #1a2a52, #070b16 72%); border-radius:10px; --poster-color:transparent; }
+  .vstage { position:relative; }
+  #badge { position:absolute; left:10px; bottom:10px; right:10px; padding:8px 10px; border-radius:8px; background:rgba(7,11,22,.78); border:1px solid var(--line); font-size:11px; color:var(--mute); overflow-wrap:anywhere; backdrop-filter:blur(4px); }
+  #badge:empty { display:none; }
+  #badge a { color:#7dd3fc; }
+  #viewerLabel { position:absolute; left:10px; top:10px; padding:4px 10px; border-radius:999px; background:rgba(7,11,22,.75); border:1px solid var(--line); font-size:12px; }
+  .tools { display:flex; gap:6px; flex-wrap:wrap; }
+  button { background:#2563eb; border:0; color:#fff; padding:8px 14px; border-radius:8px; font:inherit; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--text); padding:5px 10px; font-weight:500; font-size:12px; }
+  button.ghost.on { border-color:var(--green); color:var(--green); }
+  button.danger { background:transparent; border:1px solid var(--red); color:var(--red); padding:4px 10px; font-weight:600; font-size:12px; }
+  button.purge { background:var(--red); color:#fff; letter-spacing:.06em; }
+  .card h3 { margin:0 0 2px; font-size:13px; }
+  .card .sub { font-size:11px; color:var(--mute); margin-bottom:10px; }
+  .kvs { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; font-size:12px; }
+  .kvs dt { color:var(--mute); }
+  .kvs dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  .big { font-size:24px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .big small { font-size:12px; color:var(--mute); font-weight:500; }
+  .gauge16 { height:12px; background:#060a15; border:1px solid var(--line); border-radius:6px; overflow:hidden; margin:8px 0 10px; }
+  .gauge16 > div { height:100%; width:0; background:linear-gradient(90deg,var(--green),var(--amber)); transition:width .3s; }
+  .freqs { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:8px; font-size:10px; }
+  .freqs div { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:3px 4px; text-align:center; font-variant-numeric:tabular-nums; }
+  .leds { display:flex; gap:6px; margin:10px 0 8px; }
+  .led { width:16px; height:16px; border-radius:50%; background:#141c33; border:1px solid var(--line); transition:background .2s, box-shadow .2s; }
+  .led.on { box-shadow:0 0 10px currentColor; }
+  input[type=text], select { flex:1; min-width:120px; background:var(--panel2); border:1px solid var(--line); color:var(--text); padding:9px 10px; border-radius:8px; font:inherit; }
+  .frow { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .steps { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:12px; }
+  .step { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:8px; font-size:12px; }
+  .step.current { border-color:var(--amber); box-shadow:0 0 0 1px var(--amber) inset; }
   .step.done { border-color:var(--green); }
   .step .warn { color:var(--amber); }
-  #enrollMsg { margin-top:8px; min-height:1.4em; color:var(--mute); font-size:12px; }
-  ul#classes { list-style:none; padding:0; margin:10px 0 0; display:flex; flex-wrap:wrap; gap:6px; }
-  table.classes { width:100%; border-collapse:collapse; margin-top:10px; font-size:12px; }
-  table.classes th { text-align:left; color:var(--mute); font-weight:500; text-transform:uppercase; letter-spacing:.06em; font-size:11px; padding:4px 6px; border-bottom:1px solid var(--line); }
-  table.classes td { padding:6px; border-bottom:1px solid var(--line); vertical-align:middle; }
-  table.classes tr.active td { color:var(--green); }
-  table.classes td.cad-ready { color:var(--green); }
-  table.classes td.cad-missing { color:var(--amber); }
-  button.danger { background:transparent; border:1px solid var(--red); color:var(--red); padding:2px 8px; font-weight:500; }
-  .gauge16 { height:14px; background:#0d1428; border:1px solid var(--line); border-radius:7px; overflow:hidden; margin-top:6px; }
-  .gauge16 > div { height:100%; width:0; background:linear-gradient(90deg,var(--green),var(--amber)); transition:width .3s; }
-  .tgrid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:10px; }
-  .kv { font-size:12px; color:var(--mute); line-height:1.55; overflow-wrap:anywhere; }
-  .kv b { color:var(--text); font-weight:500; }
-  .freqs { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:6px; font-size:11px; }
-  .freqs div { background:#0d1428; border:1px solid var(--line); border-radius:6px; padding:3px 6px; font-variant-numeric:tabular-nums; }
-  #credit { margin-top:6px; font-size:11px; color:var(--mute); overflow-wrap:anywhere; }
-  #credit a { color:#7aa7ff; }
+  #capBtn { font-size:15px; padding:10px 18px; background:var(--green); }
+  #enrollMsg { margin-top:10px; min-height:1.4em; color:var(--mute); font-size:12px; }
   #resolved { margin-top:8px; font-size:12px; color:var(--mute); overflow-wrap:anywhere; }
-  ul#classes li { background:#0d1428; border:1px solid var(--line); border-radius:999px; padding:3px 4px 3px 10px; font-size:12px; display:flex; align-items:center; gap:6px; }
-  ul#classes li.active { border-color:var(--green); color:var(--green); }
-  .stack { display:flex; flex-direction:column; gap:16px; }
-  .pill { font-size:11px; padding:2px 8px; border-radius:999px; background:#0d1428; border:1px solid var(--line); color:var(--mute); text-transform:none; letter-spacing:0; }
+  table.classes { width:100%; border-collapse:collapse; font-size:12px; }
+  table.classes th { text-align:left; color:var(--mute); font-weight:600; text-transform:uppercase; letter-spacing:.08em; font-size:10px; padding:6px; border-bottom:1px solid var(--line); }
+  table.classes td { padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  table.classes tr.active td:first-child { color:var(--green); font-weight:600; }
+  .cad-ready { color:var(--green); font-size:11px; }
+  .cad-missing { color:var(--amber); font-size:11px; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:999px; background:var(--panel2); border:1px solid var(--line); color:var(--mute); text-transform:none; letter-spacing:0; font-weight:500; }
   .pill.on { border-color:var(--green); color:var(--green); }
-  footer { padding:0 20px 20px; color:var(--mute); font-size:12px; }
+  .mute { color:var(--mute); font-size:12px; }
+  footer { padding:6px 22px 20px; color:var(--mute); font-size:11px; }
+  code { font-size:11px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>KAMIKAZE</h1>
-  <span id="conn">connecting…</span>
+  <h1>KAMIKAZE <small>edge visual → 3D retrieval · VENTUNO Q</small></h1>
+  <span><span class="pill" id="modePill">mode: —</span> <span id="conn">connecting…</span></span>
 </header>
 
-<div id="hud" class="SEARCHING"><span id="hudIcon"></span><span id="hudText">Place target object inside the central alignment box.</span></div>
-
-<main>
-  <div class="stack">
-    <!-- Panel 1: live camera -->
+<div class="wrap">
+  <!-- ROW 1: live camera (45%) | 3D CAD stage (55%) -->
+  <div class="row1">
     <section class="panel">
-      <h2>1 · Live camera &amp; reticle <span class="pill" id="viewPill">view: —</span></h2>
-      <div class="stage"><canvas id="cam" width="640" height="480"></canvas></div>
-      <div class="grid" style="margin-top:10px">
+      <h2>Live camera · 60% reticle <span class="pill" id="viewPill">view: —</span></h2>
+      <div class="stage">
+        <canvas id="cam" width="640" height="480"></canvas>
+        <span id="statusPill" class="SEARCHING">SEARCHING</span>
+      </div>
+      <div id="banner" class="SEARCHING"><span id="hudIcon"></span><span id="hudText">Awaiting object inside center reticle...</span></div>
+      <div class="mini">
         <div class="stat"><b>Top-1 match</b><span id="tLabel">—</span></div>
-        <div class="stat"><b>Confidence</b><span id="tSim">—</span>
-          <div class="bar"><div id="confBar"></div></div></div>
-        <div class="stat"><b>Margin Δ</b><span id="tMargin">—</span>
-          <div class="bar gauge"><div id="marginBar"></div></div></div>
+        <div class="stat"><b>Confidence</b><span id="tSim">0.0%</span><div class="bar"><div id="confBar"></div></div></div>
+        <div class="stat"><b>Margin Δ (top-1 − top-2)</b><span id="tMargin">0.0%</span><div class="bar m"><div id="marginBar"></div></div></div>
       </div>
     </section>
 
-    <!-- Panel 3: guided enrollment -->
     <section class="panel">
-      <h2>3 · Guided multi-view enrollment</h2>
-      <div class="row">
-        <input type="text" id="mName" placeholder="Name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
+      <h2>Interactive 3D CAD
+        <span class="tools">
+          <button class="ghost on" id="rotBtn" type="button">Auto Rotate</button>
+          <button class="ghost" id="syncBtn" type="button">Sync Live Pose</button>
+          <button class="ghost" id="refetchActiveBtn" type="button">Re-Fetch CAD for Active</button>
+          <span class="pill" id="syncPill">pose: off</span>
+        </span></h2>
+      <div class="vstage">
+        <model-viewer id="viewer" src="/static/models/default.glb" camera-controls auto-rotate shadow-intensity="1.2"
+                      environment-image="neutral" exposure="1.1" camera-orbit="45deg 75deg auto" interaction-prompt="none"
+                      alt="Matched 3D model"></model-viewer>
+        <span id="viewerLabel">Default model</span>
+        <div id="badge"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ROW 2: hardware + pipeline telemetry -->
+  <div class="row2">
+    <section class="panel card">
+      <h3>Host · Qualcomm Dragonwing QCS8275</h3>
+      <div class="sub" id="socSub">aarch64 · 8 cores · Ubuntu</div>
+      <div class="big" id="tTemp">— <small>°C max junction</small></div>
+      <dl class="kvs">
+        <dt>CPU load</dt><dd id="tCpu">—</dd>
+        <dt>Thermal zones</dt><dd id="tZones">—</dd>
+        <dt>Uptime</dt><dd id="tUp">—</dd>
+      </dl>
+      <div class="freqs" id="freqs"></div>
+    </section>
+
+    <section class="panel card">
+      <h3>Memory · 16 GB LPDDR5</h3>
+      <div class="sub">/proc/meminfo</div>
+      <div class="big" id="tRam">— <small>GB used</small></div>
+      <div class="gauge16"><div id="ramBar"></div></div>
+      <dl class="kvs">
+        <dt>Available</dt><dd id="tAvail">—</dd>
+        <dt>Total (OS-visible)</dt><dd id="tTotalMem">—</dd>
+        <dt>GLB/JS RAM cache</dt><dd id="tCache">—</dd>
+        <dt>Frame ring</dt><dd id="tRing">—</dd>
+      </dl>
+    </section>
+
+    <section class="panel card">
+      <h3>Co-processor · STM32H5F5</h3>
+      <div class="sub">Modulino Pixels (8 LEDs) on Wire1 (I2C4) · Zephyr</div>
+      <div class="big" id="tBus">— <small>ms set_pixels RPC</small></div>
+      <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
+      <dl class="kvs">
+        <dt>Bridge state</dt><dd id="tBridge">—</dd>
+        <dt>RPC p95 / calls</dt><dd id="tRpc">—</dd>
+        <dt>Router socket</dt><dd id="tSock">—</dd>
+        <dt>Pixels</dt><dd id="tLed">—</dd>
+      </dl>
+    </section>
+
+    <section class="panel card">
+      <h3>Edge-AI pipeline</h3>
+      <div class="sub" id="tRuntime">runtime: —</div>
+      <div class="big" id="tFps">— <small>fps inferred</small></div>
+      <dl class="kvs">
+        <dt>NPU (cDSP)</dt><dd id="tNpu">—</dd>
+        <dt>Embed median / p95</dt><dd id="tEmbed">—</dd>
+        <dt>Detect median</dt><dd id="tDetect">—</dd>
+        <dt>Total / frame</dt><dd id="tTotal">—</dd>
+        <dt>Similarity (calibrated)</dt><dd id="tCos">—</dd>
+        <dt>Top-1 vs top-2 margin</dt><dd id="tMarg">—</dd>
+        <dt>Scene gate (lap / edges)</dt><dd id="tGate">—</dd>
+        <dt>Detector domain</dt><dd id="tDomain">—</dd>
+      </dl>
+    </section>
+  </div>
+
+  <!-- ROW 3: training console | enrolled classes -->
+  <div class="row3">
+    <section class="panel">
+      <h2>Training console · guided 4-angle enrollment</h2>
+      <div class="frow">
+        <input type="text" id="mName" placeholder="Object name, e.g. Samsung Galaxy S24 Ultra" maxlength="80">
         <select id="mCat">
           <option value="">Category (auto)</option>
           <option value="smartphone">smartphone</option>
@@ -110,80 +201,36 @@
           <option value="beverage_bottle">beverage_bottle</option>
         </select>
       </div>
-      <div class="row">
-        <input type="text" id="mBrand" placeholder="Brand" maxlength="40">
-        <input type="text" id="mVariant" placeholder="Variant / model" maxlength="40">
+      <div class="frow">
+        <input type="text" id="mBrand" placeholder="Brand (optional)" maxlength="40">
+        <input type="text" id="mVariant" placeholder="Variant / model (optional)" maxlength="40">
       </div>
-      <div class="row">
+      <div class="frow">
         <button id="startBtn">Start wizard</button>
-        <button id="capBtn" disabled>Capture view &amp; Next</button>
+        <button id="capBtn" disabled>Capture Front 0° &amp; Next</button>
         <button id="finishBtn" class="ghost" disabled>Done (save captured views)</button>
         <button id="cancelBtn" class="ghost" disabled>Cancel</button>
       </div>
       <div class="steps" id="steps"></div>
       <div id="enrollMsg"></div>
-      <div class="row">
+      <div class="frow">
+        <button id="resolveBtn" class="ghost" title="Parse the name into a canonical product and download its 3D model">Resolve &amp; Fetch CAD</button>
         <button id="saveBtn" class="ghost">Save database</button>
         <a href="/api/db/export" download="enrolled_classes.pt"><button class="ghost" type="button">Export .pt</button></a>
-        <button id="resolveBtn" class="ghost" title="Parse the name into a canonical product and download its 3D model">Resolve &amp; Fetch CAD</button>
-        <button id="resetBtn" class="danger" type="button">Reset all classes</button>
       </div>
       <div id="resolved"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Enrolled classes <span><span class="pill" id="classCount">0 classes</span> <button id="purgeBtn" class="purge" type="button">PURGE DATABASE</button></span></h2>
       <table class="classes">
-        <thead><tr><th>Class</th><th>Category</th><th>Views</th><th>Created</th><th>CAD</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Category</th><th>Views</th><th>CAD</th><th></th><th></th></tr></thead>
         <tbody id="classRows"></tbody>
       </table>
     </section>
   </div>
-
-  <div class="stack">
-    <!-- Panel 2: 3D showcase -->
-    <section class="panel">
-      <h2>2 · Interactive 3D CAD
-        <span><button class="ghost" id="syncBtn">Auto Rotate</button> <span class="pill" id="syncPill">pose: —</span></span></h2>
-      <model-viewer id="viewer" src="/static/models/default.glb" camera-controls auto-rotate shadow-intensity="1.2"
-                    environment-image="neutral" exposure="1.1" camera-orbit="45deg 75deg 1.5m" interaction-prompt="none"
-                    alt="Matched 3D model"></model-viewer>
-      <div class="mute" id="viewerLabel" style="margin-top:8px">Showing default model.</div>
-      <div id="credit"></div>
-    </section>
-
-    <!-- Panel 4: telemetry -->
-    <section class="panel">
-      <h2>4 · Telemetry &amp; hardware <span class="pill" id="modePill">mode: —</span></h2>
-      <div class="grid">
-        <div class="stat"><b>Modulino Pixels</b><span id="tLed">—</span></div>
-        <div class="stat"><b>Bridge RPC</b><span id="tBus">—</span></div>
-        <div class="stat"><b>Frame rate</b><span id="tFps">—</span></div>
-        <div class="stat"><b>Embed median</b><span id="tEmbed">—</span></div>
-        <div class="stat"><b>Embed p95</b><span id="tEmbed95">—</span></div>
-        <div class="stat"><b>Detect median</b><span id="tDetect">—</span></div>
-        <div class="stat"><b>NPU (cDSP)</b><span id="tNpu">—</span></div>
-        <div class="stat"><b>Total / frame</b><span id="tTotal">—</span></div>
-        <div class="stat"><b>Cosine sim</b><span id="tCos">—</span></div>
-        <div class="stat"><b>Margin</b><span id="tMarg">—</span></div>
-        <div class="stat"><b>Pose time</b><span id="tPoseMs">—</span></div>
-        <div class="stat"><b>CPU</b><span id="tCpu">—</span></div>
-        <div class="stat"><b>Max temp</b><span id="tTemp">—</span></div>
-        <div class="stat"><b>Pitch / Yaw / Roll</b><span id="tPose">—</span></div>
-      </div>
-      <div class="stat" style="margin-top:8px"><b>RAM <span id="tRam" style="font-size:12px;color:var(--text)">—</span></b>
-        <div class="gauge16"><div id="ramBar"></div></div></div>
-      <div class="freqs" id="freqs"></div>
-      <div class="tgrid">
-        <div class="kv" id="kvSoc">SoC: —</div>
-        <div class="kv" id="kvIpc">IPC: —</div>
-        <div class="kv" id="kvThermal">Thermal: —</div>
-        <div class="kv" id="kvInfer">Inference: —</div>
-        <div class="kv" id="kvNpu">NPU: —</div>
-        <div class="kv" id="kvStream">Stream: —</div>
-      </div>
-      <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
-      <div class="mute" id="tBackend" style="margin-top:8px"></div>
-    </section>
-  </div>
-</main>
-<footer>Object detection (Ultralytics YOLO26n) and 1280-d embeddings (MobileNetV3-Large) run on the Hexagon NPU through the QNN TFLite delegate, with the Arm CPU as fallback. Pose is a heuristic estimate. No camera image is ever saved: only 1280-d vectors are stored, and the live view holds a single in-memory frame (MJPEG <code>/api/stream</code>, dropped when the stream goes idle). API: <code>/api/state</code>, <code>/api/telemetry</code>, <code>/api/classes</code>, <code>/api/credits</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
+</div>
+<footer>Training mode. YOLO26n detection (domain gate only) and 1280-d MobileNetV3-Large embeddings run on the Hexagon NPU via the QNN TFLite delegate (Arm CPU fallback). Confidence is calibrated: C = max(0, (cos − floor) / (1 − floor)). No camera image is ever saved: only 1280-d vectors reach <code>enrolled_classes.pt</code>; the live view holds one in-RAM frame (<code>/api/stream</code>). API: <code>/api/state</code> · <code>/api/telemetry</code> · <code>/api/classes</code> · <code>/api/classes/purge</code> · <code>/api/classes/&lt;id&gt;/fetch_cad</code> · <code>/api/credits</code>.</footer>
 
 <script>
   (function () {
@@ -200,30 +247,41 @@
   })();
 
   const $ = (id) => document.getElementById(id);
-  const COLORS = { IDENTIFIED: '#10b981', GUIDING: '#f59e0b', SEARCHING: '#3b82f6' };
+  const COLORS = { IDENTIFIED: '#10b981', GUIDING: '#f59e0b', SEARCHING: '#38bdf8' };
   const ledEls = [];
   for (let i = 0; i < 8; i++) { const d = document.createElement('div'); d.className = 'led'; $('leds').appendChild(d); ledEls.push(d); }
 
   const ctx = $('cam').getContext('2d');
   const viewer = $('viewer');
-  let frameBusy = false, lastSrc = '', lastLabel = null, syncPose = false, state = null, pose = null, lastSse = 0, lastTel = 0;
+  let frameBusy = false, lastSrc = '', syncPose = false, autoRotate = true, state = null, pose = null, lastSse = 0, lastTel = 0;
+
+  function brackets(x, y, side, color) {
+    const L = side * 0.16;
+    ctx.strokeStyle = color; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y + L); ctx.lineTo(x, y); ctx.lineTo(x + L, y);
+    ctx.moveTo(x + side - L, y); ctx.lineTo(x + side, y); ctx.lineTo(x + side, y + L);
+    ctx.moveTo(x + side, y + side - L); ctx.lineTo(x + side, y + side); ctx.lineTo(x + side - L, y + side);
+    ctx.moveTo(x + L, y + side); ctx.lineTo(x, y + side); ctx.lineTo(x, y + side - L);
+    ctx.stroke();
+  }
 
   function drawOverlay() {
     const W = 640, H = 480, side = (state ? state.crop_fraction : 0.6) * Math.min(W, H);
     const x = (W - side) / 2, y = (H - side) / 2;
     const color = COLORS[state ? state.state : 'SEARCHING'];
     ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,.4)';
+    ctx.fillStyle = 'rgba(0,0,0,.42)';
     ctx.fillRect(0, 0, W, y); ctx.fillRect(0, y + side, W, H - y - side);
     ctx.fillRect(0, y, x, side); ctx.fillRect(x + side, y, W - x - side, side);
-    ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.setLineDash([14, 10]);
-    ctx.strokeRect(x, y, side, side);
-    ctx.setLineDash([]);
-    if (state && state.label) {
-      ctx.lineWidth = 2; ctx.strokeRect(x + 6, y + 6, side - 12, side - 12);
-      ctx.fillStyle = color; ctx.fillRect(x + 6, y + 6, Math.min(side - 12, 230), 22);
-      ctx.fillStyle = '#000'; ctx.font = '600 13px system-ui';
-      ctx.fillText(`${state.label} ${(state.similarity * 100).toFixed(0)}%`, x + 12, y + 22);
+    ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 1; ctx.strokeRect(x, y, side, side);
+    brackets(x, y, side, color);
+    if (state && state.label && state.state !== 'SEARCHING') {
+      const tag = `${state.label} ${(state.confidence * 100).toFixed(0)}%`;
+      ctx.font = '600 13px system-ui';
+      const tw = Math.min(side, ctx.measureText(tag).width + 14);
+      ctx.fillStyle = color; ctx.fillRect(x, y + side + 6, tw, 22);
+      ctx.fillStyle = '#000'; ctx.fillText(tag, x + 7, y + side + 22);
     }
     const det = state && state.detection;
     if (det && det.target) {
@@ -236,13 +294,8 @@
       ctx.fillStyle = '#e879f9'; ctx.fillRect(bx, ty, tw, 18);
       ctx.fillStyle = '#000'; ctx.fillText(tag, bx + 5, ty + 13);
     }
-    if (det && det.crop && det.crop_source === 'detector') {
-      const [cx0, cy0, cw, ch] = det.crop;
-      ctx.strokeStyle = 'rgba(232,121,249,.55)'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
-      ctx.strokeRect(cx0 * W, cy0 * H, cw * W, ch * H); ctx.setLineDash([]);
-    }
-    if (pose && pose.valid) {
-      const cx = W / 2, cy = H / 2, L = side * 0.32, r = (a) => a * Math.PI / 180;
+    if (pose && pose.valid && state && state.state !== 'SEARCHING') {
+      const cx = W / 2, cy = H / 2, L = side * 0.28, r = (a) => a * Math.PI / 180;
       const yaw = r(pose.yaw), pitch = r(pose.pitch), roll = r(pose.roll);
       const rot = (vx, vy, vz) => {
         let [a, b, c] = [vx, vy, vz];
@@ -253,7 +306,7 @@
       };
       [['#ef4444', 1, 0, 0], ['#22c55e', 0, 1, 0], ['#3b82f6', 0, 0, 1]].forEach(([c, vx, vy, vz]) => {
         const [ex, ey] = rot(vx, vy, vz);
-        ctx.strokeStyle = c; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+        ctx.strokeStyle = c; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
       });
     }
     ctx.restore();
@@ -263,7 +316,7 @@
   // actually received in the last 3 s - independent of the state/SSE feed - and the reader reconnects on its own.
   let lastBmp = null, lastPoll = 0, lastStateAt = 0, lastFrameAt = 0, lastMjpegAt = 0, decoding = false, pendingJpeg = null;
   let feedNote = 'connecting to receiver…';
-  const CRLF2 = [13, 10, 13, 10], latin1 = new TextDecoder('latin1');
+  const latin1 = new TextDecoder('latin1');
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function indexOf4(buf, from) {
@@ -343,7 +396,7 @@
     ctx.fillStyle = '#05070d'; ctx.fillRect(0, 0, 640, 480);
     ctx.save();
     ctx.textAlign = 'center';
-    ctx.fillStyle = `rgba(96,165,250,${0.35 + 0.5 * pulse})`;
+    ctx.fillStyle = `rgba(56,189,248,${0.35 + 0.5 * pulse})`;
     ctx.beginPath(); ctx.arc(320, 200, 9 + 5 * pulse, 0, 2 * Math.PI); ctx.fill();
     const off = state && state.privacy && state.privacy.preview_enabled === false;
     ctx.font = '600 17px system-ui'; ctx.fillStyle = `rgba(226,232,240,${0.55 + 0.4 * pulse})`;
@@ -372,7 +425,7 @@
 
   function renderLeds(led) {
     const lit = led && led.ok !== false ? led.count : 0;
-    const color = led ? `rgb(${led.r},${led.g},${led.b})` : '#1b2340';
+    const color = led ? `rgb(${led.r},${led.g},${led.b})` : '#141c33';
     ledEls.forEach((el, i) => {
       const on = i < lit;
       el.classList.toggle('on', on);
@@ -381,18 +434,28 @@
     });
   }
 
-  function fmtDate(iso) {
-    if (!iso) return '—';
-    const d = new Date(iso);
-    return isNaN(d) ? iso : d.toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+  async function refetchCad(id) {
+    $('enrollMsg').textContent = `Re-fetching CAD for ${id}… (Sketchfab → Poly Pizza → fallbacks, in the background)`;
+    try {
+      const r = await fetch('/api/classes/' + encodeURIComponent(id) + '/fetch_cad', { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      $('enrollMsg').textContent = j.ok ? (j.started ? `Re-harvesting CAD for ${id}; the viewer updates when the model lands.` : `A CAD harvest for ${id} is already running.`)
+        : (j.error || 'Re-fetch failed.');
+    } catch (e) { $('enrollMsg').textContent = 'Receiver unreachable.'; }
+    pullState();
   }
 
+  let classSig = '';
   function renderClasses(protos, active) {
+    const sig = JSON.stringify([(protos || []).map((p) => [p.class_id, p.view_count, p.vectors, p.cad_status, p.cad_source, p.cad_path]), active]);
+    if (sig === classSig) return;  // avoid rebuilding (and eating clicks on) the table at frame rate
+    classSig = sig;
     const body = $('classRows');
     body.replaceChildren();
+    $('classCount').textContent = `${(protos || []).length} class${(protos || []).length === 1 ? '' : 'es'}`;
     if (!(protos || []).length) {
       const tr = document.createElement('tr'); const td = document.createElement('td');
-      td.colSpan = 6; td.className = 'mute'; td.textContent = 'No enrolled classes.';
+      td.colSpan = 6; td.className = 'mute'; td.textContent = 'No enrolled classes. Use the training console to enroll an object.';
       tr.appendChild(td); body.appendChild(tr); return;
     }
     protos.forEach((p) => {
@@ -400,11 +463,16 @@
       if (p.class_id === active) tr.className = 'active';
       const cell = (text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
       const name = cell(p.canonical_name || p.class_id);
-      name.title = p.class_id;
-      cell((p.category || '—').replace('_', ' '));
-      cell(`${p.view_count}/4 · ${p.vectors}f`);
-      cell(fmtDate(p.created_at));
-      cell(p.cad_status === 'ready' ? (p.cad_source || 'ready') + (p.cad_match ? ' · ' + p.cad_match : '') : 'missing', p.cad_status === 'ready' ? 'cad-ready' : 'cad-missing');
+      name.title = p.class_id + (p.created_at ? ' · enrolled ' + p.created_at : '');
+      cell((p.category || '—').replace('_', ' ') + (p.phone_tier ? ' · ' + p.phone_tier.replace('_', ' ') : ''));
+      const views = p.views ? Object.keys(p.views).join(', ') : '';
+      cell(`${p.view_count}/4${views ? ' (' + views + ')' : ''}`);
+      cell(p.cad_status === 'ready' || p.cad_path ? (p.cad_source || 'cached') + (p.cad_path ? ' · ' + p.cad_path.split('/').pop() : '') : 'missing',
+        p.cad_status === 'ready' || p.cad_path ? 'cad-ready' : 'cad-missing');
+      const tdR = document.createElement('td');
+      const rf = document.createElement('button');
+      rf.className = 'ghost'; rf.textContent = 'Re-Fetch CAD'; rf.onclick = () => refetchCad(p.class_id);
+      tdR.appendChild(rf); tr.appendChild(tdR);
       const td = document.createElement('td');
       const del = document.createElement('button');
       del.className = 'danger'; del.textContent = 'Delete'; del.title = 'Delete ' + p.class_id + ' and its cached 3D model';
@@ -427,7 +495,7 @@
   }
 
   function renderCredit(attr) {
-    const box = $('credit');
+    const box = $('badge');
     box.replaceChildren();
     if (!attr) return;
     box.append('3D model ');
@@ -439,48 +507,55 @@
   }
 
   const fmt = (v, d = 1, unit = '') => (v == null ? '—' : Number(v).toFixed(d) + unit);
+  const big = (id, value, unit) => { const el = $(id); el.replaceChildren(document.createTextNode(value + ' ')); const s = document.createElement('small'); s.textContent = unit; el.appendChild(s); };
 
   function renderTelemetry(t) {
     const inf = t.inference || {}, ipc = t.ipc || {}, mod = t.modulino || {}, mem = t.memory || {}, soc = t.soc || {};
     $('modePill').textContent = 'mode: ' + (t.mode || '—');
-    $('tEmbed').textContent = fmt(inf.embed_ms_median, 2, ' ms');
-    $('tEmbed95').textContent = fmt(inf.embed_ms_p95, 2, ' ms');
-    $('tDetect').textContent = fmt(inf.detect_ms_median, 2, ' ms');
-    const npu = t.npu || {}, models = inf.models || {}, em = models.embedder || {}, dm = models.detector || {};
-    const onNpu = [em.device === 'npu' ? 'embedder' : null, dm.device === 'npu' ? 'detector' : null].filter(Boolean);
-    const st = t.stream || {}, pools = t.memory_pools || {}, gc = pools.static_cache || {}, ring = pools.frame_ring || {};
-    $('tNpu').textContent = onNpu.length ? (st.live ? `active · ${onNpu.join(' + ')} · ${st.infer_fps} fps` : `ready · ${onNpu.join(' + ')} · idle (no frames)`)
-      : (npu.fastrpc_cdsp ? 'idle (CPU fallback)' : 'unavailable');
-    const src = st.source ? ` · from ${st.source.client} POST ${st.source.path} (${st.source.format})` : '';
-    $('kvStream').textContent = `Stream: ${st.live ? 'live' : 'idle'}${src} · camera ${st.ingest_fps ?? 0} fps → NPU ${st.infer_fps ?? 0} fps · ` +
-      `${st.ingested ?? 0} received / ${st.processed ?? 0} inferred / ${st.dropped ?? 0} superseded${st.rejected ? ` / ${st.rejected} REJECTED` : ''} · RAM pools: GLB/JS cache ${gc.mb ?? 0} MB ` +
-      `(${gc.files ?? 0} files, ${gc.hits ?? 0} hits) · frame ring ${ring.enabled ? `${ring.used_mb} / ${ring.budget_mb} MB, ${ring.frames} frames, ${ring.span_s}s` : 'off'}`;
-    $('kvNpu').textContent = `NPU: Hexagon cDSP ${npu.cdsp ? npu.cdsp.remoteproc + ' ' + npu.cdsp.state : '—'} · /dev/fastrpc-cdsp ${npu.fastrpc_cdsp ? 'present' : 'absent'}` +
-      ` · NSP ${npu.nsp_temp_c != null ? npu.nsp_temp_c + ' °C' : '—'} · embedder: ${em.model || '—'} [${em.runtime || em.device || '—'}]` +
-      ` · detector: ${dm.model || 'off'}${dm.runtime ? ' [' + dm.runtime + ']' : ''}`;
-    $('tCos').textContent = fmt(inf.cosine_similarity, 3);
-    $('tMarg').textContent = fmt(inf.margin, 3);
-    const rpc = ipc.bridge_rpc || {};
-    $('tBus').textContent = rpc.avg_ms != null ? `${fmt(rpc.avg_ms, 1)} ms avg · p95 ${fmt(rpc.p95_ms, 1)}` : (rpc.ok === false ? 'failing' : '—');
-    $('tLed').textContent = `${mod.status || '—'} · ${mod.leds_on ?? 0}/${mod.leds_total ?? 8} LED`;
+    // Host
+    const temps = (t.thermal || []).map((z) => z.temp_c).filter((v) => v != null);
+    big('tTemp', temps.length ? Math.max(...temps).toFixed(1) : '—', '°C max junction');
+    $('socSub').textContent = `${soc.arch || 'aarch64'} · ${soc.cores || 8} cores · ${soc.os || 'Ubuntu'}${soc.kernel ? ' · ' + soc.kernel : ''}`;
     $('tCpu').textContent = t.cpu_load ? `${t.cpu_load.total_pct}% · load ${t.cpu_load.loadavg_1m ?? '—'}` : '—';
-    const temps = (t.thermal || []).map((z) => z.temp_c);
-    $('tTemp').textContent = temps.length ? Math.max(...temps).toFixed(1) + ' °C' : '—';
-    $('tRam').textContent = mem.total_mb ? `${(mem.used_mb / 1024).toFixed(1)} / ${(mem.total_mb / 1024).toFixed(1)} GB (${mem.used_pct}%) · nominal ${mem.nominal_gb} GB` : '—';
-    $('ramBar').style.width = (mem.used_pct || 0) + '%';
+    $('tZones').textContent = temps.length ? `${temps.length} · min ${Math.min(...temps).toFixed(1)} °C` : '—';
+    $('tUp').textContent = t.uptime_s != null ? Math.floor(t.uptime_s / 3600) + ' h ' + Math.floor((t.uptime_s % 3600) / 60) + ' min' : '—';
     const fr = $('freqs'); fr.replaceChildren();
     (t.cpu_freq || []).forEach((c) => {
       const d = document.createElement('div');
-      const load = t.cpu_load && t.cpu_load.per_core_pct ? t.cpu_load.per_core_pct[c.cpu] : null;
-      d.textContent = `${c.cpu.replace('cpu', 'C')} ${c.mhz ?? '—'} MHz${load != null ? ' · ' + load + '%' : ''}`;
+      d.textContent = `${c.cpu.replace('cpu', 'C')} ${c.mhz != null ? (c.mhz / 1000).toFixed(2) + ' GHz' : '—'}`;
       fr.appendChild(d);
     });
-    const up = t.uptime_s != null ? Math.floor(t.uptime_s / 3600) + 'h ' + Math.floor((t.uptime_s % 3600) / 60) + 'm' : '—';
-    $('kvSoc').textContent = `SoC: ${soc.processor || soc.soc_machine || '—'} · ${soc.board_model || '—'} · ${soc.arch || ''} · ${soc.cores || '?'} cores · ${soc.os || ''} · kernel ${soc.kernel || ''} · up ${up}`;
-    const rs = ipc.router_socket || {};
-    $('kvIpc').textContent = `IPC: router socket ${rs.exists ? (rs.connectable ? 'connectable (' + fmt(rs.connect_ms, 2) + ' ms)' : 'present, refusing') : 'missing'} · ttyACM0 ${ (ipc.serial_bridge || {}).present ? 'present' : 'absent'} · ${mod.bus || ''}`;
-    $('kvThermal').textContent = 'Thermal: ' + ((t.thermal || []).map((z) => `${z.type || z.zone} ${z.temp_c}°C`).join(' · ') || '—');
-    $('kvInfer').textContent = `Inference: ${inf.backend || '—'} · ${inf.embedder || ''} · ${inf.samples || 0} samples · ${inf.accelerator || ''}`;
+    // Memory
+    big('tRam', mem.total_mb ? `${(mem.used_mb / 1024).toFixed(1)} / ${(mem.total_mb / 1024).toFixed(1)}` : '—', `GB used (${mem.used_pct ?? '—'}%)`);
+    $('ramBar').style.width = (mem.used_pct || 0) + '%';
+    $('tAvail').textContent = mem.available_mb != null ? (mem.available_mb / 1024).toFixed(1) + ' GB' : '—';
+    $('tTotalMem').textContent = mem.total_mb ? `${(mem.total_mb / 1024).toFixed(1)} GB of ${mem.nominal_gb || 16} GB` : '—';
+    const pools = t.memory_pools || {}, gc = pools.static_cache || {}, ring = pools.frame_ring || {};
+    $('tCache').textContent = `${gc.mb ?? 0} MB · ${gc.files ?? 0} files`;
+    $('tRing').textContent = ring.enabled ? `${ring.used_mb} / ${ring.budget_mb} MB · ${ring.frames} frames` : 'off';
+    // STM32 bridge
+    const rpc = ipc.bridge_rpc || {}, rs = ipc.router_socket || {};
+    big('tBus', rpc.avg_ms != null ? fmt(rpc.avg_ms, 1) : '—', 'ms set_pixels RPC (avg)');
+    $('tBridge').textContent = rpc.ok === true ? 'online' : rpc.ok === false ? 'failing' : 'unknown';
+    $('tRpc').textContent = `${fmt(rpc.p95_ms, 1, ' ms')} · ${rpc.calls_ok ?? 0} ok / ${rpc.calls_failed ?? 0} failed`;
+    $('tSock').textContent = rs.exists ? (rs.connectable ? `connectable · ${fmt(rs.connect_ms, 2, ' ms')}` : 'present, refusing') : 'missing';
+    $('tLed').textContent = `${mod.leds_on ?? 0}/${mod.leds_total ?? 8} lit · ${mod.color ? 'rgb(' + mod.color.join(',') + ')' : '—'} · bri ${mod.brightness ?? '—'}`;
+    // Edge-AI pipeline
+    const npu = t.npu || {}, models = inf.models || {}, em = models.embedder || {}, dm = models.detector || {};
+    const onNpu = [em.device === 'npu' ? 'embedder' : null, dm.device === 'npu' ? 'detector' : null].filter(Boolean);
+    const st = t.stream || {};
+    $('tRuntime').textContent = 'runtime: ' + (inf.accelerator || inf.backend || '—');
+    big('tFps', fmt(st.infer_fps ?? inf.fps, 1), `fps inferred · camera ${fmt(st.ingest_fps, 1)} fps`);
+    $('tNpu').textContent = onNpu.length ? (st.live ? `active · ${onNpu.join(' + ')}` : `ready · ${onNpu.join(' + ')} · idle`) : (npu.fastrpc_cdsp ? 'idle (CPU fallback)' : 'unavailable');
+    const gated = inf.empty_scene ? 'skipped · empty scene' : '—';
+    $('tEmbed').textContent = inf.embed_ms_median != null ? `${fmt(inf.embed_ms_median, 2, ' ms')} / ${fmt(inf.embed_ms_p95, 2, ' ms')}` : gated;
+    $('tDetect').textContent = inf.detect_ms_median != null ? fmt(inf.detect_ms_median, 2, ' ms') : gated;
+    $('tTotal').textContent = fmt(inf.total_ms_median, 1, ' ms');
+    $('tCos').textContent = `${fmt(inf.similarity_pct, 1, ' %')} · raw cos ${fmt(inf.cosine_similarity, 3)}`;
+    $('tMarg').textContent = fmt(inf.margin_pct, 1, ' %');
+    const sal = inf.saliency;
+    $('tGate').textContent = sal ? `${sal.laplacian_var ?? '—'} / ${sal.edge_density != null ? (sal.edge_density * 100).toFixed(2) + ' %' : '—'}${sal.empty ? ' · EMPTY' : ''}` : '—';
+    $('tDomain').textContent = inf.domain ? inf.domain.join(', ').replace(/_/g, ' ') : 'all classes';
   }
 
   async function pollTelemetry() {  // only used when EventSource is unavailable
@@ -503,7 +578,7 @@
     });
     const ph = mv.phase;
     const remaining = (mv.views || []).filter((v) => v.state !== 'done' && v.view !== mv.current_view).length;
-    $('capBtn').textContent = mv.current_title ? `Capture ${mv.current_title} & ${remaining ? 'Next' : 'Done'}` : 'Capture view & Next';
+    $('capBtn').textContent = mv.current_title ? `Capture ${mv.current_title} & ${remaining ? 'Next' : 'Done'}` : 'Capture Front 0° & Next';
     $('startBtn').disabled = mv.active;
     $('capBtn').disabled = ph !== 'ready';
     $('finishBtn').disabled = ph !== 'ready' || !(mv.views || []).some((v) => v.state === 'done');
@@ -515,12 +590,12 @@
   }
 
   function guidanceIcon(s) {
-    const g = s.guidance || '';
     const icon = $('hudIcon');
     icon.className = '';
     if (s.state !== 'GUIDING') { icon.textContent = ''; return; }
-    if (/flip/i.test(g)) { icon.textContent = '🔄'; icon.className = 'on'; }
-    else if (/tilt/i.test(g)) { icon.textContent = '↗'; icon.className = 'on'; }
+    if (s.hint === 'flip') { icon.textContent = '🔄'; icon.className = 'on'; }
+    else if (s.hint === 'tilt') { icon.textContent = '↗'; icon.className = 'on'; }
+    else if (s.hint === 'verify') { icon.textContent = '⌖'; icon.className = 'on'; }
     else { icon.textContent = '⟳'; icon.className = 'on rotate'; }
   }
 
@@ -535,34 +610,32 @@
     const live = isLive();
     $('conn').textContent = live ? `live · camera ${s.ingest_fps} fps → NPU ${s.fps} fps` :
       (s.stream && s.stream.live ? 'receiver receiving frames · connecting video…' : 'receiver up · awaiting camera stream');
-    $('hud').className = s.state;
+    $('statusPill').className = s.state;
+    $('statusPill').textContent = s.state === 'SEARCHING' && s.empty_scene ? 'SEARCHING · EMPTY' : s.state;
+    $('banner').className = s.state;
     $('hudText').textContent = s.guidance;
     guidanceIcon(s);
-    $('tLabel').textContent = s.label || '—';
-    $('tSim').textContent = s.label ? (s.similarity * 100).toFixed(1) + '%' : '—';
-    $('confBar').style.width = (s.label ? Math.max(0, Math.min(100, s.similarity * 100)) : 0) + '%';
-    $('tMargin').textContent = s.label ? s.margin.toFixed(3) : '—';
-    $('marginBar').style.width = (s.label ? Math.max(0, Math.min(100, s.margin / 0.4 * 100)) : 0) + '%';
-    $('viewPill').textContent = 'view: ' + (s.best_view || '—');
-    $('tTotal').textContent = s.latency_ms.total.toFixed(1) + ' ms';
-    $('tFps').textContent = s.fps.toFixed(1);
-    const led = s.led;
-    const sys = s.system || {};
-    $('tPoseMs').textContent = pose && pose.ms != null ? pose.ms + ' ms' : '—';
-    $('tPose').textContent = pose && pose.valid ? `${pose.pitch}° / ${pose.yaw}° / ${pose.roll}°` : '—';
-    $('tBackend').textContent = `${s.backend} · mode ${s.mode} · raw frames persisted: ${s.privacy && s.privacy.raw_frames_persisted ? 'YES' : 'no'}`;
-    renderLeds(led);
+    const shown = s.state !== 'SEARCHING' ? s.label : null;
+    $('tLabel').textContent = shown || '—';
+    const conf = Math.max(0, Math.min(1, s.confidence || 0)), marg = Math.max(0, Math.min(1, s.margin || 0));
+    $('tSim').textContent = (conf * 100).toFixed(1) + '%';
+    $('confBar').style.width = conf * 100 + '%';
+    $('confBar').style.background = COLORS[s.state];
+    $('tMargin').textContent = (marg * 100).toFixed(1) + '%';
+    $('marginBar').style.width = marg * 100 + '%';
+    $('viewPill').textContent = 'view: ' + (shown && s.best_view ? s.best_view : '—');
+    renderLeds(s.led);
     renderClasses(s.bank, s.confirmed_label);
     renderSteps(s.multiview);
 
     const src = new URL(s.glb_url, location.href).href;
     if (src !== lastSrc) { lastSrc = src; viewer.setAttribute('src', s.glb_url); }
-    const name = s.confirmed_label;
-    $('viewerLabel').textContent = name ? `${s.asset_title || name} · model ${s.asset_status}` : 'Showing default model.';
+    const name = s.confirmed_label || s.viewer_label;
+    $('viewerLabel').textContent = name ? `${s.asset_title || name} · ${s.asset_status}` : 'Default model';
+    $('refetchActiveBtn').disabled = !name;
     renderCredit(name ? s.asset_attribution : null);
     $('syncPill').textContent = syncPose ? (pose && pose.valid ? 'pose: syncing' : 'pose: no object') : 'pose: off';
     $('syncPill').className = 'pill' + (syncPose && pose && pose.valid ? ' on' : '');
-    if (name !== lastLabel) lastLabel = name;
     applyPose();
   }
 
@@ -602,11 +675,21 @@
     const j = await post('/api/db/save');
     if (j.ok) $('enrollMsg').textContent = 'Saved ' + j.path;
   };
+  $('rotBtn').onclick = () => {
+    autoRotate = !autoRotate;
+    $('rotBtn').classList.toggle('on', autoRotate);
+    if (autoRotate) { syncPose = false; $('syncBtn').classList.remove('on'); viewer.removeAttribute('orientation'); viewer.setAttribute('auto-rotate', ''); }
+    else viewer.removeAttribute('auto-rotate');
+  };
   $('syncBtn').onclick = () => {
     syncPose = !syncPose;
-    $('syncBtn').textContent = syncPose ? 'Sync Physical Pose' : 'Auto Rotate';
-    if (syncPose) { viewer.removeAttribute('auto-rotate'); applyPose(); }
-    else { viewer.setAttribute('auto-rotate', ''); viewer.removeAttribute('orientation'); viewer.setAttribute('camera-orbit', '45deg 75deg 1.5m'); }
+    $('syncBtn').classList.toggle('on', syncPose);
+    if (syncPose) { autoRotate = false; $('rotBtn').classList.remove('on'); viewer.removeAttribute('auto-rotate'); applyPose(); }
+    else { viewer.removeAttribute('orientation'); viewer.setAttribute('camera-orbit', '45deg 75deg auto'); }
+  };
+  $('refetchActiveBtn').onclick = () => {
+    const name = state && (state.confirmed_label || state.viewer_label);
+    if (name) refetchCad(name);
   };
 
   $('resolveBtn').onclick = async () => {
@@ -626,10 +709,11 @@
     if (j.glb_url) { viewer.setAttribute('src', j.glb_url + '?t=' + Date.now()); lastSrc = ''; renderCredit(j.attribution); }
     pullState();
   };
-  $('resetBtn').onclick = async () => {
-    if (!confirm('Delete ALL enrolled classes and their cached 3D models? This empties enrolled_classes.pt.')) return;
-    const j = await post('/api/classes/reset', { delete_cad: true });
-    if (j.ok) $('enrollMsg').textContent = `Removed ${j.removed.length} class(es).`;
+  $('purgeBtn').onclick = async () => {
+    if (!confirm('PURGE the training database?\n\nThis deletes EVERY enrolled class, removes enrolled_classes.pt from disk and clears their cached 3D models. This cannot be undone.')) return;
+    const j = await post('/api/classes/purge', { delete_cad: true });
+    if (j.ok) $('enrollMsg').textContent = `Purged ${j.removed} class(es); database file ${j.db_file_exists ? 'STILL PRESENT' : 'deleted'}; ${j.cad_removed} CAD cache(s) cleared.`;
+    classSig = '';
     pullState();
   };
 

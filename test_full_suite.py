@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 import cad_harvester
+import device_taxonomy
 import entity_resolver
 import mcp_server
 import taxonomy
@@ -1039,6 +1040,66 @@ class HexagonNpuLiveTests(unittest.TestCase):
             self.assertTrue(0.0 <= d.box[0] < d.box[2] <= 1.0 and 0.0 <= d.box[1] < d.box[3] <= 1.0, d)
         best_bus = max((d for d in found if d.label == "bus"), key=lambda d: d.score)
         self.assertGreater(best_bus.box[2] - best_bus.box[0], 0.7)  # the bus spans most of the 810x1080 frame width
+
+
+class DeviceTaxonomyTests(unittest.TestCase):
+    """Phone tiers, rear-weighted view reliability, front-screen detection and the detector domain gate."""
+
+    def test_view_reliability_ranks_back_first(self):
+        rel = {v: device_taxonomy.view_reliability(v) for v in ("back", "side", "top", "front")}
+        self.assertEqual(rel["back"], 1.0)
+        self.assertGreater(rel["side"], rel["top"])
+        self.assertAlmostEqual(rel["top"], rel["front"])
+        self.assertEqual(device_taxonomy.view_reliability(None), 1.0)
+        self.assertEqual(device_taxonomy.view_reliability("global"), 1.0)
+
+    def test_weighted_phone_score_prefers_back(self):
+        score, view = device_taxonomy.weighted_phone_score({"back": 0.80, "front": 0.85})
+        self.assertEqual(view, "back")
+        self.assertAlmostEqual(score, 0.80)
+        score, view = device_taxonomy.weighted_phone_score({"back": 0.40, "front": 0.90})
+        self.assertEqual(view, "front")
+        self.assertLess(score, 0.90)
+        self.assertAlmostEqual(device_taxonomy.weighted_average({"back": 1.0, "front": 0.0}), 0.65 / 0.75)
+
+    def test_front_dominates(self):
+        self.assertTrue(device_taxonomy.front_dominates({"front": 0.8, "back": 0.6}))
+        self.assertFalse(device_taxonomy.front_dominates({"front": 0.6, "back": 0.8}))
+        self.assertFalse(device_taxonomy.front_dominates({"front": 0.9}))
+
+    def test_tier_for(self):
+        t = device_taxonomy.tier_for
+        self.assertEqual(t({"category": "smartphone", "brand": "Apple", "raw_name": "iphone 15 pro max"}), "iphone_pro")
+        self.assertEqual(t({"category": "smartphone", "raw_name": "iphone 13"}), "iphone_standard")
+        self.assertEqual(t({"category": "smartphone", "raw_name": "s24 ultra"}), "samsung_ultra")
+        self.assertEqual(t({"category": "smartphone", "brand": "Samsung", "raw_name": "galaxy s22+"}), "samsung_standard_plus")
+        self.assertIsNone(t({"category": "beverage_can", "raw_name": "coke"}))
+        self.assertIsNone(t({"category": "smartphone", "raw_name": "pixel 8"}))
+        self.assertIsNone(t(None))
+
+    def test_disambiguation_prompt(self):
+        pro = {"category": "smartphone", "raw_name": "iphone 15 pro"}
+        base = {"category": "smartphone", "raw_name": "iphone 15"}
+        base2 = {"category": "smartphone", "raw_name": "iphone 12"}
+        ultra = {"category": "smartphone", "raw_name": "galaxy s24 ultra"}
+        plus = {"category": "smartphone", "raw_name": "galaxy s24 plus"}
+        self.assertIn("LiDAR", device_taxonomy.disambiguation_prompt(pro, base))
+        self.assertIn("periscope", device_taxonomy.disambiguation_prompt(ultra, plus))
+        self.assertEqual(device_taxonomy.disambiguation_prompt(base, base2), device_taxonomy.MSG_IPHONE_LAYOUT)
+        self.assertEqual(device_taxonomy.disambiguation_prompt(base, plus), device_taxonomy.MSG_CROSS_BRAND)
+        self.assertIsNone(device_taxonomy.disambiguation_prompt({"category": "beverage_can"}, None))
+
+    def test_domain_gate(self):
+        d = device_taxonomy.domain_for
+        self.assertEqual(d({"label": "cell phone", "score": 0.7}), device_taxonomy.PHONE_DOMAIN)
+        self.assertEqual(d({"label": "cup", "score": 0.5}), device_taxonomy.BEVERAGE_DOMAIN)
+        self.assertEqual(d({"label": "bottle", "score": 0.9}), device_taxonomy.BEVERAGE_DOMAIN)
+        self.assertIsNone(d({"label": "cell phone", "score": 0.49}))
+        self.assertIsNone(d({"label": "remote", "score": 0.9}))
+        self.assertIsNone(d({"label": "cup", "score": "bad"}))
+        self.assertIsNone(d(None))
+        self.assertEqual(device_taxonomy.describe("samsung_ultra")["lens_count"], 4)
+        self.assertIsNone(device_taxonomy.describe("nope"))
 
 
 if __name__ == "__main__":

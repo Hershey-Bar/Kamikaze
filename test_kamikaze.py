@@ -24,9 +24,17 @@ except ImportError:
 needs_torch = unittest.skipIf(torch is None, "PyTorch not installed")
 
 
-def jpeg(color=(120, 80, 40), size=(320, 240)):
+def jpeg(color=(120, 80, 40), size=(320, 240), textured=True):
+    """Solid-colour frames read as an empty reticle (scene gate); `textured` adds a checkerboard so the pipeline runs."""
+    img = Image.new("RGB", size, color)
+    if textured:
+        arr = np.asarray(img).copy()
+        yy, xx = np.mgrid[0:size[1], 0:size[0]]
+        mask = ((yy // 12 + xx // 12) % 2).astype(bool)
+        arr[mask] = 255 - arr[mask]
+        img = Image.fromarray(arr)
     buf = io.BytesIO()
-    Image.new("RGB", size, color).save(buf, "JPEG")
+    img.save(buf, "JPEG")
     return buf.getvalue()
 
 
@@ -162,18 +170,46 @@ class StateMachineTests(unittest.TestCase):
         out = self.feed(sm, [self.ident()])
         self.assertEqual(out["state"], receiver.IDENTIFIED)
         self.assertEqual(out["label"], "coke_can")
-        self.assertAlmostEqual(out["score"], 0.9)
+        self.assertAlmostEqual(out["score"], receiver.calibrate(0.9))
 
-    def test_small_margin_never_identifies_and_guides_after_four(self):
+    def test_small_margin_never_identifies_and_guides_after_three(self):
         sm = receiver.StateMachine()
-        amb = receiver.FrameScore("coke_can", 0.85, 0.80, "pepsi_can")
-        self.assertEqual(self.feed(sm, [amb] * 3)["state"], receiver.SEARCHING)
+        amb = receiver.FrameScore("coke_can", 0.95, 0.90, "pepsi_can")  # calibrated 0.90 vs 0.79: margin 0.10 < 0.15
+        self.assertLess(amb.margin, receiver.MIN_MARGIN)
+        self.assertEqual(self.feed(sm, [amb] * 2)["state"], receiver.SEARCHING)
         self.assertEqual(self.feed(sm, [amb])["state"], receiver.GUIDING)
 
     def test_mid_similarity_guides(self):
         sm = receiver.StateMachine()
-        out = self.feed(sm, [receiver.FrameScore("s25_ultra", 0.55, 0.0)] * 4)
+        out = self.feed(sm, [receiver.FrameScore("s25_ultra", 0.75, 0.0)] * 3)
         self.assertEqual(out["state"], receiver.GUIDING)
+
+    def test_background_cosine_calibrates_to_zero(self):
+        for raw in (-0.3, 0.0, 0.38, 0.45, receiver.CAL_FLOOR):
+            self.assertEqual(receiver.calibrate(raw), 0.0)
+        self.assertAlmostEqual(receiver.calibrate(1.0), 1.0)
+        self.assertAlmostEqual(receiver.calibrate(receiver.T_IDENT), receiver.C_IDENT)
+        sm = receiver.StateMachine()
+        out = self.feed(sm, [receiver.FrameScore("coke_can", 0.45, 0.40, "pepsi_can")] * 5)
+        self.assertEqual((out["state"], out["score"], out["margin"]), (receiver.SEARCHING, 0.0, 0.0))
+
+    def test_empty_scene_reads_zero(self):
+        sm = receiver.StateMachine()
+        self.feed(sm, [self.ident()] * 3)
+        out = self.feed(sm, [receiver.FrameScore(None, 0.0, empty=True)] * 3)
+        self.assertEqual((out["state"], out["score"], out["margin"]), (receiver.SEARCHING, 0.0, 0.0))
+        msg = receiver.guidance_message(out["state"], None, 0.0, empty=True)
+        self.assertEqual(msg, "Awaiting object inside center reticle...")
+        self.assertEqual(receiver.led_params(out["state"], out["score"]), (0, 100, 150, 15, 1))
+
+    def test_front_cap_limits_confidence(self):
+        sm = receiver.StateMachine()
+        f = receiver.FrameScore("iphone_16", 0.97, 0.5, "galaxy_s25", hint="flip", cap=0.35)
+        out = self.feed(sm, [f] * 3)
+        self.assertEqual(out["state"], receiver.GUIDING)
+        self.assertLessEqual(out["score"], 0.35)
+        self.assertEqual(receiver.guidance_message(out["state"], out["label"], out["score"], "flip"),
+                         "Front screen detected. Flip phone 180° to expose camera island and sensors.")
 
     def test_low_similarity_searches(self):
         sm = receiver.StateMachine()
@@ -301,10 +337,36 @@ class FakeExtractor:
 
 
 class FakeAssets:
+    def __init__(self):
+        self.refetched = []
+
     def peek(self, label):
         return {"glb_url": f"/static/models/{label}.glb", "status": "ready", "title": label}
 
     get = peek
+
+    def refetch(self, label):
+        self.refetched.append(label)
+        return True
+
+
+class FakeDetector:
+    device = "cpu"
+
+    def __init__(self, label="cell phone", score=0.9):
+        self.label, self.score = label, score
+
+    def detect(self, image):
+        return [receiver.npu_mod.Detection(self.label, self.score, (0.4, 0.3, 0.6, 0.7))] if self.label else []
+
+    def info(self):
+        return {"runtime": "fake"}
+
+
+def basis(i, dim=16):
+    v = torch.zeros(dim)
+    v[i] = 1.0
+    return v
 
 
 @needs_torch
@@ -371,7 +433,7 @@ class PipelineHttpTests(unittest.TestCase):
         rand = unit(3)
         rand = rand - (rand @ a) * a
         orth = torch.nn.functional.normalize(rand, dim=0)
-        mixed = 0.6 * a + 0.8 * orth  # cosine 0.6 to coke_can: between T_SEARCH and T_IDENT
+        mixed = 0.75 * a + 0.6614 * orth  # cosine 0.75 to coke_can: calibrated 0.48, between C_SEARCH and C_IDENT
         for _ in range(6):
             verdict = self.frame(mixed)
         self.assertEqual(verdict["state"], "GUIDING")
@@ -401,6 +463,104 @@ class PipelineHttpTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/nope")[0], 404)
         self.assertEqual(self.call("POST", "/api/unenroll", b'{"label": "ghost"}')[0], 404)
         self.assertEqual(json.loads(self.call("GET", "/state")[1])["state"], "SEARCHING")
+
+    def phone(self, label, front, back, extra=None):
+        meta = {"category": "smartphone", "raw_name": label.replace("_", " "), "brand": "Apple" if "iphone" in label else "Samsung"}
+        self.bank.add_multiview(label, {"front": [front] * 3, "back": [back] * 3, **(extra or {})}, meta)
+
+    def test_empty_reticle_is_gated_to_zero(self):
+        a = basis(0)
+        self.enroll("coke_can", a)
+        self.ext.vec = a
+        for _ in range(3):
+            status, data = self.call("POST", "/api/frame", jpeg(textured=False), "image/jpeg")
+            verdict = json.loads(data)
+        self.assertTrue(verdict["empty"])
+        self.assertEqual((verdict["state"], verdict["confidence"], verdict["margin"]), ("SEARCHING", 0.0, 0.0))
+        time.sleep(0.3)
+        self.assertEqual(self.leds_log[-1], (0, 100, 150, 15, 1))
+        state = json.loads(self.call("GET", "/api/state")[1])
+        self.assertEqual(state["guidance"], "Awaiting object inside center reticle...")
+        self.assertTrue(state["empty_scene"])
+        self.assertLess(state["saliency"]["laplacian_var"], receiver.LAPLACIAN_MIN)
+        self.assertEqual(state["detection"].get("skipped"), "empty_scene")
+        self.assertEqual(self.frame(a)["empty"], False)
+
+    def test_phone_front_capped_back_identified(self):
+        self.phone("iphone_16", basis(0), basis(1))
+        for _ in range(3):
+            verdict = self.frame(basis(0))
+        self.assertEqual(verdict["state"], "GUIDING")
+        self.assertLessEqual(verdict["confidence"], 0.35)
+        self.assertEqual(verdict["hint"], "flip")
+        state = json.loads(self.call("GET", "/api/state")[1])
+        self.assertEqual(state["guidance"], "Front screen detected. Flip phone 180° to expose camera island and sensors.")
+        self.assertTrue(state["front_dominant"])
+        time.sleep(0.3)
+        self.assertEqual(self.leds_log[-1], (255, 120, 0, 40, 4))
+        for _ in range(3):
+            verdict = self.frame(basis(1))
+        self.assertEqual((verdict["state"], verdict["label"]), ("IDENTIFIED", "iphone_16"))
+        self.assertGreaterEqual(verdict["confidence"], 0.75)
+        time.sleep(0.3)
+        self.assertEqual(self.leds_log[-1][:3], (0, 255, 0))
+
+    def test_close_phone_siblings_get_tier_prompt(self):
+        self.phone("iphone_15", basis(0), basis(1))
+        self.phone("iphone_15_pro", basis(2), basis(3))
+        live = torch.nn.functional.normalize(basis(1) * 1.0 + basis(3) * 0.95, dim=0)
+        for _ in range(3):
+            verdict = self.frame(live)
+        self.assertEqual(verdict["state"], "GUIDING")
+        self.assertEqual(verdict["hint"], "tilt")
+        state = json.loads(self.call("GET", "/api/state")[1])
+        self.assertIn("LiDAR", state["guidance"])
+
+    def test_detector_domain_gate_and_conflict(self):
+        self.pipe.detector = FakeDetector("cell phone", 0.9)
+        self.phone("galaxy_s25_ultra", basis(0), basis(1))
+        self.bank.add_multiview("coke_can", {"front": [basis(5)] * 3}, {"category": "beverage_can", "raw_name": "coke can"})
+        for _ in range(3):
+            verdict = self.frame(basis(5))
+        self.assertEqual(verdict["domain"], ["smartphone"])
+        self.assertNotEqual(verdict["label"], "coke_can")
+        self.assertEqual(verdict["state"], "GUIDING")
+        state = json.loads(self.call("GET", "/api/state")[1])
+        self.assertTrue(state["domain_conflict"])
+        self.assertEqual(state["guidance"], "Verifying object geometry... Hold steady in center.")
+        self.pipe.detector = FakeDetector("cup", 0.9)
+        for _ in range(3):
+            verdict = self.frame(basis(5))
+        self.assertEqual((verdict["state"], verdict["label"]), ("IDENTIFIED", "coke_can"))
+        self.pipe.detector = FakeDetector("cup", 0.3)  # below the 0.5 gate: no domain restriction
+        self.assertIsNone(self.frame(basis(1))["domain"])
+
+    def test_purge_deletes_db_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.bank.path = Path(tmp) / "enrolled_classes.pt"
+            self.enroll("coke_can", basis(0))
+            self.bank.save()
+            self.assertTrue(self.bank.path.exists())
+            status, data = self.call("POST", "/api/classes/purge", b'{"delete_cad": false}')
+            out = json.loads(data)
+            self.assertEqual(status, 200, data)
+            self.assertEqual((out["removed"], out["labels"], out["db_file_exists"]), (1, ["coke_can"], False))
+            self.assertFalse(self.bank.path.exists())
+            listing = json.loads(self.call("GET", "/api/classes")[1])
+            self.assertEqual((listing["count"], listing["classes"]), (0, {}))
+            self.assertEqual(json.loads(self.call("GET", "/api/state")[1])["state"], "SEARCHING")
+
+    def test_fetch_cad_endpoint(self):
+        self.enroll("coke_can", basis(0))
+        status, data = self.call("POST", "/api/classes/coke_can/fetch_cad", b"")
+        self.assertEqual(status, 202, data)
+        out = json.loads(data)
+        self.assertTrue(out["started"])
+        self.assertEqual(self.pipe.assets.refetched, ["coke_can"])
+        self.assertEqual(json.loads(self.call("GET", "/api/asset")[1])["glb_url"], "/static/models/coke_can.glb")
+        self.assertEqual(self.call("POST", "/api/classes/ghost/fetch_cad", b"")[0], 404)
+        row = json.loads(self.call("GET", "/api/classes")[1])["prototypes"]
+        self.assertIn("cad_path", row[0] if isinstance(row, list) else next(iter(row.values())))
 
     def test_blocking_enroll_and_busy(self):
         a = unit(5)

@@ -33,7 +33,7 @@ VIEW_STEPS = {
     },
 }
 
-MSG_PHONE_FLIP = "Phone detected. Flip to the rear side to reveal the camera island and branding."
+MSG_PHONE_FLIP = "Front screen detected. Flip phone 180° to expose camera island and sensors."
 MSG_PHONE_TILT = "Tilt phone 30° toward light to expose lens count and LiDAR sensor."
 
 _BRANDS = (
