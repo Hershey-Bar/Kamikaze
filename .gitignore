@@ -11,3 +11,7 @@ models/*.pte
 model.pte
 enrolled_classes.pt
 *.part
+.env
+static/models/*.json
+static/models/base/
+static/models/CREDITS.md

@@ -8,27 +8,28 @@ from __future__ import annotations
 import re
 
 CATEGORIES = ("beverage_can", "beverage_bottle", "smartphone")
-VIEWS = ("front", "back", "side", "detail")
+VIEWS = ("front", "back", "side", "top")
 VIEW_YAW = {"front": 0.0, "side": 90.0, "back": 180.0}
+LEGACY_VIEW_ALIASES = {"detail": "top"}
 
 VIEW_STEPS = {
     "beverage_can": {
         "front": ("Front (0°)", "Face the main label / branding toward the camera."),
         "back": ("Back (180°)", "Rotate the can to show the barcode and nutrition facts."),
         "side": ("Side (90°)", "Turn the can a quarter-turn to show its profile and seam."),
-        "detail": ("Top / detail", "Tilt the can toward the camera to show the pull-tab."),
+        "top": ("Top / detail", "Tilt the can toward the camera to show the pull-tab."),
     },
     "beverage_bottle": {
         "front": ("Front (0°)", "Face the main label toward the camera."),
         "back": ("Back (180°)", "Rotate the bottle to show the barcode and nutrition facts."),
         "side": ("Side (90°)", "Turn the bottle a quarter-turn to show its profile."),
-        "detail": ("Cap / detail", "Hold the bottle so the cap and neck fill the box."),
+        "top": ("Cap / detail", "Hold the bottle so the cap and neck fill the box."),
     },
     "smartphone": {
         "front": ("Front (0°)", "Show the screen side facing the camera."),
         "back": ("Back (180°)", "Flip the phone to show the rear shell and camera island."),
         "side": ("Side (90°)", "Show the phone edge-on to expose the button rails and frame."),
-        "detail": ("Camera island", "Bring the rear camera island close, filling the box."),
+        "top": ("Camera island", "Bring the rear camera island close, filling the box."),
     },
 }
 
@@ -126,7 +127,7 @@ def parse_metadata(req: dict) -> dict:
     else:
         package = package or ("bottle" if category == "beverage_bottle" else "can")
         if not variant:
-            if re.search(r"zero|no sugar|sugar[\s\-]?free", haystack):
+            if re.search(r"zero|no sugar|sugar[\s\-]?free|pepsi\s*max", haystack):
                 variant = "zero"
             elif re.search(r"\bdiet\b|\blight\b", haystack):
                 variant = "diet"
@@ -216,6 +217,11 @@ def search_queries(meta: dict) -> list[str]:
             seen.add(q.lower())
             out.append(q)
     return out
+
+
+def canonical_view(name: str) -> str:
+    """Map a legacy view key (``detail``) onto the current one (``top``)."""
+    return LEGACY_VIEW_ALIASES.get(name, name)
 
 
 def view_step(category: str, view: str) -> tuple[str, str]:

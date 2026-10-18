@@ -5,7 +5,7 @@ NumPy only (no OpenCV needed), ~1-2 ms per frame on 72x72 pixels:
   * yaw   - view matching: the live embedding is compared with the enrolled front/side/back centroids and
             the matches are blended on the yaw circle (front 0, side +/-90, back 180). For phones the
             apparent width/height ratio (oriented-box foreshortening) refines the magnitude.
-  * pitch - top/detail-view weight plus the perspective taper of the mask along its major axis.
+  * pitch - top-view weight plus the perspective taper of the mask along its major axis.
 The result is an approximation intended to drive the dashboard's 3D model, not a metrology-grade pose.
 """
 
@@ -118,7 +118,7 @@ class PoseEstimator:
 
     @staticmethod
     def _view_yaw(view_sims: dict[str, float], prev_yaw: float) -> tuple[float | None, float, str | None]:
-        """Blend view-centroid similarities on the yaw circle. Returns (yaw, detail_weight, best_view)."""
+        """Blend view-centroid similarities on the yaw circle. Returns (yaw, top_weight, best_view)."""
         if not view_sims:
             return None, 0.0, None
         top = max(view_sims.values())
@@ -134,7 +134,7 @@ class PoseEstimator:
                 x += w * math.cos(ang)
                 y += w * math.sin(ang)
         yaw = math.degrees(math.atan2(y, x)) if (x or y) else None
-        return yaw, weights.get("detail", 0.0), best
+        return yaw, weights.get("top", 0.0), best
 
     def update(self, image: Image.Image, box: tuple[int, int, int], view_sims: dict[str, float] | None,
                label: str | None = None, category: str | None = None) -> dict:
@@ -156,20 +156,20 @@ class PoseEstimator:
         geo = measure(mask)
 
         roll = geo["roll"] if geo["elongation"] > 0.12 else 0.0
-        yaw_view, detail_w, best = self._view_yaw(view_sims or {}, prev["yaw"])
+        yaw_view, top_w, best = self._view_yaw(view_sims or {}, prev["yaw"])
         yaw = yaw_view if yaw_view is not None else prev["yaw"]
 
         if category == "smartphone" and best in ("front", "back") and geo["elongation"] > 0.12:
             aspect = geo["aspect"]
             self._ref_aspect = aspect if self._ref_aspect is None else max(0.9 * self._ref_aspect + 0.1 * aspect, aspect * 0.9)
-        if category == "smartphone" and self._ref_aspect and best != "detail":
+        if category == "smartphone" and self._ref_aspect and best != "top":
             asp_yaw = math.degrees(math.acos(max(0.0, min(1.0, geo["aspect"] / self._ref_aspect))))
             fold = min(abs(yaw), 180.0 - abs(yaw)) if yaw_view is not None else 0.0
             fold = 0.5 * fold + 0.5 * asp_yaw
             sign = -1.0 if yaw < 0 else 1.0
             yaw = sign * (fold if abs(yaw) <= 90.0 else 180.0 - fold)
 
-        pitch = -75.0 * detail_w + max(-45.0, min(45.0, geo["taper"] * 120.0))
+        pitch = -75.0 * top_w + max(-45.0, min(45.0, geo["taper"] * 120.0))
 
         if self._pose is None:
             sm = {"pitch": pitch, "yaw": yaw, "roll": roll}

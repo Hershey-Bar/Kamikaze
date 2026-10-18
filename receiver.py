@@ -7,35 +7,45 @@ One process, one port (0.0.0.0:5000):
   GET  /api/state                    live telemetry (state, top-1, confidence, guidance, LEDs, ...)
   GET  /api/asset                    active 3D asset for the identified object
   GET  /api/frame.jpg                latest camera frame (dashboard live view)
-  GET  /api/classes                  enrolled classes (+ multi-view prototype details)
+  GET  /api/classes                  enrolled classes: metadata, view count, created_at, CAD status/credit
+  DELETE /api/classes/<id>[?delete_cad=1]   remove one class (and optionally its cached GLB); updates enrolled_classes.pt
+  POST /api/classes/reset            {"delete_cad": false} drop every enrolled class
+  POST /api/resolve                  {"text": "coke zero can 330ml"} -> canonical product (class_id, brand, tier, CAD terms)
+  GET  /api/telemetry                SoC identity, thermals, per-core freq/load, RAM, uptime, router IPC, bridge latency,
+                                     Wire1/Modulino status, ExecuTorch median/p95, cosine/margin, FPS (SSE: /api/telemetry/stream)
+  GET  /api/credits                  author/licence attribution of every cached 3D model
   POST /api/enroll                   legacy single-shot {"label": "coke_can", "frames": 12, "append": false, "wait": false}
   POST /api/unenroll                 {"label": "coke_can"}
   POST /api/enroll/start             multi-view guided enrollment: {"raw_name", "category", "brand", "variant",
                                      "package_type", "container_volume", "frames_per_view": 8}
-  POST /api/enroll/capture           {"view": "front|back|side|detail", "wait": false} capture the current/named view
+  POST /api/enroll/capture           {"view": "front|back|side|top", "wait": false} capture the current/named view
   POST /api/enroll/finish | /cancel  finish early with the captured views / abort the session
   GET  /api/enroll/status            wizard state (current view, per-view progress + stability)
   GET  /api/pose                     smoothed physical pose {"pitch", "yaw", "roll"}
   GET  /api/events                   Server-Sent Events stream of the live state (10 Hz, change-driven)
   POST /api/db/save | GET /api/db/export   persist / download the enrolled class database
-  POST /api/cad/fetch                {"label": "...", "force": true} (re)retrieve the CAD model
+  POST /api/cad/fetch                {"raw_name": "...", "force": true} resolve + (re)harvest the CAD model, with attribution
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
 Pipeline per frame: center-60% crop -> 224x224 ImageNet normalisation -> MobileNetV3-Large embedding
 (ExecuTorch/XNNPACK fp16 on the Arm CPU, torch eager as fallback) -> L2-normalised vector -> cosine
-similarity against the multi-view prototypes (front/back/side/detail centroids + global centroid) -> 5-frame
+similarity against the multi-view prototypes (front/back/side/top centroids + global centroid) -> 5-frame
 temporal state machine -> Modulino Pixels via the Arduino Router socket (STM32 firmware untouched), 3D CAD
 retrieval and physical pose estimation (pose.py).
 
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|executorch|torch),
 KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_T_IDENT/T_SEARCH/MARGIN,
-KAMIKAZE_LOG_FRAMES (1|0).
+KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s).
+
+Privacy: no raw image is ever written to disk or accumulated; only 1280-d vectors reach enrolled_classes.pt. The
+dashboard's live view keeps ONE most-recent JPEG in RAM (overwritten every frame; disabled in deployment mode).
 """
 
 from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import io
 import json
 import logging
@@ -43,9 +53,11 @@ import math
 import mimetypes
 import os
 import re
+import shutil
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -60,16 +72,15 @@ try:
 except ImportError:  # the state machine / HTTP layer stay importable without torch (e.g. on a laptop)
     torch = None
 
-import cad_retriever
+import cad_harvester
+import entity_resolver
 import pose as pose_mod
 import taxonomy
+import telemetry
 from mcp_server import (
-    FALLBACK_MODELS,
     STATIC_DIR,
-    download_glb,
     is_valid_glb,
     local_glb_path,
-    search_3d_asset,
     set_leds,
     slugify,
 )
@@ -85,6 +96,9 @@ EMBED_BACKEND = os.environ.get("KAMIKAZE_EMBED_BACKEND", "auto")
 EMBED_PRECISION = os.environ.get("KAMIKAZE_EMBED_PRECISION", "fp16")
 TORCH_THREADS = int(os.environ.get("KAMIKAZE_TORCH_THREADS", "1"))
 LOG_FRAMES = os.environ.get("KAMIKAZE_LOG_FRAMES", "1") != "0"
+LED_HEARTBEAT_S = float(os.environ.get("KAMIKAZE_LED_HEARTBEAT", "5"))
+MODE = os.environ.get("KAMIKAZE_MODE", "training").strip().lower()  # training | deployment
+PREVIEW_FRAME = os.environ.get("KAMIKAZE_PREVIEW", "1" if MODE == "training" else "0") != "0"
 
 INPUT_SIZE = 224
 CROP_FRACTION = 0.60
@@ -123,6 +137,7 @@ MIN_VIEW_FRAMES = 4
 MV_IDLE_EXPIRE_S = 900.0
 SSE_PERIOD_S = 0.1
 SSE_KEEPALIVE_S = 1.0
+TELEMETRY_PERIOD_S = float(os.environ.get("KAMIKAZE_TELEMETRY_PERIOD", "1.0"))
 
 
 # --------------------------------------------------------------------------------------
@@ -239,6 +254,10 @@ class FeatureExtractor:
 _LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,39}$")
 
 
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
 def normalize_label(raw: object) -> str:
     label = re.sub(r"[\s\-]+", "_", str(raw or "").strip().lower())
     if not _LABEL_RE.match(label):
@@ -250,7 +269,7 @@ class EmbeddingBank:
     """label -> exemplar embeddings and prototypes.
 
     Each label has a global L2-normalised centroid and, for multi-view enrollments, angle-tagged view centroids
-    (front/back/side/detail) plus metadata and the resolved CAD asset. A label's score for a live vector is the
+    (front/back/side/top) plus metadata and the resolved CAD asset. A label's score for a live vector is the
     best cosine over its global and view centroids.
     """
 
@@ -263,8 +282,9 @@ class EmbeddingBank:
         self.view_counts: dict[str, dict[str, int]] = {}
         self.meta: dict[str, dict] = {}
         self.cad: dict[str, dict | None] = {}
-        self._labels: list[str] = []
+        self.created: dict[str, str] = {}
         self._rows: list[str] = []
+        self._labels: list[str] = []
         self._matrix = None
 
     def _rebuild(self) -> None:
@@ -303,6 +323,7 @@ class EmbeddingBank:
             self.views.pop(label, None)
             self.view_counts.pop(label, None)
             self.meta.setdefault(label, {})
+            self.created.setdefault(label, _now_iso())
             self._rebuild()
             self.save()
             return {"label": label, "vectors": int(stack.shape[0]), "consistency": round(float((stack @ centroid).mean()), 4)}
@@ -327,6 +348,7 @@ class EmbeddingBank:
             self.view_counts[label] = counts
             self.meta[label] = dict(metadata)
             self.cad.setdefault(label, None)
+            self.created[label] = _now_iso()
             self._rebuild()
             self.save()
             stack = torch.stack(all_vecs)
@@ -340,11 +362,21 @@ class EmbeddingBank:
             if label not in self.centroids:
                 return False
             del self.centroids[label]
-            for table in (self.exemplars, self.views, self.view_counts, self.meta, self.cad):
+            for table in (self.exemplars, self.views, self.view_counts, self.meta, self.cad, self.created):
                 table.pop(label, None)
             self._rebuild()
             self.save()
             return True
+
+    def reset(self) -> int:
+        """Drop every enrolled class and persist the empty database. Returns how many were removed."""
+        with self._lock:
+            n = len(self.centroids)
+            for table in (self.exemplars, self.centroids, self.views, self.view_counts, self.meta, self.cad, self.created):
+                table.clear()
+            self._rebuild()
+            self.save()
+            return n
 
     def scores(self, vec) -> list[tuple[str, float]]:
         """Best cosine similarity per label over its global + view centroids, best first."""
@@ -379,11 +411,20 @@ class EmbeddingBank:
 
     def info(self) -> list[dict]:
         with self._lock:
-            return [
-                {"label": k, "vectors": len(self.exemplars.get(k, [])), "views": dict(self.view_counts.get(k, {})),
-                 "metadata": dict(self.meta.get(k) or {}), "cad_asset": self.cad.get(k)}
-                for k in self._labels
-            ]
+            return [self._entry_info(k) for k in self._labels]
+
+    def _entry_info(self, k: str) -> dict:
+        meta = dict(self.meta.get(k) or {})
+        cad = self.cad.get(k)
+        counts = dict(self.view_counts.get(k, {}))
+        return {
+            "label": k, "class_id": k, "canonical_name": taxonomy.display_name(meta) if meta else k.replace("_", " ").title(),
+            "vectors": len(self.exemplars.get(k, [])), "views": counts, "view_count": len(counts),
+            "metadata": meta, "category": meta.get("category"), "created_at": self.created.get(k),
+            "cad_asset": cad, "cad_model_url": (cad or {}).get("glb_url") or None,
+            "cad_status": "ready" if cad and cad.get("glb_url") else "missing",
+            "cad_source": (cad or {}).get("source"), "cad_credit": (cad or {}).get("credit"),
+        }
 
     def save(self) -> None:
         if self.path is None:
@@ -391,11 +432,16 @@ class EmbeddingBank:
         with self._lock:
             prototypes = {}
             for label in self.centroids:
+                entry = self._entry_info(label)
                 prototypes[label] = {
+                    "class_id": label,
+                    "canonical_name": entry["canonical_name"],
                     "metadata": dict(self.meta.get(label) or {}),
+                    "cad_model_url": entry["cad_model_url"],
                     "views": dict(self.views.get(label, {})),
                     "view_counts": dict(self.view_counts.get(label, {})),
                     "global_centroid": self.centroids[label],
+                    "created_at": self.created.get(label),
                     "cad_asset": self.cad.get(label),
                 }
             payload = {
@@ -422,10 +468,15 @@ class EmbeddingBank:
                 self.exemplars = {k: list(v.unbind(0)) for k, v in data["exemplars"].items()}
                 self.centroids = {k: v.float() for k, v in data["centroids"].items()}
                 protos = data.get("prototypes") or {}
-                self.views = {k: {vn: vv.float() for vn, vv in (p.get("views") or {}).items()} for k, p in protos.items()}
-                self.view_counts = {k: dict(p.get("view_counts") or {}) for k, p in protos.items()}
+                self.views = {k: {taxonomy.canonical_view(vn): vv.float() for vn, vv in (p.get("views") or {}).items()}
+                              for k, p in protos.items()}
+                self.view_counts = {k: {taxonomy.canonical_view(vn): int(n) for vn, n in (p.get("view_counts") or {}).items()}
+                                    for k, p in protos.items()}
                 self.meta = {k: dict(p.get("metadata") or {}) for k, p in protos.items()}
                 self.cad = {k: p.get("cad_asset") for k, p in protos.items()}
+                self.created = {k: p.get("created_at") or _now_iso() for k, p in protos.items()}
+                for k in self.centroids:
+                    self.created.setdefault(k, _now_iso())
                 self._rebuild()
             return len(self.centroids)
         except Exception as exc:
@@ -524,7 +575,7 @@ class Enroller:
 
 
 class MultiViewEnroller:
-    """Guided 4-angle enrollment wizard: front -> back -> side -> detail, N frames per view.
+    """Guided 4-angle enrollment wizard: front -> back -> side -> top, N frames per view.
 
     Phases: idle -> ready (waiting for the user to present the current view) -> capturing -> ready (next view)
     ... -> done. A view can be re-captured, and the session can be finished early once a view exists.
@@ -559,7 +610,9 @@ class MultiViewEnroller:
         return self.phase in ("ready", "capturing")
 
     def start(self, meta: dict, frames_per_view: int = FRAMES_PER_VIEW) -> dict:
-        label = normalize_label(taxonomy.label_from_metadata(meta))
+        product = entity_resolver.resolve_metadata(meta)
+        meta = {**meta, **product.metadata()}
+        label = normalize_label(product.class_id)
         if not 3 <= frames_per_view <= 60:
             raise ValueError("frames_per_view must be 3-60")
         with self._cond:
@@ -798,13 +851,24 @@ def capture_led_params(collected: int, total: int) -> tuple[int, int, int, int, 
 
 
 class LedDriver:
-    def __init__(self, setter: Callable[..., bool] = set_leds) -> None:
+    """Sends set_pixels over the router socket on a worker thread; tracks bridge RPC latency / success.
+
+    When idle it re-sends the last successful params every KAMIKAZE_LED_HEARTBEAT seconds (same colour, so the LEDs
+    do not change) which keeps the bridge latency / health figures live. 0 disables the heartbeat.
+    """
+
+    def __init__(self, setter: Callable[..., bool] = set_leds, heartbeat_s: float | None = None) -> None:
         self._setter = setter
         self._cv = threading.Condition()
         self._target: tuple | None = None
         self._sent: tuple | None = None
         self.ok: bool | None = None
         self.latency_ms = 0.0
+        self.heartbeat_s = LED_HEARTBEAT_S if heartbeat_s is None else heartbeat_s
+        self._lat: collections.deque = collections.deque(maxlen=60)
+        self.n_ok = 0
+        self.n_fail = 0
+        self.last_ok_at: float | None = None
         threading.Thread(target=self._run, name="led", daemon=True).start()
 
     def set(self, params: tuple) -> None:
@@ -816,7 +880,9 @@ class LedDriver:
         while True:
             with self._cv:
                 while self._target is None or self._target == self._sent:
-                    self._cv.wait()
+                    woke = self._cv.wait(self.heartbeat_s if self.heartbeat_s > 0 else None)
+                    if not woke and self._target is not None and self.heartbeat_s > 0:
+                        break  # idle heartbeat: re-send the unchanged target
                 params = self._target
             t0 = time.perf_counter()
             try:
@@ -828,8 +894,15 @@ class LedDriver:
                 self.ok = ok
                 self.latency_ms = (time.perf_counter() - t0) * 1000.0
                 if ok:
+                    first = self._target != self._sent or self._sent is None
                     self._sent = params
-                    log.info("LEDs set_pixels%s -> ok (%.1f ms)", params, self.latency_ms)
+                    self.n_ok += 1
+                    self.last_ok_at = time.time()
+                    self._lat.append(self.latency_ms)
+                    if first:
+                        log.info("LEDs set_pixels%s -> ok (%.1f ms)", params, self.latency_ms)
+                else:
+                    self.n_fail += 1
             if not ok:
                 time.sleep(1.0)
 
@@ -837,7 +910,10 @@ class LedDriver:
         with self._cv:
             r, g, b, brightness, count = self._target or (0, 0, 0, 0, 0)
             return {"r": r, "g": g, "b": b, "brightness": brightness, "count": count, "ok": self.ok,
-                    "latency_ms": round(self.latency_ms, 1)}
+                    "latency_ms": round(self.latency_ms, 1),
+                    "latency_avg_ms": round(sum(self._lat) / len(self._lat), 2) if self._lat else None,
+                    "latency_p95_ms": telemetry.percentile(self._lat, 95), "rpc_ok": self.n_ok, "rpc_fail": self.n_fail,
+                    "last_ok_age_s": round(time.time() - self.last_ok_at, 1) if self.last_ok_at else None}
 
 
 # --------------------------------------------------------------------------------------
@@ -862,8 +938,11 @@ class AssetManager:
             info = dict(self._info.get(label, {}))
             busy = label in self._inflight
         if is_valid_glb(local_glb_path(slug)):
-            return {"glb_url": f"/static/models/{slug}.glb", "status": "ready", "title": info.get("title", label)}
-        return {"glb_url": DEFAULT_GLB_URL, "status": "resolving" if busy else "pending", "title": info.get("title", label)}
+            attr = cad_harvester.read_attribution(label) or {}
+            return {"glb_url": f"/static/models/{slug}.glb", "status": "ready", "title": attr.get("title") or info.get("title", label),
+                    "attribution": attr or None, "credit": cad_harvester.attribution_line(attr) if attr else ""}
+        return {"glb_url": DEFAULT_GLB_URL, "status": "resolving" if busy else "pending", "title": info.get("title", label),
+                "attribution": None, "credit": ""}
 
     def get(self, label: str) -> dict:
         entry = self.peek(label)
@@ -880,13 +959,14 @@ class AssetManager:
     def _resolve(self, label: str) -> None:
         try:
             meta = self.meta_lookup(label) if self.meta_lookup else None
-            result = cad_retriever.retrieve(label, meta) if meta else search_3d_asset(label)
+            result = cad_harvester.retrieve(label, meta)
             with self._lock:
                 if result.get("glb_url"):
                     self._info[label] = {"title": result.get("title", label), "source": result.get("source") or result.get("status")}
                     self._failed_at.pop(label, None)
                     if self.on_resolved:
-                        self.on_resolved(label, {k: result.get(k) for k in ("title", "glb_url", "source", "status", "query")})
+                        self.on_resolved(label, {k: result.get(k) for k in
+                                                 ("title", "glb_url", "source", "status", "query", "attribution", "credit")})
                 else:
                     self._failed_at[label] = time.monotonic()
         except Exception:
@@ -902,7 +982,9 @@ class AssetManager:
 
         def work() -> None:
             if not is_valid_glb(local_glb_path("default")):
-                download_glb(FALLBACK_MODELS["_generic_phone"]["model_url"], "default")
+                base = cad_harvester.ensure_base_models().get("smartphone")
+                if base:
+                    shutil.copyfile(base, local_glb_path("default"))
             vendor = STATIC_DIR / "vendor" / "model-viewer.min.js"
             if not vendor.is_file() or vendor.stat().st_size < 50_000:
                 try:
@@ -985,7 +1067,10 @@ class Pipeline:
         self._infer_lock = threading.Lock()
         self._frame_lock = threading.Lock()
         self._snap_lock = threading.Lock()
-        self._latest_jpeg: bytes | None = None
+        self._latest_jpeg: bytes | None = None  # single most-recent preview frame, in RAM only, overwritten each frame
+        self._embed_lat: collections.deque = collections.deque(maxlen=240)
+        self._total_lat: collections.deque = collections.deque(maxlen=240)
+        self._started = time.time()
         self._frames = 0
         self._fps = 0.0
         self._last_frame_mono = 0.0
@@ -1025,9 +1110,10 @@ class Pipeline:
         except Exception as exc:
             raise ValueError(f"undecodable image: {exc}") from exc
         image = image.convert("RGB")
-        with self._frame_lock:
-            self._latest_jpeg = data
-
+        if PREVIEW_FRAME:
+            with self._frame_lock:
+                self._latest_jpeg = data
+        del data
         with self._infer_lock:
             arr = preprocess(image)
             t1 = time.perf_counter()
@@ -1074,6 +1160,8 @@ class Pipeline:
                 self._fps = inst if self._fps == 0 else 0.8 * self._fps + 0.2 * inst
             self._last_frame_mono = now
             total_ms = (time.perf_counter() - t0) * 1000.0
+            self._embed_lat.append((t2 - t1) * 1000.0)
+            self._total_lat.append(total_ms)
             with self._snap_lock:
                 self._last = {
                     "label": frame.label, "similarity": frame.s1, "confidence": score, "margin": snap["margin"],
@@ -1123,6 +1211,19 @@ class Pipeline:
                 self.leds.set(led_params(SEARCHING, 0.0))
             return removed
 
+    def reset_bank(self) -> int:
+        with self._infer_lock:
+            n = self.bank.reset()
+            self.sm.reset()
+            self.pose_est.reset()
+            self._viewer_label = None
+            with self._snap_lock:
+                self._last.update(label=None, similarity=0.0, confidence=0.0, margin=0.0, top2=None,
+                                  state=SEARCHING, guidance=MSG_SEARCHING)
+            self.leds.set(led_params(SEARCHING, 0.0))
+        self._bump()
+        return n
+
     def snapshot(self) -> dict:
         with self._snap_lock:
             last = dict(self._last)
@@ -1146,6 +1247,11 @@ class Pipeline:
             "action": {IDENTIFIED: "none", GUIDING: "reorient"}.get(state, "present_object"),
             "glb_url": viewer["glb_url"],
             "asset_status": viewer["status"],
+            "asset_title": viewer.get("title", ""),
+            "asset_credit": viewer.get("credit", ""),
+            "asset_attribution": viewer.get("attribution"),
+            "mode": MODE,
+            "privacy": self.privacy(),
             "latency_ms": {"embed": round(last["embed_ms"], 1), "total": round(last["total_ms"], 1)},
             "fps": round(self._fps, 1),
             "frames": self._frames,
@@ -1165,6 +1271,48 @@ class Pipeline:
             "thresholds": {"identified": T_IDENT, "searching": T_SEARCH, "margin": MIN_MARGIN},
         }
 
+    def privacy(self) -> dict:
+        with self._frame_lock:
+            held = self._latest_jpeg is not None
+        return {"raw_frames_persisted": False, "images_written_to_disk": False, "stored_in_class_db": "1280-d vectors only",
+                "preview_frame_in_ram": bool(PREVIEW_FRAME and held), "preview_enabled": PREVIEW_FRAME, "mode": MODE}
+
+    def telemetry_snapshot(self) -> dict:
+        """Hardware (/proc, /sys), bridge IPC, and inference telemetry for GET /api/telemetry."""
+        hw = telemetry.hardware()
+        led = self.leds.status()
+        with self._snap_lock:
+            last = dict(self._last)
+        embed = list(self._embed_lat)
+        total = list(self._total_lat)
+        router = hw["router"]
+        led_ok = led["ok"]
+        return {
+            "ok": True, "time": time.time(), "mode": MODE, **hw,
+            "ipc": {"router_socket": router, "serial_bridge": hw["serial"],
+                    "bridge_rpc": {"ok": led_ok, "last_ms": led["latency_ms"], "avg_ms": led["latency_avg_ms"],
+                                   "p95_ms": led["latency_p95_ms"], "calls_ok": led["rpc_ok"], "calls_failed": led["rpc_fail"],
+                                   "last_ok_age_s": led["last_ok_age_s"]}},
+            "modulino": {
+                "bus": "Wire1 (I2C4) on the STM32H5F5 (reached through arduino-router; not visible to Linux i2c-dev)",
+                "device": "Modulino Pixels", "status": "online" if led_ok else ("unreachable" if led_ok is False else "unknown"),
+                "color": [led["r"], led["g"], led["b"]], "brightness": led["brightness"], "leds_on": led["count"],
+                "leds_total": 8, "bus_latency_ms": led["latency_ms"],
+            },
+            "inference": {
+                "backend": self.extractor.name, "embedder": EMBEDDER_ID, "embed_dim": EMBED_DIM,
+                "embed_ms_last": round(embed[-1], 2) if embed else None,
+                "embed_ms_median": telemetry.percentile(embed, 50), "embed_ms_p95": telemetry.percentile(embed, 95),
+                "total_ms_median": telemetry.percentile(total, 50), "total_ms_p95": telemetry.percentile(total, 95),
+                "samples": len(embed), "fps": round(self._fps, 1), "frames": self._frames,
+                "cosine_similarity": round(last["similarity"], 4), "margin": round(last["margin"], 4),
+                "confidence": round(last["confidence"], 4), "label": last["label"],
+                "accelerator": "Arm CPU (XNNPACK); the Hexagon NPU is not used",
+            },
+            "privacy": self.privacy(),
+            "uptime_service_s": round(time.time() - self._started, 1),
+        }
+
     def asset_payload(self) -> dict:
         snap = self.snapshot()
         return {
@@ -1176,6 +1324,9 @@ class Pipeline:
             "camera_orbit": CAMERA_ORBIT,
             "guidance": snap["guidance"],
             "asset_status": snap["asset_status"],
+            "title": snap["asset_title"],
+            "credit": snap["asset_credit"],
+            "attribution": snap["asset_attribution"],
         }
 
 
@@ -1231,7 +1382,14 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/api/asset", "/asset"):
             return self._json(200, p.asset_payload())
         if path == "/api/classes":
-            return self._json(200, {"ok": True, "classes": p.bank.counts(), "prototypes": p.bank.info()})
+            return self._json(200, {"ok": True, "count": len(p.bank.labels()), "classes": p.bank.counts(),
+                                    "prototypes": p.bank.info(), "db_path": str(p.bank.path) if p.bank.path else None})
+        if path == "/api/telemetry":
+            return self._json(200, p.telemetry_snapshot())
+        if path == "/api/telemetry/stream":
+            return self._telemetry_sse()
+        if path == "/api/credits":
+            return self._json(200, {"ok": True, "credits": cad_harvester.credits()})
         if path == "/api/pose":
             snap = p.snapshot()
             return self._json(200, {"ok": True, "pose": snap["pose"], "label": snap["label"], "state": snap["state"],
@@ -1248,11 +1406,42 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/frame.jpg":
             frame = p.latest_jpeg
             if frame is None:
-                return self._json(404, {"ok": False, "error": "no frame received yet"})
+                return self._json(404, {"ok": False, "error": "no frame received yet" if PREVIEW_FRAME else "preview disabled (deployment mode)"})
             return self._send(200, frame, "image/jpeg")
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
         self._json(404, {"ok": False, "error": "not found"})
+
+    def _telemetry_sse(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                self.wfile.write(b"data: " + json.dumps(self.pipeline.telemetry_snapshot(), ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.flush()
+                time.sleep(TELEMETRY_PERIOD_S)
+        except (OSError, ValueError):
+            return
+
+    def do_DELETE(self) -> None:
+        url = urllib.parse.urlsplit(self.path)
+        parts = [urllib.parse.unquote(s) for s in url.path.split("/") if s]
+        if len(parts) != 3 or parts[:2] != ["api", "classes"]:
+            return self._json(404, {"ok": False, "error": "not found"})
+        query = urllib.parse.parse_qs(url.query)
+        delete_cad = query.get("delete_cad", ["0"])[0].lower() in ("1", "true", "yes")
+        try:
+            label = normalize_label(parts[2])
+        except ValueError as exc:
+            return self._json(400, {"ok": False, "error": str(exc)})
+        removed = self.pipeline.unenroll(label)
+        cad_removed = cad_harvester.delete_cached(label) if (removed and delete_cad) else False
+        self._json(200 if removed else 404, {"ok": removed, "class_id": label, "cad_deleted": cad_removed,
+                                             "classes": self.pipeline.bank.counts()})
 
     def _sse(self) -> None:
         self.send_response(200)
@@ -1287,7 +1476,7 @@ class Handler(BaseHTTPRequestHandler):
         """Multi-view enrollment, db and CAD endpoints. Returns False when the path is not one of them."""
         p = self.pipeline
         if path not in ("/api/enroll/start", "/api/enroll/capture", "/api/enroll/finish", "/api/enroll/cancel",
-                        "/api/db/save", "/api/cad/fetch"):
+                        "/api/db/save", "/api/cad/fetch", "/api/classes/reset", "/api/resolve"):
             return False
         try:
             req = self._json_body(body)
@@ -1318,12 +1507,31 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/db/save":
                 p.bank.save()
                 self._json(200, {"ok": True, "path": str(p.bank.path), "classes": p.bank.counts()})
+            elif path == "/api/classes/reset":
+                labels = p.bank.labels()
+                p.reset_bank()
+                cad_removed = [x for x in labels if req.get("delete_cad") and cad_harvester.delete_cached(x)]
+                self._json(200, {"ok": True, "removed": labels, "cad_deleted": cad_removed})
+            elif path == "/api/resolve":
+                product = entity_resolver.resolve(str(req.get("text") or req.get("raw_name") or ""), str(req.get("category", "")),
+                                                  str(req.get("brand", "")), str(req.get("variant", "")),
+                                                  str(req.get("package_type", "")), str(req.get("container_volume", "")))
+                self._json(200, {"ok": True, **product.to_dict()})
             else:
-                label = normalize_label(req.get("label"))
-                meta = p.bank.metadata(label) or (taxonomy.parse_metadata(req) if req.get("raw_name") else None)
-                result = cad_retriever.retrieve(label, meta, force=bool(req.get("force")))
-                p.bank.set_cad(label, {k: result.get(k) for k in ("title", "glb_url", "source", "status", "query")})
-                self._json(200, {"ok": True, **result})
+                if req.get("label"):
+                    label = normalize_label(req.get("label"))
+                    meta = p.bank.metadata(label) or (taxonomy.parse_metadata(req) if req.get("raw_name") else None)
+                    result = cad_harvester.retrieve(label, meta, force=bool(req.get("force")))
+                else:
+                    product = entity_resolver.resolve(str(req.get("raw_name") or req.get("text") or ""), str(req.get("category", "")),
+                                                      str(req.get("brand", "")), str(req.get("variant", "")))
+                    label = normalize_label(product.class_id)
+                    result = cad_harvester.harvest(product, force=bool(req.get("force")))
+                keys = ("title", "glb_url", "source", "status", "query", "attribution", "credit")
+                p.bank.set_cad(label, {k: result.get(k) for k in keys})
+                if label == p._viewer_label:
+                    p._bump()
+                self._json(200, {"ok": True, "label": label, **result})
         except EnrollmentBusy as exc:
             self._json(409, {"ok": False, "error": str(exc)})
         except (TypeError, ValueError) as exc:  # includes JSON and MetadataError

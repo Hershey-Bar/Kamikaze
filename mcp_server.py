@@ -11,6 +11,7 @@ over its local HTTP API, so an agent can drive the same live state the dashboard
 Environment (all optional):
   SKETCHFAB_TOKEN        Sketchfab API token (required for GLB download via the Data API)
   POLY_PIZZA_API_KEY     Poly Pizza API key
+                         (both may also live in a git-ignored .env file next to this script)
   KAMIKAZE_ROUTER_SOCK   Router socket path (default /var/run/arduino-router.sock)
   KAMIKAZE_RECEIVER_URL  Receiver base URL (default http://127.0.0.1:5000)
   KAMIKAZE_MODELS_DIR    GLB cache directory (default static/models next to this file)
@@ -40,6 +41,29 @@ from typing import Any
 
 import msgpack
 from mcp.server.fastmcp import FastMCP
+
+
+def load_dotenv(path: Path | None = None) -> int:
+    """Load KEY=VALUE pairs from .env next to this file into os.environ (never overrides real variables)."""
+    path = path or Path(__file__).with_name(".env")
+    loaded = 0
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    return loaded
+
+
+load_dotenv()
 
 logging.basicConfig(
     level=os.environ.get("KAMIKAZE_LOG", "INFO"),
@@ -272,10 +296,15 @@ def _search_sketchfab(query: str, deadline: float) -> dict[str, str] | None:
             continue
         glb = (dl.get("glb") or {}).get("url")
         if glb:
+            user = model.get("user") or {}
+            lic = (model.get("license") or {}).get("label", "")
+            title = str(model.get("name", query))
             return {
-                "title": str(model.get("name", query)),
+                "title": title,
                 "model_url": glb,
                 "thumbnail_url": _pick_thumbnail(model.get("thumbnails")),
+                "attribution": (f"\u201c{title}\u201d by {user.get('displayName') or user.get('username') or 'unknown'} "
+                                f"({user.get('profileUrl', '')}) - {lic} - via Sketchfab (https://sketchfab.com/3d-models/{uid})"),
             }
     return None
 
@@ -289,10 +318,15 @@ def _search_poly_pizza(query: str, deadline: float) -> dict[str, str] | None:
     for item in data.get("results", []):
         glb = item.get("Download") or item.get("download")
         if glb:
+            title = str(item.get("Title") or item.get("title") or query)
+            creator = item.get("Creator") or item.get("creator") or {}
+            author = creator.get("Username") or creator.get("username") if isinstance(creator, dict) else ""
             return {
-                "title": str(item.get("Title") or item.get("title") or query),
+                "title": title,
                 "model_url": glb,
                 "thumbnail_url": str(item.get("Thumbnail") or item.get("thumbnail") or ""),
+                "attribution": str(item.get("Attribution") or item.get("attribution")
+                                   or f"\u201c{title}\u201d by {author or 'unknown'} via Poly Pizza (https://poly.pizza)"),
             }
     return None
 
@@ -563,7 +597,7 @@ def get_guidance() -> dict:
 @mcp.tool()
 def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant: str = "", package_type: str = "",
                      container_volume: str = "", frames_per_view: int = 6, pause_s: float = 4.0) -> dict:
-    """Guided 4-angle enrollment (front, back, side, detail) of the object in front of the camera.
+    """Guided 4-angle enrollment (front, back, side, top) of the object in front of the camera.
 
     Starts a session with the structured metadata, then captures `frames_per_view` frames per view, waiting
     `pause_s` seconds before each so the object can be rotated. Returns the final enrollment status.
@@ -573,7 +607,7 @@ def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant
     status = _receiver_call("POST", "/api/enroll/start", {k: v for k, v in body.items() if v not in ("", None)}, timeout=10.0)
     if not status.get("ok"):
         return status
-    for view in ("front", "back", "side", "detail"):
+    for view in ("front", "back", "side", "top"):
         time.sleep(max(0.0, pause_s))
         status = _receiver_call("POST", "/api/enroll/capture", {"view": view, "wait": True, "timeout": 30}, timeout=45.0)
         if not status.get("ok"):
@@ -586,14 +620,28 @@ def enroll_multiview(raw_name: str, category: str = "", brand: str = "", variant
 def fetch_cad_asset(raw_name: str, category: str = "", brand: str = "", variant: str = "", force: bool = False) -> dict:
     """Find, download and cache a 3D GLB model for a product (Sketchfab -> Poly Pizza -> GitHub -> procedural fallback).
 
-    Returns {"title", "model_url", "thumbnail_url", "status", "source", "glb_url"} where glb_url is served from /static/models.
+    Returns {"class_id", "title", "glb_url", "status", "source", "attribution", "credit", ...}; glb_url is served from
+    /static/models and `credit` is the author/licence line that must be shown with the model.
     """
-    import cad_retriever
-    import taxonomy
+    import cad_harvester
+    import entity_resolver
 
-    meta = taxonomy.parse_metadata({k: v for k, v in {"raw_name": raw_name, "category": category, "brand": brand,
-                                                       "variant": variant}.items() if v})
-    return cad_retriever.retrieve(taxonomy.label_from_metadata(meta), meta, force=force)
+    product = entity_resolver.resolve(raw_name, category=category, brand=brand, variant=variant)
+    return cad_harvester.harvest(product, force=force)
+
+
+@mcp.tool()
+def resolve_product(raw_name: str, category: str = "", brand: str = "", variant: str = "") -> dict:
+    """Parse free text ("coke zero can 330ml", "s24 ultra") into a canonical product: class_id, brand, model/variant, sub_tier, CAD search terms."""
+    import entity_resolver
+
+    return entity_resolver.resolve(raw_name, category=category, brand=brand, variant=variant).to_dict()
+
+
+@mcp.tool()
+def get_telemetry() -> dict:
+    """Hardware + inference telemetry from the receiver: SoC, thermals, CPU/RAM, router/LED bridge latency, ExecuTorch timings."""
+    return _receiver_call("GET", "/api/telemetry", timeout=5.0)
 
 
 @mcp.tool()

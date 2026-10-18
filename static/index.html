@@ -50,6 +50,23 @@
   .step .warn { color:var(--amber); }
   #enrollMsg { margin-top:8px; min-height:1.4em; color:var(--mute); font-size:12px; }
   ul#classes { list-style:none; padding:0; margin:10px 0 0; display:flex; flex-wrap:wrap; gap:6px; }
+  table.classes { width:100%; border-collapse:collapse; margin-top:10px; font-size:12px; }
+  table.classes th { text-align:left; color:var(--mute); font-weight:500; text-transform:uppercase; letter-spacing:.06em; font-size:11px; padding:4px 6px; border-bottom:1px solid var(--line); }
+  table.classes td { padding:6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  table.classes tr.active td { color:var(--green); }
+  table.classes td.cad-ready { color:var(--green); }
+  table.classes td.cad-missing { color:var(--amber); }
+  button.danger { background:transparent; border:1px solid var(--red); color:var(--red); padding:2px 8px; font-weight:500; }
+  .gauge16 { height:14px; background:#0d1428; border:1px solid var(--line); border-radius:7px; overflow:hidden; margin-top:6px; }
+  .gauge16 > div { height:100%; width:0; background:linear-gradient(90deg,var(--green),var(--amber)); transition:width .3s; }
+  .tgrid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:10px; }
+  .kv { font-size:12px; color:var(--mute); line-height:1.55; overflow-wrap:anywhere; }
+  .kv b { color:var(--text); font-weight:500; }
+  .freqs { display:grid; grid-template-columns:repeat(4,1fr); gap:4px; margin-top:6px; font-size:11px; }
+  .freqs div { background:#0d1428; border:1px solid var(--line); border-radius:6px; padding:3px 6px; font-variant-numeric:tabular-nums; }
+  #credit { margin-top:6px; font-size:11px; color:var(--mute); overflow-wrap:anywhere; }
+  #credit a { color:#7aa7ff; }
+  #resolved { margin-top:8px; font-size:12px; color:var(--mute); overflow-wrap:anywhere; }
   ul#classes li { background:#0d1428; border:1px solid var(--line); border-radius:999px; padding:3px 4px 3px 10px; font-size:12px; display:flex; align-items:center; gap:6px; }
   ul#classes li.active { border-color:var(--green); color:var(--green); }
   .stack { display:flex; flex-direction:column; gap:16px; }
@@ -108,8 +125,14 @@
       <div class="row">
         <button id="saveBtn" class="ghost">Save database</button>
         <a href="/api/db/export" download="enrolled_classes.pt"><button class="ghost" type="button">Export .pt</button></a>
+        <button id="resolveBtn" class="ghost" title="Parse the name into a canonical product and download its 3D model">Resolve &amp; Fetch CAD</button>
+        <button id="resetBtn" class="danger" type="button">Reset all</button>
       </div>
-      <ul id="classes"></ul>
+      <div id="resolved"></div>
+      <table class="classes">
+        <thead><tr><th>Class</th><th>Category</th><th>Views</th><th>Created</th><th>CAD</th><th></th></tr></thead>
+        <tbody id="classRows"></tbody>
+      </table>
     </section>
   </div>
 
@@ -122,28 +145,41 @@
                     environment-image="neutral" exposure="1.1" camera-orbit="45deg 75deg 1.5m" interaction-prompt="none"
                     alt="Matched 3D model"></model-viewer>
       <div class="mute" id="viewerLabel" style="margin-top:8px">Showing default model.</div>
+      <div id="credit"></div>
     </section>
 
     <!-- Panel 4: telemetry -->
     <section class="panel">
-      <h2>4 · Telemetry &amp; hardware</h2>
+      <h2>4 · Telemetry &amp; hardware <span class="pill" id="modePill">mode: —</span></h2>
       <div class="grid">
-        <div class="stat"><b>Modulino</b><span id="tLed">—</span></div>
-        <div class="stat"><b>Bus latency</b><span id="tBus">—</span></div>
+        <div class="stat"><b>Modulino Pixels</b><span id="tLed">—</span></div>
+        <div class="stat"><b>Bridge RPC</b><span id="tBus">—</span></div>
         <div class="stat"><b>Frame rate</b><span id="tFps">—</span></div>
-        <div class="stat"><b>ExecuTorch embed</b><span id="tEmbed">—</span></div>
+        <div class="stat"><b>ExecuTorch median</b><span id="tEmbed">—</span></div>
+        <div class="stat"><b>ExecuTorch p95</b><span id="tEmbed95">—</span></div>
         <div class="stat"><b>Total / frame</b><span id="tTotal">—</span></div>
+        <div class="stat"><b>Cosine sim</b><span id="tCos">—</span></div>
+        <div class="stat"><b>Margin</b><span id="tMarg">—</span></div>
         <div class="stat"><b>Pose time</b><span id="tPoseMs">—</span></div>
         <div class="stat"><b>CPU</b><span id="tCpu">—</span></div>
-        <div class="stat"><b>RAM</b><span id="tRam">—</span></div>
+        <div class="stat"><b>Max temp</b><span id="tTemp">—</span></div>
         <div class="stat"><b>Pitch / Yaw / Roll</b><span id="tPose">—</span></div>
+      </div>
+      <div class="stat" style="margin-top:8px"><b>RAM <span id="tRam" style="font-size:12px;color:var(--text)">—</span></b>
+        <div class="gauge16"><div id="ramBar"></div></div></div>
+      <div class="freqs" id="freqs"></div>
+      <div class="tgrid">
+        <div class="kv" id="kvSoc">SoC: —</div>
+        <div class="kv" id="kvIpc">IPC: —</div>
+        <div class="kv" id="kvThermal">Thermal: —</div>
+        <div class="kv" id="kvInfer">Inference: —</div>
       </div>
       <div class="leds" id="leds" title="Modulino Pixels (as commanded)"></div>
       <div class="mute" id="tBackend" style="margin-top:8px"></div>
     </section>
   </div>
 </main>
-<footer>Embeddings run on-device (Arm CPU · ExecuTorch/XNNPACK). Pose is a heuristic estimate. API: <code>/api/state</code>, <code>/api/events</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
+<footer>Embeddings run on-device (Arm CPU · ExecuTorch/XNNPACK; the Hexagon NPU is not used). Pose is a heuristic estimate. No camera image is ever saved: only 1280-d vectors are stored, and the live view holds a single in-memory frame. API: <code>/api/state</code>, <code>/api/telemetry</code>, <code>/api/classes</code>, <code>/api/credits</code>, <code>/api/pose</code>, <code>/api/asset</code>.</footer>
 
 <script>
   (function () {
@@ -230,23 +266,101 @@
     });
   }
 
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    return isNaN(d) ? iso : d.toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
+  }
+
   function renderClasses(protos, active) {
-    const ul = $('classes');
-    ul.replaceChildren();
-    (protos || []).forEach((p) => {
-      const li = document.createElement('li');
-      if (p.label === active) li.className = 'active';
-      const views = Object.keys(p.views || {}).length;
-      li.append(`${p.label} · ${p.vectors}f${views ? ' · ' + views + ' views' : ''}${p.cad_asset ? ' · CAD' : ''}`);
-      const x = document.createElement('button');
-      x.className = 'ghost'; x.textContent = '×'; x.title = 'Remove ' + p.label;
-      x.onclick = async () => {
-        if (!confirm('Remove enrolled class "' + p.label + '"?')) return;
-        await fetch('/api/unenroll', { method: 'POST', body: JSON.stringify({ label: p.label }) });
+    const body = $('classRows');
+    body.replaceChildren();
+    if (!(protos || []).length) {
+      const tr = document.createElement('tr'); const td = document.createElement('td');
+      td.colSpan = 6; td.className = 'mute'; td.textContent = 'No enrolled classes.';
+      tr.appendChild(td); body.appendChild(tr); return;
+    }
+    protos.forEach((p) => {
+      const tr = document.createElement('tr');
+      if (p.class_id === active) tr.className = 'active';
+      const cell = (text, cls) => { const td = document.createElement('td'); td.textContent = text; if (cls) td.className = cls; tr.appendChild(td); return td; };
+      const name = cell(p.canonical_name || p.class_id);
+      name.title = p.class_id;
+      cell((p.category || '—').replace('_', ' '));
+      cell(`${p.view_count}/4 · ${p.vectors}f`);
+      cell(fmtDate(p.created_at));
+      cell(p.cad_status === 'ready' ? (p.cad_source || 'ready') : 'missing', p.cad_status === 'ready' ? 'cad-ready' : 'cad-missing');
+      const td = document.createElement('td');
+      const del = document.createElement('button');
+      del.className = 'danger'; del.textContent = 'Delete'; del.title = 'Delete ' + p.class_id;
+      del.onclick = async () => {
+        if (!confirm('Delete enrolled class "' + p.class_id + '"?')) return;
+        const alsoCad = p.cad_status === 'ready' && confirm('Also delete its cached 3D model and credit file?');
+        const r = await fetch('/api/classes/' + encodeURIComponent(p.class_id) + (alsoCad ? '?delete_cad=1' : ''), { method: 'DELETE' });
+        const j = await r.json().catch(() => ({}));
+        $('enrollMsg').textContent = j.ok ? 'Deleted ' + p.class_id + (j.cad_deleted ? ' and its 3D model.' : '.') : (j.error || 'Delete failed.');
+        pullState();
       };
-      li.appendChild(x);
-      ul.appendChild(li);
+      td.appendChild(del); tr.appendChild(td);
+      body.appendChild(tr);
     });
+  }
+
+  function link(parent, text, url) {
+    if (url && /^https?:\/\//.test(url)) {
+      const a = document.createElement('a'); a.href = url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.textContent = text; parent.appendChild(a);
+    } else parent.append(text);
+  }
+
+  function renderCredit(attr) {
+    const box = $('credit');
+    box.replaceChildren();
+    if (!attr) return;
+    box.append('3D model ');
+    link(box, '\u201c' + (attr.title || 'Untitled') + '\u201d', attr.source_url);
+    box.append(' by ');
+    link(box, attr.author || 'unknown author', attr.author_url);
+    if (attr.license) { box.append(' \u00b7 licence: '); link(box, attr.license, attr.license_url); }
+    if (attr.source) box.append(' \u00b7 via ' + attr.source);
+  }
+
+  const fmt = (v, d = 1, unit = '') => (v == null ? '—' : Number(v).toFixed(d) + unit);
+
+  function renderTelemetry(t) {
+    const inf = t.inference || {}, ipc = t.ipc || {}, mod = t.modulino || {}, mem = t.memory || {}, soc = t.soc || {};
+    $('modePill').textContent = 'mode: ' + (t.mode || '—');
+    $('tEmbed').textContent = fmt(inf.embed_ms_median, 1, ' ms');
+    $('tEmbed95').textContent = fmt(inf.embed_ms_p95, 1, ' ms');
+    $('tCos').textContent = fmt(inf.cosine_similarity, 3);
+    $('tMarg').textContent = fmt(inf.margin, 3);
+    const rpc = ipc.bridge_rpc || {};
+    $('tBus').textContent = rpc.avg_ms != null ? `${fmt(rpc.avg_ms, 1)} ms avg · p95 ${fmt(rpc.p95_ms, 1)}` : (rpc.ok === false ? 'failing' : '—');
+    $('tLed').textContent = `${mod.status || '—'} · ${mod.leds_on ?? 0}/${mod.leds_total ?? 8} LED`;
+    $('tCpu').textContent = t.cpu_load ? `${t.cpu_load.total_pct}% · load ${t.cpu_load.loadavg_1m ?? '—'}` : '—';
+    const temps = (t.thermal || []).map((z) => z.temp_c);
+    $('tTemp').textContent = temps.length ? Math.max(...temps).toFixed(1) + ' °C' : '—';
+    $('tRam').textContent = mem.total_mb ? `${(mem.used_mb / 1024).toFixed(1)} / ${(mem.total_mb / 1024).toFixed(1)} GB (${mem.used_pct}%) · nominal ${mem.nominal_gb} GB` : '—';
+    $('ramBar').style.width = (mem.used_pct || 0) + '%';
+    const fr = $('freqs'); fr.replaceChildren();
+    (t.cpu_freq || []).forEach((c) => {
+      const d = document.createElement('div');
+      const load = t.cpu_load && t.cpu_load.per_core_pct ? t.cpu_load.per_core_pct[c.cpu] : null;
+      d.textContent = `${c.cpu.replace('cpu', 'C')} ${c.mhz ?? '—'} MHz${load != null ? ' · ' + load + '%' : ''}`;
+      fr.appendChild(d);
+    });
+    const up = t.uptime_s != null ? Math.floor(t.uptime_s / 3600) + 'h ' + Math.floor((t.uptime_s % 3600) / 60) + 'm' : '—';
+    $('kvSoc').textContent = `SoC: ${soc.board_model || '—'} · ${soc.arch || ''} · ${soc.cores || '?'} cores${soc.soc_machine ? ' · ' + soc.soc_machine : ''} · ${soc.os || ''} · kernel ${soc.kernel || ''} · up ${up}`;
+    const rs = ipc.router_socket || {};
+    $('kvIpc').textContent = `IPC: router socket ${rs.exists ? (rs.connectable ? 'connectable (' + fmt(rs.connect_ms, 2) + ' ms)' : 'present, refusing') : 'missing'} · ttyACM0 ${ (ipc.serial_bridge || {}).present ? 'present' : 'absent'} · ${mod.bus || ''}`;
+    $('kvThermal').textContent = 'Thermal: ' + ((t.thermal || []).map((z) => `${z.type || z.zone} ${z.temp_c}°C`).join(' · ') || '—');
+    $('kvInfer').textContent = `Inference: ${inf.backend || '—'} · ${inf.embedder || ''} · ${inf.samples || 0} samples · ${inf.accelerator || ''}`;
+  }
+
+  function connectTelemetry() {
+    if (!window.EventSource) return;
+    const es = new EventSource('/api/telemetry/stream');
+    es.onmessage = (ev) => { try { renderTelemetry(JSON.parse(ev.data)); } catch (e) {} };
+    es.onerror = () => { es.close(); setTimeout(connectTelemetry, 3000); };
   }
 
   function renderSteps(mv) {
@@ -303,18 +417,13 @@
     $('tMargin').textContent = s.label ? s.margin.toFixed(3) : '—';
     $('marginBar').style.width = (s.label ? Math.max(0, Math.min(100, s.margin / 0.4 * 100)) : 0) + '%';
     $('viewPill').textContent = 'view: ' + (s.best_view || '—');
-    $('tEmbed').textContent = s.latency_ms.embed.toFixed(1) + ' ms';
     $('tTotal').textContent = s.latency_ms.total.toFixed(1) + ' ms';
     $('tFps').textContent = s.fps.toFixed(1);
     const led = s.led;
-    $('tLed').textContent = led.ok === false ? 'router offline' : `${led.count} LED · rgb(${led.r},${led.g},${led.b})`;
-    $('tBus').textContent = (led.latency_ms || 0).toFixed(1) + ' ms';
     const sys = s.system || {};
-    $('tCpu').textContent = sys.cpu_pct != null ? sys.cpu_pct + '%' : '—';
-    $('tRam').textContent = sys.ram_pct != null ? sys.ram_pct + '%' : '—';
     $('tPoseMs').textContent = pose && pose.ms != null ? pose.ms + ' ms' : '—';
     $('tPose').textContent = pose && pose.valid ? `${pose.pitch}° / ${pose.yaw}° / ${pose.roll}°` : '—';
-    $('tBackend').textContent = s.backend + (sys.temp_c != null ? ` · ${sys.temp_c}°C` : '');
+    $('tBackend').textContent = `${s.backend} · mode ${s.mode} · raw frames persisted: ${s.privacy && s.privacy.raw_frames_persisted ? 'YES' : 'no'}`;
     renderLeds(led);
     renderClasses(s.bank, s.confirmed_label);
     renderSteps(s.multiview);
@@ -322,7 +431,8 @@
     const src = new URL(s.glb_url, location.href).href;
     if (src !== lastSrc) { lastSrc = src; viewer.setAttribute('src', s.glb_url); }
     const name = s.confirmed_label;
-    $('viewerLabel').textContent = name ? `${name} · model ${s.asset_status}` : 'Showing default model.';
+    $('viewerLabel').textContent = name ? `${s.asset_title || name} · model ${s.asset_status}` : 'Showing default model.';
+    renderCredit(name ? s.asset_attribution : null);
     $('syncPill').textContent = syncPose ? (pose && pose.valid ? 'pose: syncing' : 'pose: no object') : 'pose: off';
     $('syncPill').className = 'pill' + (syncPose && pose && pose.valid ? ' on' : '');
     if (name !== lastLabel) lastLabel = name;
@@ -370,9 +480,35 @@
     else { viewer.setAttribute('auto-rotate', ''); viewer.removeAttribute('orientation'); viewer.setAttribute('camera-orbit', '45deg 75deg 1.5m'); }
   };
 
+  $('resolveBtn').onclick = async () => {
+    const name = $('mName').value.trim();
+    if (!name) { $('enrollMsg').textContent = 'Enter a name first.'; return; }
+    const req = { raw_name: name, category: $('mCat').value, brand: $('mBrand').value.trim(), variant: $('mVariant').value.trim() };
+    const box = $('resolved');
+    $('resolveBtn').disabled = true;
+    box.textContent = 'Resolving…';
+    const parsed = await post('/api/resolve', req);
+    if (!parsed.ok) { box.textContent = parsed.error || 'Could not resolve.'; $('resolveBtn').disabled = false; return; }
+    box.textContent = `Resolved → ${parsed.canonical_name} [${parsed.class_id}] · ${parsed.category}${parsed.sub_tier ? ' · ' + parsed.sub_tier : ''} · searching CAD sources…`;
+    const j = await post('/api/cad/fetch', req);
+    $('resolveBtn').disabled = false;
+    if (!j.ok) { box.textContent = j.error || 'CAD fetch failed.'; return; }
+    box.textContent = `${parsed.canonical_name} → ${j.source} (${j.status}) · ${j.credit}`;
+    if (j.glb_url) { viewer.setAttribute('src', j.glb_url + '?t=' + Date.now()); lastSrc = ''; renderCredit(j.attribution); }
+    pullState();
+  };
+  $('resetBtn').onclick = async () => {
+    if (!confirm('Delete ALL enrolled classes? This empties enrolled_classes.pt.')) return;
+    const alsoCad = confirm('Also delete all cached 3D models for them?');
+    const j = await post('/api/classes/reset', { delete_cad: alsoCad });
+    if (j.ok) $('enrollMsg').textContent = `Removed ${j.removed.length} class(es).`;
+    pullState();
+  };
+
   setInterval(pullFrame, 120);
   setInterval(() => { if (Date.now() - lastSse > 3000) pullState(); }, 500);
   connectEvents();
+  connectTelemetry();
   pullState();
 </script>
 </body>
