@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 from http.client import HTTPConnection
 from pathlib import Path
@@ -469,7 +470,7 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
         status, body = self.call("GET", "/")
         self.assertEqual(status, 200)
         text = body.decode("utf-8")
-        for needle in ("Resolve &amp; Fetch CAD", "classRows", "ramBar", "model-viewer", "/api/telemetry/stream", "syncBtn"):
+        for needle in ("Resolve &amp; Fetch CAD", "classRows", "ramBar", "model-viewer", "/api/events?telemetry=1", "streamFeed", "syncBtn"):
             self.assertIn(needle, text)
 
     def test_preview_frame_is_not_served_in_deployment_mode(self):
@@ -535,6 +536,58 @@ class EnrollmentAndLifecycleTests(unittest.TestCase):
             conn.close()
 
 
+    def _post_raw(self, path, body, ctype):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", path, body=body, headers={"Content-Type": ctype})
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read())
+        finally:
+            conn.close()
+
+    def test_every_ingest_alias_and_payload_format_reaches_the_live_preview(self):
+        import base64
+        frame = self.tc.jpeg()
+        b64 = base64.b64encode(frame).decode()
+        boundary = "kzTestBoundary"
+        multipart = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"frame\"; filename=\"f.jpg\"\r\n"
+                     f"Content-Type: image/jpeg\r\n\r\n").encode() + frame + f"\r\n--{boundary}--\r\n".encode()
+        cases = [("/", frame, "image/jpeg", "jpeg"), ("/upload", frame, "application/octet-stream", "jpeg"),
+                 ("/frame", multipart, f"multipart/form-data; boundary={boundary}", "multipart/jpeg"),
+                 ("/ingest", json.dumps({"image": "data:image/jpeg;base64," + b64}).encode(), "application/json", "json-base64/jpeg"),
+                 ("/api/upload", ("frame=" + urllib.parse.quote(b64)).encode(), "application/x-www-form-urlencoded", "form-base64/jpeg"),
+                 ("/api/ingest/", b64.encode(), "text/plain", "base64/jpeg")]
+        for i, (path, body, ctype, fmt) in enumerate(cases, 1):
+            status, data = self._post_raw(path, body, ctype)
+            self.assertEqual(status, 200, (path, data))
+            self.assertTrue(data["queued"], path)
+            st = self.pipe.stream_stats()
+            self.assertEqual((st["ingested"], st["source"]["path"], st["source"]["format"]), (i, path.rstrip("/") or "/", fmt))
+        self.assertEqual(self.call("GET", "/api/frame.jpg")[1], frame)
+        status, data = self._post_raw("/api/frame", multipart, f"multipart/form-data; boundary={boundary}")
+        self.assertEqual(status, 200)
+        self.assertNotIn("queued", data)  # /api/frame stays synchronous
+        status, data = self._post_raw("/", b"<html>not a frame</html>", "text/html")
+        self.assertEqual(status, 400)
+        self.assertIn("not a JPEG frame", data["error"])
+        self.assertEqual(self.pipe.stream_stats()["rejected"], 1)
+        status, info = self.call("GET", "/api/ingest")
+        self.assertEqual(status, 200)
+        self.assertIn("/upload", info["async_routes"])
+        self.assertEqual(info["stream"]["rejected"], 1)
+
+    def test_events_stream_carries_state_and_telemetry_on_one_connection(self):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", "/api/events?telemetry=1")
+            resp = conn.getresponse()
+            self.assertEqual(resp.getheader("Content-Type"), "text/event-stream")
+            self.assertEqual(resp.readline(), b"event: telemetry\n")
+            self.assertIn("stream", json.loads(resp.readline()[len(b"data: "):]))
+        finally:
+            conn.close()
+
+
 class RamPoolTests(unittest.TestCase):
     def test_static_cache_hits_revalidates_and_evicts(self):
         import receiver
@@ -570,6 +623,30 @@ class RamPoolTests(unittest.TestCase):
         ring.clear()
         self.assertEqual(len(ring), 0)
         self.assertFalse(receiver.FrameRing(0).enabled)
+
+
+class FramePayloadTests(unittest.TestCase):
+    def test_extract_frame_normalises_common_streamer_payloads(self):
+        import base64
+        import io
+        import receiver
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 24), (200, 30, 30)).save(buf, "JPEG")
+        jpeg = buf.getvalue()
+        png = io.BytesIO()
+        Image.new("RGB", (32, 24), (10, 200, 30)).save(png, "PNG")
+        b64 = base64.b64encode(jpeg)
+        self.assertEqual(receiver.extract_frame(jpeg), (jpeg, "jpeg"))
+        self.assertEqual(receiver.extract_frame(b"--xyz\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n--xyz--\r\n"),
+                         (jpeg, "multipart/jpeg"))
+        self.assertEqual(receiver.extract_frame(b'{"frame": "' + b64 + b'"}', "application/json"), (jpeg, "json-base64/jpeg"))
+        self.assertEqual(receiver.extract_frame(base64.urlsafe_b64encode(jpeg).rstrip(b"=")), (jpeg, "base64/jpeg"))
+        out, fmt = receiver.extract_frame(png.getvalue(), "image/png")
+        self.assertEqual((out[:3], fmt), (receiver.JPEG_SOI, "transcoded"))
+        for bad in (b"", b"junk", b'{"nothing": 1}', b"--b\r\n\r\nno image\r\n--b--", b"\x89PNG\r\n\x1a\n" + b"0" * 40):
+            with self.assertRaises(ValueError, msg=bad):
+                receiver.extract_frame(bad)
 
 
 class HardwareStatsTests(unittest.TestCase):

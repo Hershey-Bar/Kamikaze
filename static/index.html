@@ -206,7 +206,7 @@
 
   const ctx = $('cam').getContext('2d');
   const viewer = $('viewer');
-  let frameBusy = false, lastSrc = '', lastLabel = null, syncPose = false, state = null, pose = null, lastSse = 0;
+  let frameBusy = false, lastSrc = '', lastLabel = null, syncPose = false, state = null, pose = null, lastSse = 0, lastTel = 0;
 
   function drawOverlay() {
     const W = 640, H = 480, side = (state ? state.crop_fraction : 0.6) * Math.min(W, H);
@@ -259,27 +259,81 @@
     ctx.restore();
   }
 
-  let lastBmp = null, lastPoll = 0, lastStateAt = 0, wasLive = false, feedRetry = null;
-  const feed = new Image();
-  function openFeed() {
-    clearTimeout(feedRetry);
-    feed.onerror = () => { feedRetry = setTimeout(openFeed, 2000); };
-    feed.src = '/api/stream?t=' + Date.now();
+  // Live view: read the MJPEG stream with fetch() so every frame's arrival is known exactly. "Live" means a frame was
+  // actually received in the last 3 s - independent of the state/SSE feed - and the reader reconnects on its own.
+  let lastBmp = null, lastPoll = 0, lastStateAt = 0, lastFrameAt = 0, lastMjpegAt = 0, decoding = false, pendingJpeg = null;
+  let feedNote = 'connecting to receiver…';
+  const CRLF2 = [13, 10, 13, 10], latin1 = new TextDecoder('latin1');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function indexOf4(buf, from) {
+    for (let i = from; i + 3 < buf.length; i++) if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) return i;
+    return -1;
+  }
+
+  function showJpeg(bytes) {
+    lastFrameAt = Date.now();
+    if (decoding) { pendingJpeg = bytes; return; }  // keep only the newest frame while one is decoding
+    decoding = true;
+    createImageBitmap(new Blob([bytes], { type: 'image/jpeg' })).then((bmp) => {
+      if (lastBmp) lastBmp.close();
+      lastBmp = bmp;
+    }).catch(() => {}).finally(() => {
+      decoding = false;
+      if (pendingJpeg) { const next = pendingJpeg; pendingJpeg = null; showJpeg(next); }
+    });
+  }
+
+  async function streamFeed() {
+    if (!window.ReadableStream || !window.TextDecoder) return;  // pullFrame() fallback handles old browsers
+    for (;;) {
+      let wait = 1000;
+      try {
+        const r = await fetch('/api/stream?t=' + Date.now(), { cache: 'no-store' });
+        if (!r.ok || !r.body) {
+          feedNote = r.status === 404 ? 'live preview disabled on the receiver' : 'MJPEG stream HTTP ' + r.status;
+          wait = 5000;
+          throw new Error(feedNote);
+        }
+        feedNote = 'MJPEG connected · no frames yet';
+        const rd = r.body.getReader();
+        let buf = new Uint8Array(0);
+        for (;;) {
+          const { value, done } = await rd.read();
+          if (done) break;
+          const merged = new Uint8Array(buf.length + value.length);
+          merged.set(buf); merged.set(value, buf.length); buf = merged;
+          for (;;) {
+            const he = indexOf4(buf, 0);
+            if (he < 0) break;
+            const m = /content-length:\s*(\d+)/i.exec(latin1.decode(buf.subarray(0, he)));
+            if (!m) { buf = buf.slice(he + 4); continue; }
+            const start = he + 4, n = +m[1];
+            if (buf.length < start + n) break;
+            lastMjpegAt = Date.now();
+            showJpeg(buf.slice(start, start + n));
+            buf = buf.slice(start + n);
+          }
+          if (buf.length > 8 * 1024 * 1024) buf = new Uint8Array(0);  // corrupt stream guard
+        }
+        feedNote = 'MJPEG stream closed · reconnecting…';
+      } catch (e) {
+        if (!/disabled|HTTP/.test(feedNote)) feedNote = 'receiver unreachable · retrying…';
+      }
+      await sleep(wait);
+    }
   }
 
   function isLive() {
-    return !!(state && state.stream && state.stream.live && Date.now() - lastStateAt < 4000);
+    return Date.now() - lastFrameAt < 3000;
   }
 
-  async function pullFrame() {  // fallback when the browser cannot render the MJPEG stream
+  async function pullFrame() {  // fallback when the MJPEG reader gets nothing but the receiver reports a live stream
     if (frameBusy) return;
     frameBusy = true;
     try {
       const r = await fetch('/api/frame.jpg?t=' + Date.now(), { cache: 'no-store' });
-      if (r.ok) {
-        if (lastBmp) lastBmp.close();
-        lastBmp = await createImageBitmap(await r.blob());
-      }
+      if (r.ok) showJpeg(new Uint8Array(await r.arrayBuffer()));
     } catch (e) { /* receiver restarting */ }
     frameBusy = false;
   }
@@ -296,18 +350,23 @@
     ctx.fillText(off ? 'Live preview disabled (deployment mode)' : 'Awaiting stream from stream_cam.py on port 5000…', 320, 250);
     ctx.font = '13px ui-monospace, monospace'; ctx.fillStyle = '#64748b';
     ctx.fillText(state ? 'adb forward tcp:5000 tcp:5000  ·  python stream_cam.py' : 'connecting to receiver…', 320, 278);
+    const st = state && state.stream;
+    const detail = st && st.ingested ? `last frame ${st.frame_age_s}s ago from ${st.source ? st.source.client + ' ' + st.source.path : '?'}` +
+      (st.rejected ? ` · ${st.rejected} rejected` : '') : st && st.rejected ? `${st.rejected} frames rejected (bad format) - see receiver log` : feedNote;
+    ctx.fillText(detail, 320, 302);
     ctx.restore();
   }
 
   function tick(t) {
-    if (isLive()) {
-      if (feed.naturalWidth) ctx.drawImage(feed, 0, 0, 640, 480);
-      else {
-        if (Date.now() - lastPoll > 50) { lastPoll = Date.now(); pullFrame(); }
-        if (lastBmp) ctx.drawImage(lastBmp, 0, 0, 640, 480); else { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 640, 480); }
-      }
+    const serverLive = !!(state && state.stream && state.stream.live && Date.now() - lastStateAt < 4000);
+    if (serverLive && Date.now() - lastMjpegAt > 1500 && Date.now() - lastPoll > 66) { lastPoll = Date.now(); pullFrame(); }
+    if (isLive() && lastBmp) {
+      ctx.drawImage(lastBmp, 0, 0, 640, 480);
       drawOverlay();
-    } else drawAwaiting(t);
+    } else {
+      if (lastBmp && !isLive()) { lastBmp.close(); lastBmp = null; }  // never redraw an old frame after the stream stops
+      drawAwaiting(t);
+    }
     requestAnimationFrame(tick);
   }
 
@@ -392,8 +451,9 @@
     const st = t.stream || {}, pools = t.memory_pools || {}, gc = pools.static_cache || {}, ring = pools.frame_ring || {};
     $('tNpu').textContent = onNpu.length ? (st.live ? `active · ${onNpu.join(' + ')} · ${st.infer_fps} fps` : `ready · ${onNpu.join(' + ')} · idle (no frames)`)
       : (npu.fastrpc_cdsp ? 'idle (CPU fallback)' : 'unavailable');
-    $('kvStream').textContent = `Stream: ${st.live ? 'live' : 'idle'} · camera ${st.ingest_fps ?? 0} fps → NPU ${st.infer_fps ?? 0} fps · ` +
-      `${st.ingested ?? 0} received / ${st.processed ?? 0} inferred / ${st.dropped ?? 0} superseded · RAM pools: GLB/JS cache ${gc.mb ?? 0} MB ` +
+    const src = st.source ? ` · from ${st.source.client} POST ${st.source.path} (${st.source.format})` : '';
+    $('kvStream').textContent = `Stream: ${st.live ? 'live' : 'idle'}${src} · camera ${st.ingest_fps ?? 0} fps → NPU ${st.infer_fps ?? 0} fps · ` +
+      `${st.ingested ?? 0} received / ${st.processed ?? 0} inferred / ${st.dropped ?? 0} superseded${st.rejected ? ` / ${st.rejected} REJECTED` : ''} · RAM pools: GLB/JS cache ${gc.mb ?? 0} MB ` +
       `(${gc.files ?? 0} files, ${gc.hits ?? 0} hits) · frame ring ${ring.enabled ? `${ring.used_mb} / ${ring.budget_mb} MB, ${ring.frames} frames, ${ring.span_s}s` : 'off'}`;
     $('kvNpu').textContent = `NPU: Hexagon cDSP ${npu.cdsp ? npu.cdsp.remoteproc + ' ' + npu.cdsp.state : '—'} · /dev/fastrpc-cdsp ${npu.fastrpc_cdsp ? 'present' : 'absent'}` +
       ` · NSP ${npu.nsp_temp_c != null ? npu.nsp_temp_c + ' °C' : '—'} · embedder: ${em.model || '—'} [${em.runtime || em.device || '—'}]` +
@@ -423,11 +483,8 @@
     $('kvInfer').textContent = `Inference: ${inf.backend || '—'} · ${inf.embedder || ''} · ${inf.samples || 0} samples · ${inf.accelerator || ''}`;
   }
 
-  function connectTelemetry() {
-    if (!window.EventSource) return;
-    const es = new EventSource('/api/telemetry/stream');
-    es.onmessage = (ev) => { try { renderTelemetry(JSON.parse(ev.data)); } catch (e) {} };
-    es.onerror = () => { es.close(); setTimeout(connectTelemetry, 3000); };
+  async function pollTelemetry() {  // only used when EventSource is unavailable
+    try { renderTelemetry(await (await fetch('/api/telemetry', { cache: 'no-store' })).json()); } catch (e) {}
   }
 
   function renderSteps(mv) {
@@ -476,9 +533,8 @@
   function render(s) {
     state = s; pose = s.pose; lastStateAt = Date.now();
     const live = isLive();
-    if (live && !wasLive) openFeed();  // (re)attach the MJPEG feed whenever the camera stream (re)starts
-    wasLive = live;
-    $('conn').textContent = live ? `live · camera ${s.ingest_fps} fps → NPU ${s.fps} fps` : 'receiver up · awaiting camera stream';
+    $('conn').textContent = live ? `live · camera ${s.ingest_fps} fps → NPU ${s.fps} fps` :
+      (s.stream && s.stream.live ? 'receiver receiving frames · connecting video…' : 'receiver up · awaiting camera stream');
     $('hud').className = s.state;
     $('hudText').textContent = s.guidance;
     guidanceIcon(s);
@@ -517,8 +573,10 @@
 
   function connectEvents() {
     if (!window.EventSource) return;
-    const es = new EventSource('/api/events');
+    // state + telemetry share one connection (browsers allow ~6 per host; MJPEG holds another)
+    const es = new EventSource('/api/events?telemetry=1');
     es.onmessage = (ev) => { lastSse = Date.now(); try { render(JSON.parse(ev.data)); } catch (e) {} };
+    es.addEventListener('telemetry', (ev) => { lastTel = Date.now(); try { renderTelemetry(JSON.parse(ev.data)); } catch (e) {} });
     es.onerror = () => { es.close(); setTimeout(connectEvents, 2000); };
   }
 
@@ -578,7 +636,9 @@
   setInterval(() => { if (Date.now() - lastSse > 3000) pullState(); }, 500);
   requestAnimationFrame(tick);
   connectEvents();
-  connectTelemetry();
+  setInterval(() => { if (Date.now() - lastTel > 3000) pollTelemetry(); }, 1000);
+  pollTelemetry();
+  streamFeed();
   pullState();
 </script>
 </body>

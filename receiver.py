@@ -2,9 +2,12 @@
 """Kamikaze edge receiver: few-shot visual identification, guidance state machine, 3D dashboard.
 
 One process, one port (0.0.0.0:5000):
-  POST /api/ingest                   live stream_cam.py frames: returns at once with the latest verdict; a background NPU
-                                     worker always processes the newest frame (older unprocessed frames are dropped)
-  POST /upload | /api/frame | /      raw JPEG frame -> synchronous JSON verdict (tests, replay_frames.py, verify_live.py)
+  POST /api/ingest | /ingest | / | /upload | /api/upload | /frame
+                                     live camera frames: return at once with the latest verdict; a background NPU worker
+                                     always processes the newest frame (older unprocessed frames are dropped). Accepts raw
+                                     image/jpeg, multipart/form-data, JSON/form base64 or data URLs, and PNG/BMP/WebP/GIF
+  POST /api/frame (or any ingest route with ?sync=1)   same payloads -> synchronous JSON verdict (tests, replay tools)
+  GET  /api/ingest                   ingest routes, accepted formats and live stream stats (source client/route/format)
   GET  /                             interactive dashboard + <model-viewer> (static/index.html)
   GET  /api/state                    live telemetry (state, top-1, confidence, guidance, LEDs, ...)
   GET  /api/asset                    active 3D asset for the identified object
@@ -27,7 +30,8 @@ One process, one port (0.0.0.0:5000):
   POST /api/enroll/finish | /cancel  finish early with the captured views / abort the session
   GET  /api/enroll/status            wizard state (current view, per-view progress + stability)
   GET  /api/pose                     smoothed physical pose {"pitch", "yaw", "roll"}
-  GET  /api/events                   Server-Sent Events stream of the live state (10 Hz, change-driven)
+  GET  /api/events[?telemetry=1]     Server-Sent Events stream of the live state (10 Hz, change-driven); with telemetry=1 the
+                                     same connection also carries `event: telemetry` every KAMIKAZE_TELEMETRY_PERIOD
   POST /api/db/save | GET /api/db/export   persist / download the enrolled class database
   POST /api/cad/fetch                {"raw_name": "...", "force": true} resolve + (re)harvest the CAD model, with attribution
   GET  /static/...                   static files, incl. cached GLBs in static/models/
@@ -54,6 +58,8 @@ deployment mode). KAMIKAZE_RING_GB > 0 opts in to a RAM ring of recent frames (t
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import collections
 import datetime
 import io
@@ -1239,6 +1245,106 @@ class FrameRing:
 # --------------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------------------
+# Frame payload normalisation (any streamer -> JPEG bytes)
+# --------------------------------------------------------------------------------------
+
+INGEST_ROUTES = ("/api/ingest", "/ingest", "/", "/upload", "/api/upload", "/frame")  # fast async path
+SYNC_FRAME_ROUTES = ("/api/frame",)  # synchronous: waits for inference and returns the fresh verdict
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"BM", b"RIFF", b"GIF8")
+_FRAME_KEYS = ("image", "frame", "jpeg", "jpg", "img", "data", "file", "b64", "image_base64", "base64")
+_B64_RE = re.compile(rb"[A-Za-z0-9+/=_\-\r\n]+")
+
+
+def _b64_image(text: str | bytes) -> bytes:
+    if isinstance(text, bytes):
+        text = text.decode("latin-1")
+    text = text.strip()
+    if text.startswith("data:"):
+        text = text.split(",", 1)[-1]
+    text = "".join(text.split())
+    try:
+        return base64.b64decode(text + "=" * (-len(text) % 4), altchars=b"-_" if ("-" in text or "_" in text) else None)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"invalid base64 image: {exc}") from None
+
+
+def _to_jpeg(data: bytes) -> bytes:
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, "JPEG", quality=85)
+            return buf.getvalue()
+    except Exception as exc:
+        raise ValueError(f"corrupt or unsupported image: {exc}") from None
+
+
+def _from_multipart(body: bytes, content_type: str, depth: int) -> tuple[bytes, str]:
+    m = re.search(r'boundary="?([^";]+)"?', content_type or "", re.I)
+    if m:
+        boundary = m.group(1).encode("latin-1")
+    else:
+        first = body.split(b"\r\n", 1)[0]
+        if not first.startswith(b"--") or len(first) < 3:
+            raise ValueError("multipart body without boundary")
+        boundary = first[2:]
+    for chunk in body.split(b"--" + boundary)[1:]:
+        if chunk.startswith(b"--"):
+            break
+        head, sep, content = chunk.lstrip(b"\r\n").partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+        ct = re.search(rb"(?im)^content-type:\s*([^\r\n]+)", head)
+        try:
+            frame, fmt = extract_frame(content, ct.group(1).decode("latin-1") if ct else "", depth + 1)
+            return frame, "multipart/" + fmt
+        except ValueError:
+            continue
+    raise ValueError("multipart body has no image part")
+
+
+def extract_frame(body: bytes, content_type: str = "", depth: int = 0) -> tuple[bytes, str]:
+    """Normalise whatever a camera streamer POSTs into JPEG bytes: raw JPEG (stream_cam.py), multipart/form-data
+    (requests files=...), JSON or form fields holding base64 / data-URL images, bare base64, or PNG/BMP/WebP/GIF
+    (transcoded to JPEG in memory). Returns (jpeg, format) or raises ValueError with an actionable message."""
+    if not body or len(body) < 16:
+        raise ValueError("empty frame payload")
+    if body.startswith(JPEG_SOI):
+        return body, "jpeg"
+    if depth > 2:
+        raise ValueError("nested frame payload too deep")
+    ctype = (content_type or "").lower()
+    stripped = body.lstrip()
+    if "multipart/" in ctype or body.startswith(b"--"):
+        return _from_multipart(body, content_type, depth)
+    if stripped.startswith(b"{"):
+        try:
+            obj = json.loads(stripped.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise ValueError("JSON frame body is not valid JSON") from None
+        if isinstance(obj, dict):
+            for key in _FRAME_KEYS:
+                if isinstance(obj.get(key), str) and len(obj[key]) > 16:
+                    frame, fmt = extract_frame(_b64_image(obj[key]), "", depth + 1)
+                    return frame, "json-base64/" + fmt
+        raise ValueError(f"JSON frame body has no base64 image under any of: {', '.join(_FRAME_KEYS)}")
+    if "x-www-form-urlencoded" in ctype:
+        form = urllib.parse.parse_qs(body.decode("latin-1"))
+        for key in _FRAME_KEYS:
+            if form.get(key):
+                frame, fmt = extract_frame(_b64_image(form[key][0]), "", depth + 1)
+                return frame, "form-base64/" + fmt
+        raise ValueError(f"form body has no base64 image under any of: {', '.join(_FRAME_KEYS)}")
+    if body.startswith(_IMAGE_MAGIC):
+        return _to_jpeg(body), "transcoded"
+    if stripped.startswith(b"data:") or _B64_RE.fullmatch(stripped[:512]):
+        frame, fmt = extract_frame(_b64_image(stripped), "", depth + 1)
+        return frame, "base64/" + fmt
+    raise ValueError("not a JPEG frame: send raw image/jpeg bytes, multipart/form-data, or JSON {\"image\": <base64>}")
+
+
 class Pipeline:
     def __init__(self, extractor, bank: EmbeddingBank, leds: LedDriver, assets: AssetManager, detector=None) -> None:
         self.extractor, self.bank, self.leds, self.assets = extractor, bank, leds, assets
@@ -1272,6 +1378,9 @@ class Pipeline:
         self._pending_cv = threading.Condition()
         self._dropped = 0
         self._decode_errors = 0
+        self._rejected = 0
+        self._source: dict | None = None
+        self._idle_logged = True
         self._worker: threading.Thread | None = None
         self.ring = FrameRing(int(RING_GB * 2**30))
         self.static_cache = StaticCache(int(ASSET_CACHE_MB * 2**20))
@@ -1338,11 +1447,42 @@ class Pipeline:
                 "similarity": round(last["similarity"], 3), "confidence": round(last["confidence"], 3),
                 "fps": round(self._fps, 1), "ingest_fps": round(self._ingest_fps, 1), "latency_ms": round(last["total_ms"], 1)}
 
+    def note_source(self, source: dict) -> None:
+        """Record who is streaming; log when a stream (re)starts so a route/format mismatch is obvious in the log."""
+        with self._frame_lock:
+            idle = not self._last_ingest_mono or time.monotonic() - self._last_ingest_mono > STALE_S
+            changed = self._source is None or any(self._source.get(k) != source.get(k) for k in ("client", "path", "format"))
+            self._source, self._idle_logged = {**source, "since": self._source.get("since") if self._source and not idle and not changed else time.time()}, False
+        if idle or changed:
+            log.info("Live stream started: %s POST %s (%s, %s, %d bytes/frame)", source.get("client"), source.get("path"),
+                     source.get("format"), source.get("content_type") or "no content-type", source.get("bytes", 0))
+
+    def note_rejected(self, source: dict, size: int, head: bytes, error: Exception) -> None:
+        self._rejected += 1
+        if self._rejected <= 5 or self._rejected % 100 == 0:
+            log.warning("Rejected frame #%d from %s POST %s (content-type %r, %d bytes, starts %r): %s", self._rejected,
+                        source.get("client"), source.get("path"), source.get("content_type"), size, head, error)
+
+    def _check_idle(self) -> None:
+        with self._frame_lock:
+            if self._idle_logged or not self._last_ingest_mono:
+                return
+            age = time.monotonic() - self._last_ingest_mono
+            if age <= STALE_S:
+                return
+            self._idle_logged = True
+        log.info("Live stream idle: no frame for %.0f s (preview dropped, waiting for stream_cam.py)", age)
+
     def _work(self) -> None:
         while True:
             with self._pending_cv:
-                self._pending_cv.wait_for(lambda: self._pending is not None)
-                data, self._pending = self._pending, None
+                if not self._pending_cv.wait_for(lambda: self._pending is not None, 1.0):
+                    data = None
+                else:
+                    data, self._pending = self._pending, None
+            if data is None:
+                self._check_idle()
+                continue
             try:
                 self.process_jpeg(data, publish=False)
             except ValueError:
@@ -1356,7 +1496,8 @@ class Pipeline:
         return {"live": live, "frame_age_s": round(age, 2) if age is not None else None,
                 "ingest_fps": round(self._ingest_fps, 1) if live else 0.0, "infer_fps": round(self._fps, 1) if live else 0.0,
                 "ingested": self._ingested, "processed": self._frames, "dropped": self._dropped,
-                "decode_errors": self._decode_errors, "async_worker": self._worker is not None}
+                "decode_errors": self._decode_errors, "rejected": self._rejected, "source": self._source,
+                "async_worker": self._worker is not None}
 
     def _bump(self) -> None:
         with self._ver_cv:
@@ -1722,7 +1863,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/enroll/status":
             return self._json(200, {"ok": True, **p.mv.status()})
         if path == "/api/events":
-            return self._sse()
+            return self._sse("telemetry=1" in urllib.parse.urlsplit(self.path).query)
+        if path in INGEST_ROUTES[:2] or path in SYNC_FRAME_ROUTES:
+            return self._json(200, {"ok": True, "hint": "POST camera frames here (raw image/jpeg, multipart/form-data, or "
+                                    "JSON {\"image\": <base64>})", "async_routes": list(INGEST_ROUTES),
+                                    "sync_routes": list(SYNC_FRAME_ROUTES), "stream": p.stream_stats()})
         if path == "/api/db/export":
             blob = p.bank.export_bytes()
             if blob is None:
@@ -1813,17 +1958,22 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200 if removed else 404, {"ok": removed, "class_id": label, "cad_deleted": cad_removed,
                                              "classes": self.pipeline.bank.counts()})
 
-    def _sse(self) -> None:
+    def _sse(self, with_telemetry: bool = False) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        p, version, last_sent = self.pipeline, -1, 0.0
+        p, version, last_sent, last_tel = self.pipeline, -1, 0.0, 0.0
         try:
             while True:
-                new = p.wait_version(version, SSE_KEEPALIVE_S)
+                if with_telemetry and time.monotonic() - last_tel >= TELEMETRY_PERIOD_S:
+                    last_tel = time.monotonic()  # one connection carries state + telemetry (browsers cap ~6 per host)
+                    self.wfile.write(b"event: telemetry\ndata: " + json.dumps(p.telemetry_snapshot(), ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+                timeout = min(SSE_KEEPALIVE_S, TELEMETRY_PERIOD_S) if with_telemetry else SSE_KEEPALIVE_S
+                new = p.wait_version(version, timeout)
                 now = time.monotonic()
                 if new != version:
                     if now - last_sent < SSE_PERIOD_S:
@@ -1929,23 +2079,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, ctype, cache)
 
     def do_POST(self) -> None:
-        path = self.path.split("?", 1)[0]
+        url = urllib.parse.urlsplit(self.path)
+        path = url.path.rstrip("/") or "/"
         body = self._read_body()
         if body is None:
             return
-        if path == "/api/ingest":
-            try:
-                return self._json(200, self.pipeline.ingest(body))
-            except ValueError as exc:
-                return self._json(400, {"ok": False, "error": str(exc)})
-        if path in ("/", "/upload", "/api/frame"):
-            try:
-                return self._json(200, self.pipeline.process_jpeg(body))
-            except ValueError as exc:
-                return self._json(400, {"ok": False, "error": str(exc)})
-            except Exception as exc:
-                log.exception("Frame processing failed")
-                return self._json(500, {"ok": False, "error": str(exc)})
+        if path in INGEST_ROUTES or path in SYNC_FRAME_ROUTES:
+            return self._frame_post(path, body, path in SYNC_FRAME_ROUTES or "sync=1" in url.query)
         if self._post_api(path, body):
             return
         if path in ("/api/enroll", "/api/unenroll"):
@@ -1961,6 +2101,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200 if removed else 404, {"ok": removed, "label": label})
             return self._enroll(label, req)
         self._json(404, {"ok": False, "error": "not found"})
+
+    def _frame_post(self, path: str, body: bytes, sync: bool) -> None:
+        """Camera frame on any ingest alias, in any common encoding. Async routes answer in ~1 ms; /api/frame waits."""
+        p = self.pipeline
+        ctype = self.headers.get("Content-Type", "")
+        source = {"client": self.client_address[0], "path": path, "content_type": ctype.split(";")[0].strip() or None}
+        try:
+            frame, fmt = extract_frame(body, ctype)
+        except ValueError as exc:
+            p.note_rejected(source, len(body), body[:16], exc)
+            return self._json(400, {"ok": False, "error": str(exc)})
+        p.note_source({**source, "format": fmt, "bytes": len(frame)})
+        try:
+            return self._json(200, p.process_jpeg(frame) if sync else p.ingest(frame))
+        except ValueError as exc:
+            p.note_rejected(source, len(body), body[:16], exc)
+            return self._json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            log.exception("Frame processing failed")
+            return self._json(500, {"ok": False, "error": str(exc)})
 
     def _enroll(self, label: str, req: dict) -> None:
         try:

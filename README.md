@@ -45,9 +45,34 @@ python stream_cam.py
 
 `stream_cam.py` captures in MJPG mode at 30 fps and POSTs over 3 parallel keep-alive connections (`--senders`), because
 one round trip through the ADB tunnel costs ~45 ms and a single sequential sender tops out at ~21 fps. The dashboard
-shows the live feed as MJPEG (`/api/stream`); if no frame has arrived for `KAMIKAZE_STALE_S` (3 s) the preview is dropped
-and it shows *Awaiting stream from stream_cam.py on port 5000?*, so a stale or test image is never displayed.
-Measured live: camera 30 fps, 29.8 fps sent, NPU worker 29?30 fps (detect 8.7 ms, embed 2.3 ms, 17 ms per frame), MJPEG 29.8 fps, 0 dropped.
+reads the MJPEG stream (`/api/stream`) with `fetch()` and draws each frame on the canvas; if no frame has arrived for
+`KAMIKAZE_STALE_S` (3 s) the preview is dropped and it shows *Awaiting stream from stream_cam.py on port 5000...*, so a
+stale or test image is never displayed. State and telemetry share one SSE connection (`/api/events?telemetry=1`), so
+several open tabs do not exhaust the browser's per-host connection limit.
+Measured live: camera 30 fps, 29.8 fps sent, NPU worker 29-30 fps (detect 8.7 ms, embed 2.3 ms, 17 ms per frame), MJPEG 29.6 fps, 0 dropped.
+
+### Frame ingest
+
+Every route below accepts a frame; the payload format is detected from the body, not only from `Content-Type`:
+
+- Asynchronous (reply at once, latest frame wins): `/api/ingest`, `/ingest`, `/`, `/upload`, `/api/upload`, `/frame`
+- Synchronous (reply contains the classification): `/api/frame`, or any route with `?sync=1`
+- Formats: raw `image/jpeg` bytes; `multipart/form-data` (any field name); JSON `{"image": "<base64 or data URL>"}`
+  (keys such as `image`, `frame`, `jpeg`, `img`, `data`, `file`, `b64`); form-urlencoded `frame=<base64>`; bare base64;
+  PNG/BMP/WebP/GIF (transcoded to JPEG). Anything else is rejected with HTTP 400 and counted in telemetry (`stream.rejected`).
+
+`GET /api/ingest` returns the accepted routes and the live stream counters. The receiver logs
+`Live stream started: <client> POST <path> (<format>, ...)` when frames start and `Live stream idle` when they stop.
+
+### Troubleshooting "Awaiting stream"
+
+1. `stream_cam.py` prints `[STREAM] receiver reachable at ...` at startup, then `[STREAM] POST ... -> HTTP 200` for the
+   first 5 frames and every error. *not reachable* means the ADB forward is missing: run `adb forward tcp:5000 tcp:5000`.
+2. `[CAMERA]` lines show which backend opened the webcam (DirectShow+MJPG, DirectShow, MediaFoundation, default); a
+   camera that delivers no frames for 4 s is reopened with the next backend. Use `--camera 1` for another device.
+3. The once-per-second stats line warns when the camera delivers no frames or frames do not reach the receiver.
+4. On the board, `curl -s localhost:5000/api/ingest` shows `ingested`, `rejected` and the last `source`;
+   `/tmp/receiver.log` has the `Live stream ...` lines.
 
 The startup log prints the accelerator, e.g. `Hexagon NPU (HTP v75, QNN TFLite delegate): embedder + detector`.
 `KAMIKAZE_NPU=0` forces CPU (XNNPACK); `KAMIKAZE_DETECT_CROP=0` falls back to the fixed center crop.
@@ -103,11 +128,13 @@ with title, author, author URL, licence and source; credits are shown in the das
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/ingest` | JPEG frame in, returns at once (async NPU worker, latest-frame-wins) |
-| POST | `/upload`, `/api/frame` | JPEG frame in, synchronous classification out |
+| POST | `/api/ingest`, `/ingest`, `/`, `/upload`, `/api/upload`, `/frame` | frame in, returns at once (async NPU worker, latest-frame-wins) |
+| POST | `/api/frame` (or any ingest route with `?sync=1`) | frame in, synchronous classification out |
+| GET | `/api/ingest` | accepted ingest routes/formats and live stream counters |
 | GET | `/api/stream`, `/api/frame.jpg` | live MJPEG preview / latest frame (404 when the stream is idle; training mode only) |
 | GET | `/api/ring`, `/api/ring/frame.jpg?ago=N` | optional RAM frame ring status / rewind (`KAMIKAZE_RING_GB`) |
 | GET | `/api/state`, `/api/asset`, `/api/pose` | recognition state, current 3D asset, pose |
+| GET | `/api/events` (`?telemetry=1` adds `event: telemetry`) | state SSE (the dashboard's single event connection) |
 | GET | `/api/telemetry`, `/api/telemetry/stream` | SoC, thermals, RAM, CPU, NPU, LED bridge, inference (JSON / SSE) |
 | POST | `/api/enroll/start` / `capture` / `finish` / `cancel`, GET `/api/enroll/status` | guided enrollment |
 | GET | `/api/classes` | enrolled classes |
