@@ -2,17 +2,21 @@
 
     NpuEmbedder  - MediaPipe Image Embedder (MobileNetV3-Large, Apache-2.0): 224x224 RGB -> L2-normalised 1280-d vector.
                    ~0.7 ms/frame on the HTP vs ~24 ms on the Arm CPU; HTP/CPU output cosine 0.99998.
-    NpuDetector  - MediaPipe EfficientDet-Lite2 int8 object detector (COCO-90, Apache-2.0): full frame -> boxes.
-                   ~3 ms/frame on the HTP. Raw SSD outputs are decoded here (anchors generated to match the
-                   TFLite_Detection_PostProcess reference bit-for-bit, then class-agnostic NMS).
+    YoloDetector - Ultralytics YOLO26n / YOLO11n (COCO-80, AGPL-3.0) exported to FP32 TFLite (export_yolo.sh) and run
+                   in FP16 on the HTP: ~6 ms/frame at 640x640 vs ~170-200 ms on the Arm CPU. Letterboxed input,
+                   raw (1, 4+nc, 8400) head decoded + NMS here. Without the .tflite it falls back to Ultralytics
+                   PyTorch on the CPU (UltralyticsDetector).
+    NpuDetector  - MediaPipe EfficientDet-Lite0/2 int8 (COCO-90, Apache-2.0), kept as an alternative
+                   (KAMIKAZE_DETECTOR=lite2). Raw SSD outputs decoded with anchors matching TFLite_Detection_PostProcess.
     CropTracker  - smooths the detector box over frames into the square crop that feeds the embedder.
 
 Runtime: ai-edge-litert + libQnnTFLiteDelegate.so from Qualcomm's qairt-libs / qairt-dsp-binaries packages
-(ppa:ubuntu-qcom-iot/qcom-ppa). Each model is compiled for the HTP on first load (~0.7 s embedder, ~2 s detector);
+(ppa:ubuntu-qcom-iot/qcom-ppa). Each model is compiled for the HTP on first load (~0.7 s embedder, ~2-4 s detector);
 if the delegate, /dev/fastrpc-cdsp or the model is unavailable the same .tflite runs on the CPU (XNNPACK) instead.
 
-Models are fetched once from Google's MediaPipe model bucket into models/npu/ (override: KAMIKAZE_NPU_MODELS).
-Environment: KAMIKAZE_NPU (1|0), KAMIKAZE_QNN_DELEGATE, KAMIKAZE_DETECTOR (lite0|lite2), KAMIKAZE_NPU_VERBOSE (0|1).
+Models live in models/npu/ (override: KAMIKAZE_NPU_MODELS): MediaPipe models are downloaded on first use, YOLO models
+are produced on the board by ./export_yolo.sh. Environment: KAMIKAZE_NPU (1|0), KAMIKAZE_QNN_DELEGATE,
+KAMIKAZE_DETECTOR (yolo26n|yolo11n|<custom stem>|lite2|lite0), KAMIKAZE_DETECT_SCORE, KAMIKAZE_NPU_VERBOSE (0|1).
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import glob
+import json
 import logging
 import math
 import os
@@ -41,7 +46,8 @@ QNN_DELEGATE = os.environ.get("KAMIKAZE_QNN_DELEGATE", "libQnnTFLiteDelegate.so"
 QNN_OPTIONS = {"backend_type": "htp", "htp_performance_mode": "2", "htp_precision": "1", "log_level": "0"}
 FASTRPC_DEVICE = "/dev/fastrpc-cdsp"
 DSP_LIB_DIRS = ("/usr/lib/dsp/cdsp", "/usr/lib/rfsa/adsp", "/usr/share/qcom")
-DETECTOR_VARIANT = os.environ.get("KAMIKAZE_DETECTOR", "lite2")
+DETECTOR_VARIANT = os.environ.get("KAMIKAZE_DETECTOR", "yolo26n")
+DETECT_SCORE = float(os.environ.get("KAMIKAZE_DETECT_SCORE", "0.30"))
 VERBOSE = os.environ.get("KAMIKAZE_NPU_VERBOSE", "0") == "1"
 CPU_THREADS = 4
 MEDIAPIPE = "https://storage.googleapis.com/mediapipe-models"
@@ -68,6 +74,10 @@ DETECTOR_SPECS = {
                        f"{MEDIAPIPE}/object_detector/efficientdet_lite2/int8/latest/efficientdet_lite2.tflite",
                        "MediaPipe Object Detector - EfficientDet-Lite2 (int8, COCO)"),
 }
+YOLO_SPECS = {
+    "yolo26n": ModelSpec("yolo26n_float32.tflite", "", "Ultralytics YOLO26n (COCO-80, TFLite FP32 -> HTP FP16)", "AGPL-3.0"),
+    "yolo11n": ModelSpec("yolo11n_float32.tflite", "", "Ultralytics YOLO11n (COCO-80, TFLite FP32 -> HTP FP16)", "AGPL-3.0"),
+}
 EMBEDDER_ID = "mediapipe-mobilenet_v3_large-embedder-1280"
 
 COCO_LABELS = (
@@ -81,9 +91,13 @@ COCO_LABELS = (
     "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "???", "book", "clock", "vase", "scissors",
     "teddy bear", "hair drier", "toothbrush",
 )
+COCO80_LABELS = tuple(name for name in COCO_LABELS if name != "???")  # Ultralytics/YOLO class order
 # COCO has no "can": cans come out as bottle/cup; phones as cell phone (sometimes remote when edge-on).
-TARGET_CLASSES = {"cell phone": "smartphone", "remote": "smartphone", "bottle": "beverage", "cup": "beverage"}
-TARGET_IDS = np.array([COCO_LABELS.index(name) for name in TARGET_CLASSES], dtype=np.int64)
+# The extra names cover a custom-trained YOLO (export_yolo.sh path/to/best.pt) with its own phone/can classes.
+TARGET_CLASSES = {"cell phone": "smartphone", "remote": "smartphone", "bottle": "beverage", "cup": "beverage",
+                  "smartphone": "smartphone", "phone": "smartphone", "can": "beverage", "soda can": "beverage",
+                  "beverage can": "beverage"}
+TARGET_IDS = np.array([COCO_LABELS.index(name) for name in TARGET_CLASSES if name in COCO_LABELS], dtype=np.int64)
 
 
 # --------------------------------------------------------------------------------------
@@ -146,6 +160,8 @@ def ensure_model(spec: ModelSpec, models_dir: Path | None = None, timeout: float
     path = directory / spec.file
     if _valid_tflite(path):
         return path
+    if not spec.url:
+        raise FileNotFoundError(f"{path} not found: run ./export_yolo.sh {path.name.split('_float32')[0]} on the board")
     directory.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".part")
     log.info("Downloading %s ...", spec.url)
@@ -410,6 +426,197 @@ class NpuDetector:
         return {"model": self.spec.title, "file": self.rt.path.name, "license": self.spec.license, "device": self.rt.device,
                 "runtime": self.rt.note, "init_ms": round(self.rt.init_ms, 1), "input": [self.size, self.size],
                 "anchors": int(len(self.anchors)), "classes": sorted(TARGET_CLASSES)}
+
+
+# --------------------------------------------------------------------------------------
+# YOLO detector (Ultralytics, exported to TFLite by export_yolo.sh)
+# --------------------------------------------------------------------------------------
+
+
+def yolo_spec(variant: str) -> ModelSpec:
+    """Known YOLO variants, or any custom stem exported by export_yolo.sh (models/npu/<stem>_float32.tflite)."""
+    return YOLO_SPECS.get(variant) or ModelSpec(f"{variant}_float32.tflite", "",
+                                                f"Custom YOLO {variant} (TFLite FP32 -> HTP FP16)", "AGPL-3.0")
+
+
+def detector_model_path(variant: str = DETECTOR_VARIANT, models_dir: Path | None = None) -> Path:
+    spec = DETECTOR_SPECS.get(variant) or yolo_spec(variant)
+    return Path(models_dir or MODELS_DIR) / spec.file
+
+
+def load_yolo_names(stem: str, models_dir: Path | None = None) -> tuple[str, ...]:
+    """Class names written by export_yolo.sh (<stem>.names.json); COCO-80 order otherwise."""
+    try:
+        names = json.loads((Path(models_dir or MODELS_DIR) / f"{stem}.names.json").read_text(encoding="utf-8"))["names"]
+        if names:
+            return tuple(str(n) for n in names)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return COCO80_LABELS
+
+
+def letterbox(image, size: int, fill: int = 114) -> tuple[np.ndarray, float, int, int]:
+    """PIL image -> uint8 (size, size, 3) letterboxed RGB plus the scale and left/top padding (Ultralytics style)."""
+    from PIL import Image
+
+    frame = image if image.mode == "RGB" else image.convert("RGB")
+    w, h = frame.size
+    r = min(size / w, size / h)
+    nw, nh = max(1, min(size, round(w * r))), max(1, min(size, round(h * r)))
+    if (nw, nh) != (w, h):
+        frame = frame.resize((nw, nh), Image.BILINEAR, reducing_gap=2.0)
+    left, top = (size - nw) // 2, (size - nh) // 2
+    canvas = np.full((size, size, 3), fill, dtype=np.uint8)
+    canvas[top:top + nh, left:left + nw] = np.asarray(frame, dtype=np.uint8)
+    return canvas, r, left, top
+
+
+def decode_yolo(raw: np.ndarray, class_ids: np.ndarray, score_threshold: float, iou_threshold: float = 0.5,
+                size: int | None = None, max_candidates: int = 300, limit: int = 20) -> list[tuple[int, float, np.ndarray]]:
+    """Raw YOLO head (1, 4+nc, N) or (1, N, 4+nc) with cx,cy,w,h boxes (pixels or normalised) and per-class scores
+    -> [(class index, score, [xmin, ymin, xmax, ymax] normalised to the model input)], best first, after NMS."""
+    out = raw[0] if raw.ndim == 3 else raw
+    if out.shape[0] < out.shape[1]:
+        out = out.T
+    scores = out[:, 4:][:, class_ids]
+    best = scores.max(axis=1)
+    idx = np.nonzero(best >= score_threshold)[0]
+    if idx.size == 0:
+        return []
+    if idx.size > max_candidates:
+        idx = idx[np.argsort(-best[idx])[:max_candidates]]
+    cls = class_ids[scores[idx].argmax(axis=1)]
+    conf = best[idx]
+    b = out[idx, :4].astype(np.float32)
+    if size and float(np.abs(b).max()) > 2.0:
+        b = b / float(size)
+    xyxy = np.stack([b[:, 0] - b[:, 2] / 2, b[:, 1] - b[:, 3] / 2, b[:, 0] + b[:, 2] / 2, b[:, 1] + b[:, 3] / 2], axis=1)
+    return [(int(cls[k]), float(conf[k]), xyxy[k]) for k in nms(xyxy, conf, iou_threshold, limit)]
+
+
+def unletterbox(box, size: int, scale: float, left: int, top: int, width: int, height: int) -> tuple[float, ...]:
+    """[xmin, ymin, xmax, ymax] normalised to the letterboxed input -> normalised to the original frame."""
+    x0, y0, x1, y1 = box
+    return (float(np.clip((x0 * size - left) / (scale * width), 0.0, 1.0)),
+            float(np.clip((y0 * size - top) / (scale * height), 0.0, 1.0)),
+            float(np.clip((x1 * size - left) / (scale * width), 0.0, 1.0)),
+            float(np.clip((y1 * size - top) / (scale * height), 0.0, 1.0)))
+
+
+def _target_ids(names, all_classes: bool) -> np.ndarray:
+    if all_classes:
+        return np.arange(len(names), dtype=np.int64)
+    return np.array([i for i, name in enumerate(names) if name in TARGET_CLASSES], dtype=np.int64)
+
+
+class YoloDetector:
+    """Full frame -> target-object detections with Ultralytics YOLO (TFLite FP32, run in FP16 on the HTP)."""
+
+    def __init__(self, variant: str = DETECTOR_VARIANT, path: Path | None = None, prefer_npu: bool = True,
+                 score_threshold: float = DETECT_SCORE, iou_threshold: float = 0.5, all_classes: bool = False):
+        self.variant = variant
+        self.spec = yolo_spec(variant)
+        self.rt = Runtime(Path(path) if path else ensure_model(self.spec), prefer_npu)
+        inp = self.rt.input
+        self.size = int(inp["shape"][1])
+        self.dtype = inp["dtype"]
+        out = self.rt.outputs()[0]
+        self._out = out["index"]
+        shape = [int(v) for v in out["shape"]]
+        num_classes = min(shape[1], shape[2]) - 4
+        names = load_yolo_names(self.rt.path.name.split("_float32")[0], self.rt.path.parent)
+        if len(names) != num_classes:
+            names = COCO80_LABELS if num_classes == len(COCO80_LABELS) else tuple(f"class_{i}" for i in range(num_classes))
+        self.names = names
+        self.class_ids = _target_ids(names, all_classes)
+        if self.class_ids.size == 0:
+            raise RuntimeError(f"{self.rt.path.name}: no class maps to a phone or beverage ({names[:8]}...)")
+        self.score_threshold, self.iou_threshold = score_threshold, iou_threshold
+
+    @property
+    def device(self) -> str:
+        return self.rt.device
+
+    def detect_array(self, rgb: np.ndarray) -> list[Detection]:
+        """rgb: uint8 (S,S,3) letterboxed frame at the model input size. Boxes normalised to that input."""
+        x = rgb[None].astype(np.float32) * (1.0 / 255.0) if np.issubdtype(self.dtype, np.floating) else rgb[None].astype(self.dtype)
+        raw = self.rt.run(x, [self._out])[0]
+        return [Detection(self.names[c], s, tuple(float(np.clip(v, 0.0, 1.0)) for v in box))
+                for c, s, box in decode_yolo(raw, self.class_ids, self.score_threshold, self.iou_threshold, self.size)]
+
+    def detect(self, image) -> list[Detection]:
+        """PIL image (any size) -> detections normalised to that image."""
+        width, height = image.size
+        canvas, scale, left, top = letterbox(image, self.size)
+        out = []
+        for det in self.detect_array(canvas):
+            box = unletterbox(det.box, self.size, scale, left, top, width, height)
+            if box[2] - box[0] > 1e-3 and box[3] - box[1] > 1e-3:
+                out.append(Detection(det.label, det.score, box))
+        return out
+
+    def info(self) -> dict:
+        return {"model": self.spec.title, "file": self.rt.path.name, "license": self.spec.license, "device": self.rt.device,
+                "runtime": self.rt.note, "init_ms": round(self.rt.init_ms, 1), "input": [self.size, self.size],
+                "num_classes": len(self.names), "classes": [self.names[i] for i in self.class_ids]}
+
+
+class UltralyticsDetector:
+    """Ultralytics PyTorch YOLO on the Arm CPU: fallback when the exported .tflite is missing (~150-250 ms/frame)."""
+
+    device = "cpu"
+
+    def __init__(self, variant: str = DETECTOR_VARIANT, score_threshold: float = DETECT_SCORE, iou_threshold: float = 0.5,
+                 size: int = 640, all_classes: bool = False):
+        from ultralytics import YOLO
+
+        t0 = time.perf_counter()
+        self.variant, self.size = variant, size
+        weights = Path(variant if variant.endswith(".pt") else MODELS_DIR / f"{variant}.pt")
+        weights.parent.mkdir(parents=True, exist_ok=True)
+        self.model = YOLO(str(weights))
+        names = self.model.names
+        self.names = tuple(names[k] for k in sorted(names)) if isinstance(names, dict) else tuple(names)
+        self.class_ids = _target_ids(self.names, all_classes)
+        if self.class_ids.size == 0:
+            raise RuntimeError(f"{weights.name}: no class maps to a phone or beverage")
+        self.score_threshold, self.iou_threshold = score_threshold, iou_threshold
+        self.lock = threading.Lock()
+        self.detect_array(np.zeros((size, size, 3), dtype=np.uint8))
+        self.init_ms = (time.perf_counter() - t0) * 1000.0
+        log.info("%s ready on the CPU (Ultralytics PyTorch) in %.0f ms", weights.name, self.init_ms)
+
+    def _predict(self, source) -> list[Detection]:
+        with self.lock:
+            result = self.model.predict(source, imgsz=self.size, conf=self.score_threshold, iou=self.iou_threshold,
+                                        classes=[int(i) for i in self.class_ids], device="cpu", verbose=False)[0]
+        boxes = result.boxes
+        return [Detection(self.names[int(c)], float(s), tuple(float(v) for v in b))
+                for b, s, c in zip(boxes.xyxyn.tolist(), boxes.conf.tolist(), boxes.cls.tolist())]
+
+    def detect_array(self, rgb: np.ndarray) -> list[Detection]:
+        return self._predict(np.ascontiguousarray(rgb[..., ::-1]))  # Ultralytics treats arrays as BGR
+
+    def detect(self, image) -> list[Detection]:
+        return self._predict(image if image.mode == "RGB" else image.convert("RGB"))
+
+    def info(self) -> dict:
+        return {"model": f"Ultralytics {self.variant} (PyTorch, COCO-80)", "file": f"{self.variant}.pt", "license": "AGPL-3.0",
+                "device": "cpu", "runtime": "Ultralytics PyTorch CPU (run ./export_yolo.sh for the NPU)",
+                "init_ms": round(self.init_ms, 1), "input": [self.size, self.size], "num_classes": len(self.names),
+                "classes": [self.names[i] for i in self.class_ids]}
+
+
+def make_detector(variant: str = DETECTOR_VARIANT, prefer_npu: bool = True):
+    """YOLO (default) or EfficientDet-Lite. YOLO runs from models/npu/<variant>_float32.tflite on the HTP; without the
+    exported file it falls back to Ultralytics PyTorch on the CPU."""
+    if variant in DETECTOR_SPECS:
+        return NpuDetector(variant, prefer_npu=prefer_npu)
+    if _valid_tflite(detector_model_path(variant)):
+        return YoloDetector(variant, prefer_npu=prefer_npu)
+    log.warning("%s missing (run ./export_yolo.sh %s); using Ultralytics PyTorch on the CPU",
+                detector_model_path(variant).name, variant)
+    return UltralyticsDetector(variant)
 
 
 # --------------------------------------------------------------------------------------

@@ -659,6 +659,61 @@ class NpuMathTests(unittest.TestCase):
         self.assertEqual(D("bottle", 0.9, (0, 0, 1, 1)).category, "beverage")
         self.assertIsNone(D("person", 0.9, (0, 0, 1, 1)).category)
         self.assertEqual(len(self.npu.COCO_LABELS), 90)
+        self.assertEqual(len(self.npu.COCO80_LABELS), 80)
+        c80 = self.npu.COCO80_LABELS
+        self.assertEqual((c80[0], c80[39], c80[41], c80[65], c80[67], c80[79]),
+                         ("person", "bottle", "cup", "remote", "cell phone", "toothbrush"))
+
+    def test_default_detector_is_yolo(self):
+        self.assertTrue(self.npu.DETECTOR_VARIANT.startswith("yolo") or "KAMIKAZE_DETECTOR" in os.environ)
+        self.assertEqual(self.npu.detector_model_path("yolo26n").name, "yolo26n_float32.tflite")
+        self.assertEqual(self.npu.detector_model_path("my_cans").name, "my_cans_float32.tflite")
+        self.assertEqual(self.npu.detector_model_path("lite2").name, "efficientdet_lite2_int8.tflite")
+        with self.assertRaises(FileNotFoundError):
+            self.npu.ensure_model(self.npu.yolo_spec("definitely_missing"), Path(tempfile.mkdtemp(prefix="kz_y_")))
+
+    def _yolo_head(self, rows, n=8400, nc=80, layout="channels_first"):
+        import numpy as np
+        out = np.zeros((4 + nc, n), dtype=np.float32)
+        for i, (cx, cy, w, h, cls, score) in enumerate(rows):
+            out[:4, i] = (cx, cy, w, h)
+            out[4 + cls, i] = score
+        return out[None] if layout == "channels_first" else out.T[None]
+
+    def test_decode_yolo_pixels_and_layouts(self):
+        import numpy as np
+        ids = self.npu._target_ids(self.npu.COCO80_LABELS, False)
+        self.assertEqual(sorted(self.npu.COCO80_LABELS[i] for i in ids), ["bottle", "cell phone", "cup", "remote"])
+        rows = [(320, 320, 128, 256, 67, 0.9),    # phone
+                (322, 318, 130, 250, 67, 0.7),    # duplicate -> NMS
+                (100, 100, 64, 64, 0, 0.99),      # person: not a target class
+                (500, 500, 40, 120, 39, 0.5),     # bottle
+                (50, 600, 20, 20, 41, 0.1)]       # cup under threshold
+        for layout in ("channels_first", "channels_last"):
+            with self.subTest(layout=layout):
+                dets = self.npu.decode_yolo(self._yolo_head(rows, layout=layout), ids, 0.3, 0.5, 640)
+                self.assertEqual([(c, round(s, 2)) for c, s, _ in dets], [(67, 0.9), (39, 0.5)])
+                np.testing.assert_allclose(dets[0][2], [0.4, 0.3, 0.6, 0.7], atol=1e-6)
+        norm = [(0.5, 0.5, 0.2, 0.4, 67, 0.8)]
+        dets = self.npu.decode_yolo(self._yolo_head(norm), ids, 0.3, 0.5, 640)
+        np.testing.assert_allclose(dets[0][2], [0.4, 0.3, 0.6, 0.7], atol=1e-6)
+        self.assertEqual(self.npu.decode_yolo(self._yolo_head([]), ids, 0.3, 0.5, 640), [])
+
+    def test_letterbox_round_trip(self):
+        from PIL import Image
+        img = Image.new("RGB", (640, 480), (10, 200, 30))
+        canvas, scale, left, top = self.npu.letterbox(img, 320)
+        self.assertEqual(canvas.shape, (320, 320, 3))
+        self.assertEqual((round(scale, 3), left, top), (0.5, 0, 40))
+        self.assertEqual(tuple(canvas[0, 0]), (114, 114, 114))
+        self.assertEqual(tuple(canvas[160, 160]), (10, 200, 30))
+        # a box covering the whole image area inside the letterbox maps back to the full frame
+        box = (0.0, 40 / 320, 1.0, 280 / 320)
+        for got, want in zip(self.npu.unletterbox(box, 320, scale, left, top, 640, 480), (0.0, 0.0, 1.0, 1.0)):
+            self.assertAlmostEqual(got, want, places=5)
+        half = self.npu.unletterbox((0.25, 0.5, 0.75, 0.75), 320, scale, left, top, 640, 480)
+        for got, want in zip(half, (0.25, (160 - 40) / 240, 0.75, (240 - 40) / 240)):
+            self.assertAlmostEqual(got, want, places=5)
 
     def test_pick_target_prefers_centred_target_classes(self):
         D = self.npu.Detection
@@ -732,7 +787,7 @@ def _board_npu() -> tuple[bool, str]:
     ok, why = npu.npu_available()
     if not ok:
         return False, why
-    files = [npu.MODELS_DIR / npu.EMBEDDER_SPEC.file, npu.MODELS_DIR / npu.DETECTOR_SPECS[npu.DETECTOR_VARIANT].file]
+    files = [npu.MODELS_DIR / npu.EMBEDDER_SPEC.file, npu.detector_model_path()]
     missing = [f.name for f in files if not f.is_file()]
     return (not missing), (f"models missing: {missing}" if missing else "ok")
 
@@ -750,7 +805,7 @@ class HexagonNpuLiveTests(unittest.TestCase):
         import npu
         cls.np, cls.npu = np, npu
         cls.embedder = npu.NpuEmbedder()
-        cls.detector = npu.NpuDetector()
+        cls.detector = npu.make_detector()
 
     def test_embedder_runs_on_npu_and_is_unit_norm(self):
         import time
@@ -787,6 +842,30 @@ class HexagonNpuLiveTests(unittest.TestCase):
         print(f"\n  NPU detector ({self.detector.variant}): {ms:.2f} ms/frame, {len(dets)} detections on grey")
         self.assertIsInstance(dets, list)
         self.assertLess(ms, 40.0)
+
+    def test_yolo_detects_on_ultralytics_sample(self):
+        import glob
+        import importlib.util
+        from PIL import Image
+        if not self.npu.DETECTOR_VARIANT.startswith("yolo"):
+            self.skipTest("detector is not YOLO")
+        spec = importlib.util.find_spec("ultralytics")
+        if spec is None:
+            self.skipTest("ultralytics not installed")
+        bus = glob.glob(str(Path(spec.origin).parent / "assets" / "bus.jpg"))
+        if not bus:
+            self.skipTest("ultralytics sample image missing")
+        det = self.npu.YoloDetector(all_classes=True)
+        self.assertEqual(det.device, "npu", det.info())
+        img = Image.open(bus[0]).convert("RGB")
+        found = det.detect(img)
+        labels = {d.label for d in found}
+        self.assertIn("person", labels, found)
+        self.assertIn("bus", labels, found)
+        for d in found:
+            self.assertTrue(0.0 <= d.box[0] < d.box[2] <= 1.0 and 0.0 <= d.box[1] < d.box[3] <= 1.0, d)
+        best_bus = max((d for d in found if d.label == "bus"), key=lambda d: d.score)
+        self.assertGreater(best_bus.box[2] - best_bus.box[0], 0.7)  # the bus spans most of the 810x1080 frame width
 
 
 if __name__ == "__main__":

@@ -5,6 +5,9 @@ Pillow>=10.0
 # Hexagon NPU runtime (npu.py). The QNN delegate comes from Qualcomm's PPA on the board:
 #   sudo add-apt-repository ppa:ubuntu-qcom-iot/qcom-ppa && sudo apt install qairt-libs qairt-dsp-binaries
 ai-edge-litert>=2.0; sys_platform == "linux" and platform_machine == "aarch64"
+# YOLO object detector (npu.py). Install after torch/torchvision below so pip keeps the CPU wheels.
+# The NPU .tflite is produced by ./export_yolo.sh (separate TensorFlow venv in ~/yolo_export).
+ultralytics>=8.4; sys_platform == "linux" and platform_machine == "aarch64"
 # Board only (aarch64): the PyPI torchvision wheel is CUDA-built and fails on the VENTUNO Q.
 #   pip install torch==2.14.1 executorch==1.5.1 --extra-index-url https://download.pytorch.org/whl/cpu
 #   pip install --no-deps --force-reinstall torchvision==0.29.1+cpu --index-url https://download.pytorch.org/whl/cpu

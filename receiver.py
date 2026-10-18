@@ -28,7 +28,7 @@ One process, one port (0.0.0.0:5000):
   POST /api/cad/fetch                {"raw_name": "...", "force": true} resolve + (re)harvest the CAD model, with attribution
   GET  /static/...                   static files, incl. cached GLBs in static/models/
 
-Pipeline per frame: EfficientDet-Lite2 int8 object detection on the Hexagon NPU (npu.py; phones, bottles/cans) ->
+Pipeline per frame: Ultralytics YOLO26n object detection on the Hexagon NPU (npu.py; phones, bottles/cans) ->
 square crop around the target inside the central 60% box (temporally smoothed; the fixed center-60% crop when nothing
 is detected) -> 224x224 -> 1280-d MobileNetV3-Large embedding on the NPU (QNN TFLite delegate; ExecuTorch/XNNPACK or
 torch on the Arm CPU as fallbacks) -> L2-normalised vector -> cosine similarity against the multi-view prototypes
@@ -36,7 +36,7 @@ torch on the Arm CPU as fallbacks) -> L2-normalised vector -> cosine similarity 
 Router socket (STM32 firmware untouched), background 3D CAD retrieval and physical pose estimation (pose.py).
 
 Environment (all optional): KAMIKAZE_HOST/PORT, KAMIKAZE_BANK, KAMIKAZE_EMBED_BACKEND (auto|npu|executorch|torch),
-KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (lite2|lite0), KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
+KAMIKAZE_DETECT_CROP (1|0), KAMIKAZE_DETECTOR (yolo26n|yolo11n|lite2|lite0), KAMIKAZE_DETECT_SCORE, KAMIKAZE_DETECTOR_CPU (0|1), KAMIKAZE_NPU (1|0),
 KAMIKAZE_EMBED_PRECISION (fp16|fp32), KAMIKAZE_TORCH_THREADS, KAMIKAZE_T_IDENT/T_SEARCH/MARGIN,
 KAMIKAZE_LOG_FRAMES (1|0), KAMIKAZE_MODE (training|deployment), KAMIKAZE_PREVIEW (1|0), KAMIKAZE_LED_HEARTBEAT (s).
 
@@ -1713,14 +1713,14 @@ def make_server(pipeline: Pipeline, host: str = HOST, port: int = PORT) -> Threa
 
 
 def build_detector():
-    """EfficientDet-Lite object detector on the Hexagon NPU; None (fixed center crop) if the NPU is unavailable,
-    unless KAMIKAZE_DETECTOR_CPU=1 accepts the slower CPU detector."""
+    """YOLO (KAMIKAZE_DETECTOR, default yolo26n) or EfficientDet-Lite object detector on the Hexagon NPU; None (fixed
+    center crop) if the NPU is unavailable, unless KAMIKAZE_DETECTOR_CPU=1 accepts the slower CPU detector."""
     ok, why = npu_mod.npu_available()
     if not ok and os.environ.get("KAMIKAZE_DETECTOR_CPU", "0") != "1":
         log.warning("Object detector off (NPU unavailable: %s); using the fixed center crop", why)
         return None
     try:
-        return npu_mod.NpuDetector()
+        return npu_mod.make_detector(npu_mod.DETECTOR_VARIANT, prefer_npu=ok)
     except Exception as exc:
         log.warning("Object detector unavailable, using the fixed center crop (%s: %s)", type(exc).__name__, exc)
         return None
