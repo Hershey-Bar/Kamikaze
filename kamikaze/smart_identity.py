@@ -5,7 +5,10 @@ from __future__ import annotations
 import collections
 import re
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 
 import citrus_classifier as citrus
@@ -72,8 +75,17 @@ class ScanEvidence:
             rgb = np.asarray(crop)
             h, w = rgb.shape[:2]
             scale = min(1.0, 320 / max(h, w))
-            small = cv2.resize(rgb, (max(4, round(w * scale)), max(4, round(h * scale))))
-            clarity = float(cv2.Laplacian(cv2.cvtColor(small, cv2.COLOR_RGB2GRAY), cv2.CV_64F).var())
+            if cv2 is not None:
+                small = cv2.resize(rgb, (max(4, round(w * scale)), max(4, round(h * scale))))
+                clarity = float(cv2.Laplacian(cv2.cvtColor(small, cv2.COLOR_RGB2GRAY), cv2.CV_64F).var())
+            else:
+                from PIL import Image
+                img = Image.fromarray(rgb)
+                sw, sh = max(4, round(w * scale)), max(4, round(h * scale))
+                small = np.asarray(img.resize((sw, sh), Image.Resampling.BILINEAR))
+                gray = 0.299 * small[..., 0] + 0.587 * small[..., 1] + 0.114 * small[..., 2]
+                lap = (gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:] - 4 * gray[1:-1, 1:-1])
+                clarity = float(lap.var()) if lap.size else 0.0
             key = view if view in ("front", "back", "side") else "front"
             if key not in self.crops or clarity > self.crops[key][0]:
                 self.crops[key] = (clarity, small.copy())

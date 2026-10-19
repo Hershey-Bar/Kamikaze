@@ -16,7 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+_FILE_PARENT = Path(__file__).resolve().parent
+ROOT = _FILE_PARENT.parent if _FILE_PARENT.name == "kamikaze" else _FILE_PARENT
 DB_PATH = ROOT / "models" / "devices_db.json"
 PHONE_TIERS = ("pro max", "pro", "plus", "ultra", "mini")
 DIM_TOL_MM = 2.0

@@ -19,8 +19,17 @@ import zipfile
 from http.client import HTTPConnection
 from pathlib import Path
 from unittest import mock
+import sys
 
-import cv2
+_ROOT = Path(__file__).resolve().parent.parent
+for _p in (_ROOT, _ROOT / "kamikaze", _ROOT / "tests", _ROOT / "iot_artifacts"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 from PIL import Image
 

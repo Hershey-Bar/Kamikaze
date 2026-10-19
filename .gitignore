@@ -3,8 +3,32 @@ __pycache__/
 *$py.class
 .vscode/
 build/
+dist/
 *.tmp
 .DS_Store
+
+# Python packaging
+*.egg-info/
+.eggs/
+
+# Virtual environments (any name)
+venv/
+.venv/
+env/
+
+# Pytest / test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+*.lcov
+
+# Local testing recordings and captured frames
+tests/recordings/
+tests/frames/
+tools/recordings/
+tools/frames/
+
+# Board model artifacts — rebuilt by scripts/
 static/models/*.glb
 static/vendor/
 models/*.pte
@@ -13,7 +37,11 @@ model.pte
 enrolled_classes.pt
 enrolled_classes.*.bak.pt
 *.part
+
+# Secrets — never commit
 .env
+
+# Static assets generated at runtime
 static/models/*.json
 static/models/base/
 static/models/CREDITS.md

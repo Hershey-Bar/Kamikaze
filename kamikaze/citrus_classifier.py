@@ -26,8 +26,57 @@ from __future__ import annotations
 import os
 import re
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
+from PIL import Image
+
+
+def _resize(arr: np.ndarray, dsize: tuple[int, int]) -> np.ndarray:
+    if cv2 is not None:
+        return cv2.resize(arr, dsize, interpolation=getattr(cv2, "INTER_AREA", None))
+    img = Image.fromarray(arr)
+    return np.asarray(img.resize(dsize, Image.Resampling.BILINEAR))
+
+
+def _rgb_to_hsv(arr: np.ndarray) -> np.ndarray:
+    if cv2 is not None:
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    rgb = arr.astype(np.float32) / 255.0
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mx = rgb.max(axis=-1)
+    mn = rgb.min(axis=-1)
+    delta = mx - mn
+    safe = np.where(delta > 1e-6, delta, 1.0)
+    h = np.where(mx == r, ((g - b) / safe) % 6.0, np.where(mx == g, (b - r) / safe + 2.0, (r - g) / safe + 4.0)) / 6.0
+    h = (np.where(delta > 1e-6, h, 0.0) % 1.0) * 180.0
+    s = np.where(mx > 1e-6, delta / np.where(mx > 1e-6, mx, 1.0), 0.0) * 255.0
+    v = mx * 255.0
+    return np.stack([h, s, v], axis=-1).astype(np.uint8)
+
+
+def _rgb_to_lab(arr: np.ndarray) -> np.ndarray:
+    if cv2 is not None:
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    # Fast RGB->LAB conversion conforming to OpenCV uint8 scale
+    rgb = arr.astype(np.float32) / 255.0
+    # sRGB to linear RGB
+    mask = rgb > 0.04045
+    linear = np.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+    # Matrix mult to XYZ (D65)
+    x = linear[..., 0] * 0.412453 + linear[..., 1] * 0.357580 + linear[..., 2] * 0.180423
+    y = linear[..., 0] * 0.212671 + linear[..., 1] * 0.715160 + linear[..., 2] * 0.072169
+    z = linear[..., 0] * 0.019334 + linear[..., 1] * 0.119193 + linear[..., 2] * 0.950227
+    # Normalize by D65 white point
+    x, y, z = x / 0.95047, y / 1.00000, z / 1.08883
+    f = lambda t: np.where(t > 0.008856, t ** (1.0 / 3.0), (7.787 * t) + (16.0 / 116.0))
+    fx, fy, fz = f(x), f(y), f(z)
+    L = np.clip(116.0 * fy - 16.0, 0, 100) * (255.0 / 100.0)
+    a = np.clip(500.0 * (fx - fy) + 128.0, 0, 255)
+    b_val = np.clip(200.0 * (fy - fz) + 128.0, 0, 255)
+    return np.stack([L, a, b_val], axis=-1).astype(np.uint8)
 
 FLAVORS = ("lime", "lemon", "grapefruit", "orange")
 WORDS = {
@@ -131,7 +180,7 @@ def _surface_image(rgb: np.ndarray, bbox=None) -> np.ndarray:
     h, w = arr.shape[:2]
     if max(h, w) > SIDE:
         s = SIDE / max(h, w)
-        arr = cv2.resize(arr, (max(4, int(round(w * s))), max(4, int(round(h * s)))), interpolation=cv2.INTER_AREA)
+        arr = _resize(arr, (max(4, int(round(w * s))), max(4, int(round(h * s)))))
         h, w = arr.shape[:2]
     return np.ascontiguousarray(arr)
 
@@ -144,8 +193,8 @@ def surface_pixels(rgb: np.ndarray, bbox=None) -> tuple[np.ndarray, np.ndarray, 
     cy, cx = (h - 1) / 2.0, (w - 1) / 2.0
     ry, rx = max(1.0, ELLIPSE * h / 2.0), max(1.0, ELLIPSE * w / 2.0)
     ellipse = ((yy - cy) / ry) ** 2 + ((xx - cx) / rx) ** 2 <= 1.0
-    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-    lab = cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)
+    hsv = _rgb_to_hsv(arr)
+    lab = _rgb_to_lab(arr)
     s, v = hsv[..., 1], hsv[..., 2]
     keep = ellipse & ~((v > GLARE_V) & (s < GLARE_S)) & ~(v < INK_V)
     return hsv[keep], lab[keep], int(keep.sum())
@@ -158,8 +207,8 @@ def kirkland_color_evidence(rgb: np.ndarray, bbox=None) -> dict:
     # The old ellipse missed artwork above/below the centre. Keep the cylindrical middle, excluding the lid/base.
     surface = arr[max(0, round(h * 0.18)):max(1, round(h * 0.90)),
                   max(0, round(w * 0.20)):max(1, round(w * 0.80))]
-    hsv = cv2.cvtColor(surface, cv2.COLOR_RGB2HSV).astype(np.float32)
-    lab = cv2.cvtColor(surface, cv2.COLOR_RGB2LAB).astype(np.float32)
+    hsv = _rgb_to_hsv(surface).astype(np.float32)
+    lab = _rgb_to_lab(surface).astype(np.float32)
     hue, sat, value = hsv[..., 0], hsv[..., 1], hsv[..., 2]
     a, b = lab[..., 1] - 128.0, lab[..., 2] - 128.0
     chroma = (sat >= 22) & (value >= 55) & (np.hypot(a, b) >= 6)
@@ -208,10 +257,17 @@ def color_evidence(rgb: np.ndarray, bbox=None) -> dict:
     hsv_c, lab_c = hsv[chroma], lab[chroma].astype(np.float32)
     ab = np.ascontiguousarray(lab_c[:, 1:3] - 128.0)
     k = min(K, n)
-    cv2.setRNGSeed(0)
-    _, labels, _ = cv2.kmeans(ab, k, None, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5), 3,
-                              cv2.KMEANS_PP_CENTERS)
-    labels = labels.ravel()
+    if cv2 is not None:
+        cv2.setRNGSeed(0)
+        _, labels, _ = cv2.kmeans(ab, k, None, (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5), 3,
+                                  cv2.KMEANS_PP_CENTERS)
+        labels = labels.ravel()
+    else:
+        try:
+            from scipy.cluster.vq import kmeans2
+            _, labels = kmeans2(ab, k, minit="points", seed=0)
+        except Exception:
+            labels = np.zeros(len(ab), dtype=np.int32)
     scores = dict(zero)
     for c in range(k):
         m = labels == c

@@ -40,8 +40,34 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-import msgpack
-from mcp.server.fastmcp import FastMCP
+# Ensure kamikaze/ package directory is on sys.path
+_BASE_DIR = Path(__file__).resolve().parent
+_KAMIKAZE_DIR = _BASE_DIR / "kamikaze"
+if _KAMIKAZE_DIR.is_dir() and str(_KAMIKAZE_DIR) not in sys.path:
+    sys.path.insert(0, str(_KAMIKAZE_DIR))
+if str(_BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(_BASE_DIR))
+
+try:
+    import msgpack
+except ImportError:
+    msgpack = None
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    class FastMCP:  # type: ignore[no-redef]
+        """Lightweight stub when mcp package is not installed (e.g. local dev / non-MCP usage)."""
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+        def tool(self, *args: Any, **kwargs: Any) -> Any:
+            return lambda f: f
+        def prompt(self, *args: Any, **kwargs: Any) -> Any:
+            return lambda f: f
+        def resource(self, *args: Any, **kwargs: Any) -> Any:
+            return lambda f: f
+        def run(self, *args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("The 'mcp' package is required to run the MCP server over stdio. Run: pip install mcp")
 
 import netguard
 
@@ -489,16 +515,18 @@ class _RouterClient:
         raise TimeoutError(f"no reply to {method}")
 
     def call(self, method: str, params: list[Any]) -> bool:
+        if msgpack is None:
+            return False
         with self._lock:
             for attempt in (1, 2):
                 try:
                     if self._sock is None:
                         self._sock = self._connect()
                     return self._roundtrip(self._sock, method, params)
-                except (OSError, ConnectionError, TimeoutError, msgpack.UnpackException) as exc:
+                except (OSError, ConnectionError, TimeoutError, getattr(msgpack, "UnpackException", Exception)) as exc:
                     self._close()
                     if attempt == 2:
-                        log.warning("Router RPC %s failed: %s", method, exc)
+                        log.debug("Router RPC %s failed (expected on local laptop): %s", method, exc)
                         return False
             return False
 
@@ -510,10 +538,46 @@ def _clamp(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(value)))
 
 
+_last_sim_leds = None
+
+
+def _simulate_leds(r: int, g: int, b: int, brightness: int, count: int) -> None:
+    """Simulate the 8 Modulino Pixels in stderr when hardware is absent (local dev / laptop mode)."""
+    global _last_sim_leds
+    if os.environ.get("KAMIKAZE_SIMULATE_LEDS", "1") == "0":
+        return
+    state = (r, g, b, brightness, count)
+    if state == _last_sim_leds:
+        return
+    _last_sim_leds = state
+
+    if r > 180 and g > 100 and b < 80:
+        c, name = "\033[93m", "AMBER"
+    elif g > 130 and r < 120:
+        c, name = "\033[92m", "GREEN"
+    elif b > 130 and g > 130 and r < 100:
+        c, name = "\033[96m", "CYAN"
+    elif r > 150 and g < 100:
+        c, name = "\033[91m", "RED"
+    elif b > 150 and r < 100:
+        c, name = "\033[94m", "BLUE"
+    else:
+        c, name = "\033[97m", "WHITE"
+    reset = "\033[0m"
+    blocks = "".join(f"{c}●{reset} " if i < count else "○ " for i in range(8))
+    sys.stderr.write(f"[LOCAL PIXELS] {blocks} ({name} x{count}, bri={brightness}%)\n")
+    sys.stderr.flush()
+
+
 def set_leds(r: int, g: int, b: int, brightness: int, count: int) -> bool:
-    """Drive the Modulino Pixels via MessagePack-RPC `set_pixels`; True once the router acknowledges."""
+    """Drive the Modulino Pixels via MessagePack-RPC `set_pixels`; True once the router acknowledges.
+    Falls back to simulated terminal LED display if hardware is absent (local laptop mode).
+    """
     params = [_clamp(r, 0, 255), _clamp(g, 0, 255), _clamp(b, 0, 255), _clamp(brightness, 0, 100), _clamp(count, 0, 8)]
-    return _router.call("set_pixels", params)
+    ok = _router.call("set_pixels", params)
+    if not ok:
+        _simulate_leds(r, g, b, brightness, count)
+    return ok
 
 
 @mcp.tool()

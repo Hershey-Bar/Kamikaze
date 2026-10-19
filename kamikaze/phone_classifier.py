@@ -24,14 +24,18 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 
 import device_cache
 
 log = logging.getLogger("kamikaze.phone_classifier")
 
-ROOT = Path(__file__).resolve().parent
+_FILE_PARENT = Path(__file__).resolve().parent
+ROOT = _FILE_PARENT.parent if _FILE_PARENT.name == "kamikaze" else _FILE_PARENT
 EMB_PATH = ROOT / "models" / "phone_embeddings.npz"
 ISLAND_FRAC = 0.45
 EMB_SIZE = 224

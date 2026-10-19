@@ -12,7 +12,10 @@ import time
 import unittest
 from pathlib import Path
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 from PIL import Image
 
@@ -30,7 +33,21 @@ TARGETS = (
 
 
 def hsv_rgb(h, s, v):
-    return tuple(int(x) for x in cv2.cvtColor(np.uint8([[[h, s, v]]]), cv2.COLOR_HSV2RGB)[0, 0])
+    if cv2 is not None:
+        return tuple(int(x) for x in cv2.cvtColor(np.uint8([[[h, s, v]]]), cv2.COLOR_HSV2RGB)[0, 0])
+    hf = (h % 180) / 30.0
+    sf = s / 255.0
+    vf = v / 255.0
+    c = vf * sf
+    x = c * (1.0 - abs((hf % 2.0) - 1.0))
+    m = vf - c
+    if hf < 1: rgb = (c, x, 0)
+    elif hf < 2: rgb = (x, c, 0)
+    elif hf < 3: rgb = (0, c, x)
+    elif hf < 4: rgb = (0, x, c)
+    elif hf < 5: rgb = (x, 0, c)
+    else: rgb = (c, 0, x)
+    return tuple(int(round((val + m) * 255)) for val in rgb)
 
 
 def scene_with_can(print_rgb, size=(640, 480), box=(260, 110, 380, 370), background=(70, 75, 80)):
@@ -204,6 +221,8 @@ class CameraReliefTests(unittest.TestCase):
     def test_speculative_and_accessory_titles_rejected(self):
         import importlib.util
         path = Path(__file__).resolve().parent / "scripts" / "populate_device_cache.py"
+        if not path.is_file():
+            path = Path(__file__).resolve().parent.parent / "scripts" / "populate_device_cache.py"
         spec = importlib.util.spec_from_file_location("populate_device_cache", path)
         pop = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(pop)

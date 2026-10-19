@@ -40,7 +40,8 @@ except ImportError:
 
 needs_torch = unittest.skipIf(torch is None, "PyTorch not installed")
 ROUTER_SOCK = "/var/run/arduino-router.sock"
-ROOT = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent
+ROOT = _HERE.parent if _HERE.name == "tests" else _HERE
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".tif", ".tiff", ".heic"}
 TEST_PREFIX = "zz_test_"
 

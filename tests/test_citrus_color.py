@@ -2,7 +2,10 @@
 
 import unittest
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 
 import citrus_classifier as cc
@@ -10,8 +13,22 @@ import citrus_classifier as cc
 
 def hsv_rgb(h, s, v):
     """OpenCV-scale HSV (h 0-180, s / v 0-255) -> RGB tuple."""
-    px = np.uint8([[[h, s, v]]])
-    return tuple(int(x) for x in cv2.cvtColor(px, cv2.COLOR_HSV2RGB)[0, 0])
+    if cv2 is not None:
+        px = np.uint8([[[h, s, v]]])
+        return tuple(int(x) for x in cv2.cvtColor(px, cv2.COLOR_HSV2RGB)[0, 0])
+    hf = (h % 180) / 30.0
+    sf = s / 255.0
+    vf = v / 255.0
+    c = vf * sf
+    x = c * (1.0 - abs((hf % 2.0) - 1.0))
+    m = vf - c
+    if hf < 1: rgb = (c, x, 0)
+    elif hf < 2: rgb = (x, c, 0)
+    elif hf < 3: rgb = (0, c, x)
+    elif hf < 4: rgb = (0, x, c)
+    elif hf < 5: rgb = (x, 0, c)
+    else: rgb = (c, 0, x)
+    return tuple(int(round((val + m) * 255)) for val in rgb)
 
 
 def can(print_rgb, print_frac=0.35, h=160, w=80, seed=0, glare=True, ink=True, noise=6.0):

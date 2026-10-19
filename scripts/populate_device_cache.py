@@ -35,6 +35,7 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "kamikaze"))
 
 import numpy as np  # noqa: E402
 

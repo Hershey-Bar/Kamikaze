@@ -121,6 +121,7 @@ import mimetypes
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 import urllib.error
@@ -143,6 +144,11 @@ try:
     import cv2
 except ImportError:  # numpy fallback for the empty-scene gate
     cv2 = None
+
+# Ensure kamikaze/ package directory is on sys.path
+_KAMIKAZE_DIR = Path(__file__).resolve().parent / "kamikaze"
+if _KAMIKAZE_DIR.is_dir() and str(_KAMIKAZE_DIR) not in sys.path:
+    sys.path.insert(0, str(_KAMIKAZE_DIR))
 
 import cad_harvester
 import citrus_classifier
@@ -2582,7 +2588,7 @@ class Pipeline:
                         crop = citrus_crop(image, target, box or center_crop_box(*image.size))
                     pose["yaw"] = round(self.relative_yaw.update(crop), 1)
                     pose["source"], pose["relative"] = "surface-flow-relative", True
-                except (ValueError, cv2.error):
+                except (ValueError, getattr(cv2, "error", Exception)):
                     log.exception("Relative live pose failed")
                     pose = {**pose, "valid": False}
             if empty or dark or (self.detector is not None and not self._detection.get("target")):

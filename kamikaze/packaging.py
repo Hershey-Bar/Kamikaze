@@ -23,7 +23,10 @@ import urllib.parse
 import urllib.request
 from typing import Callable
 
-import cv2
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 import numpy as np
 
 import netguard
@@ -323,7 +326,7 @@ def build(product, extras: dict | None = None, hits: list[dict] | None = None) -
         try:
             jpeg = _get(url, MAX_IMAGE_BYTES, "image/jpeg")
             label, report = label_from_photo(jpeg, spec)
-        except (urllib.error.URLError, OSError, ValueError, PackagingError, cv2.error) as exc:
+        except (urllib.error.URLError, OSError, ValueError, PackagingError, getattr(cv2, "error", Exception)) as exc:
             log.info("OFF %s photo rejected: %s", hit.get("code"), exc)
             continue
         page = OFF_PAGE.format(code=hit["code"])

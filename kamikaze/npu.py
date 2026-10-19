@@ -41,7 +41,8 @@ import numpy as np
 
 log = logging.getLogger("kamikaze.npu")
 
-ROOT = Path(__file__).resolve().parent
+_FILE_PARENT = Path(__file__).resolve().parent
+ROOT = _FILE_PARENT.parent if _FILE_PARENT.name == "kamikaze" else _FILE_PARENT
 MODELS_DIR = Path(os.environ.get("KAMIKAZE_NPU_MODELS", ROOT / "models" / "npu"))
 NPU_ENABLED = os.environ.get("KAMIKAZE_NPU", "1") != "0"
 QNN_DELEGATE = os.environ.get("KAMIKAZE_QNN_DELEGATE", "libQnnTFLiteDelegate.so")

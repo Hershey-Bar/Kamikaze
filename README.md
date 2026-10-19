@@ -75,8 +75,8 @@ The cache contains both attributed downloads and explicitly estimated models; Fo
 and unfolded dimensions, but a closed-state GLB is not a verified unfolded mesh.
 
 ```bash
-# Existing tests live at the repository root, not in a tests/ directory.
-.venv/bin/python -m unittest discover -s . -p 'test_*.py'
+# Run unit tests across all suites
+python -m unittest discover -s tests -p 'test_*.py'
 ./run_receiver.sh --camera auto
 ```
 
@@ -152,15 +152,110 @@ receiver falls back to Ultralytics PyTorch on the CPU. `./export_yolo.sh path/to
 YOLO; set `KAMIKAZE_DETECTOR=best`. The STM32 firmware in
 `modulino_bridge/` is already flashed; it does not need to be reflashed and `arduino-router.service` must stay running.
 
-## Run
+## Operating Modes: Board (40 TOPS NPU) vs. Local Laptop
 
+Kamikaze is engineered with dual-mode execution logic, allowing it to run either natively on the **Arduino VENTUNO Q** physical edge hardware or locally on developer laptops (Windows, macOS, Linux).
+
+> [!NOTE]
+> **Performance Trade-Off:** The Arduino VENTUNO Q leverages its Qualcomm Dragonwing QCS8275 SoC with a dedicated **Hexagon Tensor NPU delivering up to 40 TOPS**, executing MobileNetV3-L embedding in ~0.9 ms, DINOv2 ViT-S/14 in ~20 ms, and YOLO-World detection in ~19 ms. 
+> Running in **Local Laptop Mode** relies on host CPU/GPU execution without access to the 40 TOPS Hexagon NPU; inference speeds will be substantially slower (DINOv2 CPU runs ~730 ms, YOLO CPU ~160–200 ms). However, all classification, zero-touch Smart Kiosk logic, CAD resolution, and UI features function identically.
+
+---
+
+### Mode A: Arduino VENTUNO Q Board Mode (Production Edge AI)
+
+In Board Mode, the full physical pipeline is active:
+1. **Camera Capture:** Logitech Brio 101 plugged into the board's USB 3.0 Type-A port (`/dev/video0`, V4L2 MJPG 1920x1080 @ 30 FPS).
+2. **NPU Acceleration:** Qualcomm Hexagon NPU executes YOLO-World object detection and DINOv2 / MobileNetV3 embeddings via the QNN TFLite delegate.
+3. **Physical Actuation:** Real Modulino Pixels RGB LEDs driven via MessagePack-RPC over `/var/run/arduino-router.sock` through the STM32H5F5 Zephyr co-processor.
+4. **Physical Button:** On-board User Button on `GPIO_79` (`/dev/gpiochip2`).
+
+#### Running on the VENTUNO Q:
 ```bash
-# board (Brio plugged into the USB 3.0 Type-A port)
-./run_receiver.sh                        # = receiver.py --camera auto (first USB UVC camera, e.g. /dev/video0)
-./run_receiver.sh --camera /dev/video0   # explicit device; --cam-width/--cam-height/--cam-fps (default 1920/1080/30)
-# Windows: only the dashboard
-adb forward tcp:5000 tcp:5000            # then open http://localhost:5000
+# 1. SSH into the board or attach via ADB shell
+ssh arduino@ventunoq.local   # or: adb shell
+
+# 2. Navigate to project & activate board venv
+cd ~/hackathon_iot
+source .venv/bin/activate
+
+# 3. Launch the receiver with the on-board camera
+./run_receiver.sh                        # = receiver.py --camera auto (/dev/video0)
+# Or specify camera explicitly:
+./run_receiver.sh --camera /dev/video0 --cam-width 1920 --cam-height 1080 --cam-fps 30
 ```
+
+#### Viewing Dashboard on Host Laptop:
+```powershell
+# From your host developer machine (Windows/Mac/Linux):
+adb forward tcp:5000 tcp:5000
+
+# Open your browser at:
+# http://localhost:5000
+```
+
+---
+
+### Mode B: Local Laptop / Dev Hardware Mode (Testing & Development)
+
+In Local Mode, no Arduino VENTUNO Q or Modulino hardware is required:
+1. **Camera Options:**
+   - **Integrated Webcam:** Use `--camera auto` or `--camera 0` to capture directly from your laptop's built-in webcam or USB camera.
+   - **Headless / HTTP Ingest:** Use `--camera none` to run without a local camera. Frames can be piped using `tools/stream_cam.py` or replayed using `tools/replay_frames.py`.
+   - **Mock Test Server:** Use `tools/local_test_server.py` for ultra-lightweight UI/dashboard development without loading heavy AI vision models.
+2. **Hardware Fallbacks:**
+   - **NPU -> CPU/GPU:** Automatically uses PyTorch / ONNX / CPU execution when Hexagon NPU drivers are absent.
+   - **Modulino Pixels Emulation:** When `/var/run/arduino-router.sock` is absent, Modulino LED signals are intercepted and rendered in real-time as an ASCII/ANSI visualizer in your terminal:
+     `[LOCAL PIXELS] ● ● ● ● ● ○ ○ ○  (AMBER x5, bri=15%)`
+   - **OpenCV / Pillow Fallback:** Citrus HSV/CIELAB color classification and image utilities fall back to pure NumPy and PIL if OpenCV is not installed.
+
+#### 1. Setup Local Environment:
+```bash
+# Clone the repository
+git clone https://github.com/Hershey-Bar/Kamikaze.git
+cd Kamikaze
+
+# Populate offline device CAD cache (generates calibrated 3D meshes for 38 devices)
+python scripts/populate_device_cache.py --offline --no-embeddings
+
+# Install dependencies (choose your platform):
+# Option 1: Standard local testing dependencies
+pip install -r requirements-local.txt
+
+# Option 2: Full local suite (includes PyTorch, torchvision, rapidocr-onnxruntime)
+pip install -r requirements.txt
+```
+
+#### 2. Running Locally with Laptop Webcam:
+```bash
+# Start receiver with local webcam (index 0 or auto)
+python receiver.py --camera auto
+
+# Open http://localhost:5000 in your browser
+```
+
+#### 3. Running Headless with Ingest or Frame Replay:
+```bash
+# Terminal 1: Start receiver in headless mode (no local camera grab)
+python receiver.py --camera none
+
+# Terminal 2: Stream your laptop webcam to the receiver over HTTP
+python tools/stream_cam.py --url http://127.0.0.1:5000
+
+# Or replay a specific sample image repeatedly:
+python tools/replay_frames.py --url http://127.0.0.1:5000 --fps 15 path/to/sample.jpg
+```
+
+#### 4. Running the Ultra-Fast Mock Server:
+For front-end UI tweaking, CAD `<model-viewer>` testing, or telemetry inspection without loading neural networks:
+```bash
+python tools/local_test_server.py --port 5000
+# Open http://localhost:5000 (serves live mock SSE events, 3D assets, and dummy camera frames)
+```
+
+---
+
+## Run (Detailed Flags)
 
 Video is captured **on the board**. `onboard_camera.py` opens the camera with OpenCV's V4L2 backend in MJPG mode
 (1920x1080 @ 30 fps) with colour conversion disabled, so each read is the camera's own JPEG: the capture thread hands it
@@ -634,7 +729,7 @@ cited `layout_json`).
 ## Tests
 
 ```bash
-.venv/bin/python -W ignore -m unittest test_kamikaze test_comprehensive test_full_suite test_cad_sources test_smart_citrus test_citrus_color test_smart_kiosk
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 `test_smart_kiosk` checks the populated device cache (every device within +-2 mm), so run the populate script first.
