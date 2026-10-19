@@ -1,0 +1,582 @@
+{
+  "snapshot_date": "2026-10-18",
+  "source_commit": "10de309b67393228c40f366fe318c725e0dfe3ad",
+  "hardware": "Arduino VENTUNO Q / QCS8275",
+  "os": "Ubuntu 24.04.4 LTS ARM64",
+  "python": "3.12",
+  "backup": {
+    "verified": true,
+    "archive": "minimal.tar.gz",
+    "sha256": "f4da4be42fd369db50c9472580b7749324662111cfba63633f95ea7804ddf833",
+    "archive_bytes": 364418346,
+    "verified_entries": 515,
+    "includes": [
+      "models",
+      "static/models",
+      "static/vendor",
+      "enrolled_classes.pt",
+      ".env"
+    ],
+    "source_bytes": 457623664,
+    "private": true,
+    "git_ignored_path": "board_backups/ventunoq-20261018/minimal.tar.gz"
+  },
+  "asset_inventory": [
+    {
+      "path": "static/models/iphone_16_pro.glb",
+      "bytes": 495288,
+      "sha256": "fc902137369beb7e4ab0cb561e4cfb59e525014ef8825694273a537b6e0eb26d"
+    },
+    {
+      "path": "static/models/iphone_16_pro_max.glb",
+      "bytes": 960100,
+      "sha256": "32e46929eac1965233613a0a66c264c3db03a1d479ff898bf26c7e727f0443c1"
+    },
+    {
+      "path": "static/models/galaxy_s21.glb",
+      "bytes": 68844,
+      "sha256": "17ad6b5ba0f9d3975beb8a1ddc20dbf04f7234f2993496a0ae042e9ea2fcf15c"
+    },
+    {
+      "path": "static/models/galaxy_s23.glb",
+      "bytes": 203404,
+      "sha256": "829ef82752eb34104b86f52b1823c6514136d468b1b85f6bd7f33a2ad5c6f18e"
+    },
+    {
+      "path": "static/models/kirkland_grapefruit_can.glb",
+      "bytes": 10335856,
+      "sha256": "6aa64a397ed17f149d47558262d761ec7991e04854b010d4a73e1682005b01b2"
+    },
+    {
+      "path": "static/models/galaxy_s21_ultra.glb",
+      "bytes": 92240,
+      "sha256": "0b66ec6e3a46b0ed151a0542cfca4b77b2c69bb267cc384a9c1631bafaf09be1"
+    },
+    {
+      "path": "static/models/samsung_galaxy_z_fold_3.glb",
+      "bytes": 68868,
+      "sha256": "40a140871650b330096190f80db0db8b09a4cd0af447549143d1fc0f7f1ef2b2"
+    },
+    {
+      "path": "static/models/galaxy_s23_plus.glb",
+      "bytes": 61740,
+      "sha256": "0a31eccbfa97730b26c2d4b20be89f10e7330ef100d23f28d559877afb9c9ced"
+    },
+    {
+      "path": "static/models/iphone_14_pro.glb",
+      "bytes": 1103736,
+      "sha256": "978f0bf8ddf81639b5f8d40d9fb4a5d3b2ddad925ded4e58275c65f934634111"
+    },
+    {
+      "path": "static/models/galaxy_s21_plus.glb",
+      "bytes": 68880,
+      "sha256": "93c96f88faf3c72c4afd31c61347a3e61542161a3a1fd9972e85993a778e1f0d"
+    },
+    {
+      "path": "static/models/kirkland_lime_355ml_can.glb",
+      "bytes": 6017584,
+      "sha256": "3ace9091dc0a368cc2980f24eead728fe335b97517eb0cd93068cfa8960ede6c"
+    },
+    {
+      "path": "static/models/kirkland_lemon_sparkling_water_355ml_can.glb",
+      "bytes": 11999444,
+      "sha256": "f4c5b6f76bedca41bf0faf217e4991be9472c96fa698512d49bb76649be50f34"
+    },
+    {
+      "path": "static/models/iphone_15_pro.glb",
+      "bytes": 1421876,
+      "sha256": "0a1d83b2dbb83a1e464e4746ff84a4c718019c47290358575eea72745f7bfa36"
+    },
+    {
+      "path": "static/models/kirkland_sparkling_water_lime_can.glb",
+      "bytes": 6017584,
+      "sha256": "3ace9091dc0a368cc2980f24eead728fe335b97517eb0cd93068cfa8960ede6c"
+    },
+    {
+      "path": "static/models/samsung_galaxy_z_fold_6.glb",
+      "bytes": 61756,
+      "sha256": "3b3db525ba673d2123ac6cc08aab35c7241b70d7bf72befc361c8bbc1068d00e"
+    },
+    {
+      "path": "static/models/iphone_15_pro_max.glb",
+      "bytes": 254116,
+      "sha256": "cbd211403a56d13b9ceebd68527e8055e78a22968fefcde891d44f729f3a78d5"
+    },
+    {
+      "path": "static/models/kirkland_grapefruit_sparkling_water_can.glb",
+      "bytes": 10335856,
+      "sha256": "6aa64a397ed17f149d47558262d761ec7991e04854b010d4a73e1682005b01b2"
+    },
+    {
+      "path": "static/models/iphone_13_pro_max.glb",
+      "bytes": 705364,
+      "sha256": "fec747201ae152befbd9c3ff36b80f8998445a0b62f95c325ee2521ee0728740"
+    },
+    {
+      "path": "static/models/kirkland_lime_sparkling_water_355ml_can.glb",
+      "bytes": 6017584,
+      "sha256": "3ace9091dc0a368cc2980f24eead728fe335b97517eb0cd93068cfa8960ede6c"
+    },
+    {
+      "path": "static/models/iphone_16.glb",
+      "bytes": 201148,
+      "sha256": "052a308df5b1db8d8cd1aaabaf91c55dde396c096a0946955fbde665974ae6f3"
+    },
+    {
+      "path": "static/models/galaxy_s20.glb",
+      "bytes": 68848,
+      "sha256": "64cc09f7d54d0e01d1ec1a3ca5c9ab742e23b205da1bd638126ce67a4c2d4b73"
+    },
+    {
+      "path": "static/models/galaxy_s20_ultra.glb",
+      "bytes": 92228,
+      "sha256": "4c9d43f926fcf2626edaf82c37cbd39c63f0f0b66a3bdfc49a58cf82aa8a2421"
+    },
+    {
+      "path": "static/models/galaxy_s22_plus.glb",
+      "bytes": 68864,
+      "sha256": "9bce889f6f52dc4edea91b652882f3178b6020d18050d0e1e766f9561fe699b7"
+    },
+    {
+      "path": "static/models/iphone_13_pro.glb",
+      "bytes": 95016,
+      "sha256": "e0dd5ff826712d6fae979d1603141da1d952ef61f40fda379beff643e8f06e96"
+    },
+    {
+      "path": "static/models/galaxy_s24_ultra.glb",
+      "bytes": 176164,
+      "sha256": "deef7e994b6a053f07bfa4cc4513c2e9c889916fbd7814405bd95f515c69e9b3"
+    },
+    {
+      "path": "static/models/galaxy_s22.glb",
+      "bytes": 68852,
+      "sha256": "fe08884b98a6172c5ef4a17ef919728d7279e61762ae1f4a9fe9d438b0946155"
+    },
+    {
+      "path": "static/models/kirkland_lime_sparkling_water_can.glb",
+      "bytes": 6017584,
+      "sha256": "3ace9091dc0a368cc2980f24eead728fe335b97517eb0cd93068cfa8960ede6c"
+    },
+    {
+      "path": "static/models/galaxy_s24.glb",
+      "bytes": 61736,
+      "sha256": "5d825b4f7039bb8e7f26e27ec8de3b443904a19055cced73401c17d4ab67d38a"
+    },
+    {
+      "path": "static/models/galaxy_s25_plus.glb",
+      "bytes": 387904,
+      "sha256": "5557b9d78eea212372ec17c29547302700483b87e351b9821ffc150980c0b743"
+    },
+    {
+      "path": "static/models/galaxy_s25.glb",
+      "bytes": 339392,
+      "sha256": "0b2b2121a75ce94f5c49d31726424f2f84c14a87a43ba1f8861db529a0602caa"
+    },
+    {
+      "path": "static/models/iphone_13.glb",
+      "bytes": 2433752,
+      "sha256": "bc088383450feb01478d1d892891473d4f9b830c14e1f65585172e304f0851cf"
+    },
+    {
+      "path": "static/models/galaxy_s25_ultra.glb",
+      "bytes": 562848,
+      "sha256": "6adf790b50be4cc8248884187e7f5d2482abdd11d77bc4885b87add1d002079c"
+    },
+    {
+      "path": "static/models/kirkland_lemon_sparkling_water_can.glb",
+      "bytes": 11999444,
+      "sha256": "f4c5b6f76bedca41bf0faf217e4991be9472c96fa698512d49bb76649be50f34"
+    },
+    {
+      "path": "static/models/iphone_14.glb",
+      "bytes": 945084,
+      "sha256": "7b9b29cff81d2365d90b1087494ff0116a96097073f14ec70aacc4d2181feff7"
+    },
+    {
+      "path": "static/models/galaxy_s20_plus.glb",
+      "bytes": 92232,
+      "sha256": "4f0819c54cb246354ae27e186059802729ea42dea9613caa80715ec47cdb3784"
+    },
+    {
+      "path": "static/models/samsung_galaxy_z_fold_4.glb",
+      "bytes": 68876,
+      "sha256": "6f04970a0543c660c73bbafcf4ed4e2f2bdf0cc2ce7df6f2757382aeae7ff1c1"
+    },
+    {
+      "path": "static/models/iphone_15_plus.glb",
+      "bytes": 1380836,
+      "sha256": "9995d590ed4a8f626a9ac41508802852a58fa5a62af76f9cd8bccf67906d16f3"
+    },
+    {
+      "path": "static/models/galaxy_s22_ultra.glb",
+      "bytes": 85124,
+      "sha256": "d65f7721d7a6f4bfb02493aef4b64244e1cccea4500684982901ca08b481e40e"
+    },
+    {
+      "path": "static/models/kirkland_grapefruit_sparkling_water_355m.glb",
+      "bytes": 10335856,
+      "sha256": "6aa64a397ed17f149d47558262d761ec7991e04854b010d4a73e1682005b01b2"
+    },
+    {
+      "path": "static/models/iphone_15.glb",
+      "bytes": 53276,
+      "sha256": "026c8d00faaa4b5f7e9d5e8051c4a3dbb75e17da2c7a7d3c46969204fb817a34"
+    },
+    {
+      "path": "static/models/iphone_11_pro.glb",
+      "bytes": 1041420,
+      "sha256": "04a822d6dc6a8efd8200a113e138efb928c4bde1ea5d1593d639ebc5c7b28784"
+    },
+    {
+      "path": "static/models/iphone_14_pro_max.glb",
+      "bytes": 1104576,
+      "sha256": "e6b0f404d5e3ce179e69d436560df045c113a2a4e2610693235e2a0dfd472c98"
+    },
+    {
+      "path": "static/models/galaxy_s23_ultra.glb",
+      "bytes": 211824,
+      "sha256": "e5842f91e9199299a998f74c3e8f2a537995a1fb9d53e141e411d3663939709f"
+    },
+    {
+      "path": "static/models/iphone_14_plus.glb",
+      "bytes": 221592,
+      "sha256": "f5f44d741cee6ba15ad5aa66f098fc81ae3cf5eac9179fbf18b26ae9360922fd"
+    },
+    {
+      "path": "static/models/iphone_13_mini.glb",
+      "bytes": 80192,
+      "sha256": "fa9847d169e622efd699ddfe984183d0a8ce326d0f9f0faf460fea914462e63a"
+    },
+    {
+      "path": "static/models/samsung_galaxy_z_fold_5.glb",
+      "bytes": 61748,
+      "sha256": "56ea312c89d0db367aab349b7993f1fb64f02e27baae4ef45fa41e772ed7a0b6"
+    },
+    {
+      "path": "static/models/iphone_16_plus.glb",
+      "bytes": 504572,
+      "sha256": "b2e14784112a425ef024997debfee3c3a86b263e01c04ef9932219f09a17e1b4"
+    },
+    {
+      "path": "static/models/kirkland_lemon_can.glb",
+      "bytes": 11999444,
+      "sha256": "f4c5b6f76bedca41bf0faf217e4991be9472c96fa698512d49bb76649be50f34"
+    },
+    {
+      "path": "static/models/galaxy_s24_plus.glb",
+      "bytes": 760656,
+      "sha256": "5f5b751bc45051bd94985120622a45736e584ba49a8e4f7730e4d8a278412e40"
+    },
+    {
+      "path": "static/models/kirkland_lemon_355ml_can.glb",
+      "bytes": 11999444,
+      "sha256": "f4c5b6f76bedca41bf0faf217e4991be9472c96fa698512d49bb76649be50f34"
+    },
+    {
+      "path": "static/models/library/kirkland_signature_sparkling_water_grapefruit_can.glb",
+      "bytes": 10335856,
+      "sha256": "6aa64a397ed17f149d47558262d761ec7991e04854b010d4a73e1682005b01b2"
+    },
+    {
+      "path": "static/models/library/kirkland_signature_sparkling_water_lemon_can.glb",
+      "bytes": 11999444,
+      "sha256": "f4c5b6f76bedca41bf0faf217e4991be9472c96fa698512d49bb76649be50f34"
+    },
+    {
+      "path": "static/models/library/kirkland_signature_sparkling_water_lime_can.glb",
+      "bytes": 6017584,
+      "sha256": "3ace9091dc0a368cc2980f24eead728fe335b97517eb0cd93068cfa8960ede6c"
+    },
+    {
+      "path": "models/mnv3_embed_fp16.pte",
+      "bytes": 14384128,
+      "sha256": "aef9b2f59007e18dca3073228940ce798fc1050eebc7d375514fe8d84e865915"
+    },
+    {
+      "path": "models/phone_embeddings.npz",
+      "bytes": 106800,
+      "sha256": "45151c6315d35bbabe9769294493b5b889d2581256b1cadb71ece3cd6bb7d786"
+    },
+    {
+      "path": "models/cad_cache/galaxy_z_fold_5.glb",
+      "bytes": 61748,
+      "sha256": "56ea312c89d0db367aab349b7993f1fb64f02e27baae4ef45fa41e772ed7a0b6"
+    },
+    {
+      "path": "models/cad_cache/iphone_16_pro.glb",
+      "bytes": 495288,
+      "sha256": "fc902137369beb7e4ab0cb561e4cfb59e525014ef8825694273a537b6e0eb26d"
+    },
+    {
+      "path": "models/cad_cache/iphone_16_pro_max.glb",
+      "bytes": 960100,
+      "sha256": "32e46929eac1965233613a0a66c264c3db03a1d479ff898bf26c7e727f0443c1"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s21.glb",
+      "bytes": 68844,
+      "sha256": "17ad6b5ba0f9d3975beb8a1ddc20dbf04f7234f2993496a0ae042e9ea2fcf15c"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s23.glb",
+      "bytes": 203404,
+      "sha256": "829ef82752eb34104b86f52b1823c6514136d468b1b85f6bd7f33a2ad5c6f18e"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s21_ultra.glb",
+      "bytes": 92240,
+      "sha256": "0b66ec6e3a46b0ed151a0542cfca4b77b2c69bb267cc384a9c1631bafaf09be1"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s23_plus.glb",
+      "bytes": 61740,
+      "sha256": "0a31eccbfa97730b26c2d4b20be89f10e7330ef100d23f28d559877afb9c9ced"
+    },
+    {
+      "path": "models/cad_cache/iphone_14_pro.glb",
+      "bytes": 1103736,
+      "sha256": "978f0bf8ddf81639b5f8d40d9fb4a5d3b2ddad925ded4e58275c65f934634111"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s21_plus.glb",
+      "bytes": 68880,
+      "sha256": "93c96f88faf3c72c4afd31c61347a3e61542161a3a1fd9972e85993a778e1f0d"
+    },
+    {
+      "path": "models/cad_cache/galaxy_z_fold_6.glb",
+      "bytes": 61756,
+      "sha256": "3b3db525ba673d2123ac6cc08aab35c7241b70d7bf72befc361c8bbc1068d00e"
+    },
+    {
+      "path": "models/cad_cache/iphone_15_pro.glb",
+      "bytes": 1421876,
+      "sha256": "0a1d83b2dbb83a1e464e4746ff84a4c718019c47290358575eea72745f7bfa36"
+    },
+    {
+      "path": "models/cad_cache/galaxy_z_fold_4.glb",
+      "bytes": 68876,
+      "sha256": "6f04970a0543c660c73bbafcf4ed4e2f2bdf0cc2ce7df6f2757382aeae7ff1c1"
+    },
+    {
+      "path": "models/cad_cache/iphone_15_pro_max.glb",
+      "bytes": 254116,
+      "sha256": "cbd211403a56d13b9ceebd68527e8055e78a22968fefcde891d44f729f3a78d5"
+    },
+    {
+      "path": "models/cad_cache/iphone_13_pro_max.glb",
+      "bytes": 705364,
+      "sha256": "fec747201ae152befbd9c3ff36b80f8998445a0b62f95c325ee2521ee0728740"
+    },
+    {
+      "path": "models/cad_cache/iphone_16.glb",
+      "bytes": 201148,
+      "sha256": "052a308df5b1db8d8cd1aaabaf91c55dde396c096a0946955fbde665974ae6f3"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s20.glb",
+      "bytes": 68848,
+      "sha256": "64cc09f7d54d0e01d1ec1a3ca5c9ab742e23b205da1bd638126ce67a4c2d4b73"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s20_ultra.glb",
+      "bytes": 92228,
+      "sha256": "4c9d43f926fcf2626edaf82c37cbd39c63f0f0b66a3bdfc49a58cf82aa8a2421"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s22_plus.glb",
+      "bytes": 68864,
+      "sha256": "9bce889f6f52dc4edea91b652882f3178b6020d18050d0e1e766f9561fe699b7"
+    },
+    {
+      "path": "models/cad_cache/iphone_13_pro.glb",
+      "bytes": 95016,
+      "sha256": "e0dd5ff826712d6fae979d1603141da1d952ef61f40fda379beff643e8f06e96"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s24_ultra.glb",
+      "bytes": 176164,
+      "sha256": "deef7e994b6a053f07bfa4cc4513c2e9c889916fbd7814405bd95f515c69e9b3"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s22.glb",
+      "bytes": 68852,
+      "sha256": "fe08884b98a6172c5ef4a17ef919728d7279e61762ae1f4a9fe9d438b0946155"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s24.glb",
+      "bytes": 61736,
+      "sha256": "5d825b4f7039bb8e7f26e27ec8de3b443904a19055cced73401c17d4ab67d38a"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s25_plus.glb",
+      "bytes": 387904,
+      "sha256": "5557b9d78eea212372ec17c29547302700483b87e351b9821ffc150980c0b743"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s25.glb",
+      "bytes": 339392,
+      "sha256": "0b2b2121a75ce94f5c49d31726424f2f84c14a87a43ba1f8861db529a0602caa"
+    },
+    {
+      "path": "models/cad_cache/iphone_13.glb",
+      "bytes": 2433752,
+      "sha256": "bc088383450feb01478d1d892891473d4f9b830c14e1f65585172e304f0851cf"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s25_ultra.glb",
+      "bytes": 212500,
+      "sha256": "d6959e53f2af8f2c03280c6e67f75d4af4a8437acc0ba66956ea644c5fde4a88"
+    },
+    {
+      "path": "models/cad_cache/galaxy_z_fold_3.glb",
+      "bytes": 68868,
+      "sha256": "40a140871650b330096190f80db0db8b09a4cd0af447549143d1fc0f7f1ef2b2"
+    },
+    {
+      "path": "models/cad_cache/iphone_14.glb",
+      "bytes": 945084,
+      "sha256": "7b9b29cff81d2365d90b1087494ff0116a96097073f14ec70aacc4d2181feff7"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s20_plus.glb",
+      "bytes": 92232,
+      "sha256": "4f0819c54cb246354ae27e186059802729ea42dea9613caa80715ec47cdb3784"
+    },
+    {
+      "path": "models/cad_cache/iphone_15_plus.glb",
+      "bytes": 1380836,
+      "sha256": "9995d590ed4a8f626a9ac41508802852a58fa5a62af76f9cd8bccf67906d16f3"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s22_ultra.glb",
+      "bytes": 85124,
+      "sha256": "d65f7721d7a6f4bfb02493aef4b64244e1cccea4500684982901ca08b481e40e"
+    },
+    {
+      "path": "models/cad_cache/iphone_15.glb",
+      "bytes": 53276,
+      "sha256": "026c8d00faaa4b5f7e9d5e8051c4a3dbb75e17da2c7a7d3c46969204fb817a34"
+    },
+    {
+      "path": "models/cad_cache/iphone_14_pro_max.glb",
+      "bytes": 1104576,
+      "sha256": "e6b0f404d5e3ce179e69d436560df045c113a2a4e2610693235e2a0dfd472c98"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s23_ultra.glb",
+      "bytes": 211824,
+      "sha256": "e5842f91e9199299a998f74c3e8f2a537995a1fb9d53e141e411d3663939709f"
+    },
+    {
+      "path": "models/cad_cache/iphone_14_plus.glb",
+      "bytes": 221592,
+      "sha256": "f5f44d741cee6ba15ad5aa66f098fc81ae3cf5eac9179fbf18b26ae9360922fd"
+    },
+    {
+      "path": "models/cad_cache/iphone_13_mini.glb",
+      "bytes": 80192,
+      "sha256": "fa9847d169e622efd699ddfe984183d0a8ce326d0f9f0faf460fea914462e63a"
+    },
+    {
+      "path": "models/cad_cache/iphone_16_plus.glb",
+      "bytes": 504572,
+      "sha256": "b2e14784112a425ef024997debfee3c3a86b263e01c04ef9932219f09a17e1b4"
+    },
+    {
+      "path": "models/cad_cache/galaxy_s24_plus.glb",
+      "bytes": 760656,
+      "sha256": "5f5b751bc45051bd94985120622a45736e584ba49a8e4f7730e4d8a278412e40"
+    },
+    {
+      "path": "models/npu/mobilenet_v3_large_embedder.tflite",
+      "bytes": 10889458,
+      "sha256": "11af3c560dfeed7737cb4c03c23bf52a8403020784192d4dea0b74862a12828d"
+    },
+    {
+      "path": "models/npu/efficientdet_lite2_int8.tflite",
+      "bytes": 7515971,
+      "sha256": "b3f50554cb0ea559e90328845f7d9ba4d13c8bff372914d24e06bc8bb72fa896"
+    },
+    {
+      "path": "models/npu/yolo26n_float32.tflite",
+      "bytes": 9831665,
+      "sha256": "9231dfcd4d13ce8f679bb25f3c2d510354602a156789ef0f180feff44bc84185"
+    },
+    {
+      "path": "models/npu/ppocrv4_det_320_float32.tflite",
+      "bytes": 4742480,
+      "sha256": "bd21f9c7e60336d36385ee62cc6f4d223985a1c761c1ade333e3c563f92ce714"
+    },
+    {
+      "path": "models/npu/efficientdet_lite0_int8.tflite",
+      "bytes": 4602795,
+      "sha256": "0720bf247bd76e6594ea28fa9c6f7c5242be774818997dbbeffc4da460c723bb"
+    },
+    {
+      "path": "models/npu/dinov2_vits14_pose_float32.tflite",
+      "bytes": 86598936,
+      "sha256": "556f22aa6264d043b338f1f040aa79e979cddc5863bbb5f03b90d1211a606d56"
+    },
+    {
+      "path": "models/npu/yolo11n_float32.tflite",
+      "bytes": 10646713,
+      "sha256": "71b7642308ae687c8c79c62de2d823f5aeb847adfc19774e8e42642548a43678"
+    },
+    {
+      "path": "models/npu/yolov8s-worldv2-kz_float32.tflite",
+      "bytes": 50009637,
+      "sha256": "25617b5f11786c95942d6d890b9ab7efe96e20d6d644a99690925d037ca6ceab"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/matplotlib/mpl-data/sample_data/topobathy.npz",
+      "bytes": 45224,
+      "sha256": "0244e03291702df45024dcb5cacbc4f3d4cb30d72dfa7fd371c4ac61c42b4fbf"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/matplotlib/mpl-data/sample_data/goog.npz",
+      "bytes": 22845,
+      "sha256": "400917cf30e6b664f7b0da93d7c745860d3aa9008da8b7f160d2dd12e6a318b1"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/matplotlib/mpl-data/sample_data/jacksboro_fault_dem.npz",
+      "bytes": 174061,
+      "sha256": "d493f50a33e82a4420494c54d1fca1539d177bdc27ab190bc5fe6e92f62fb637"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/rapidocr_onnxruntime/models/ch_PP-OCRv4_rec_infer.onnx",
+      "bytes": 10857958,
+      "sha256": "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/rapidocr_onnxruntime/models/ch_ppocr_mobile_v2.0_cls_infer.onnx",
+      "bytes": 585532,
+      "sha256": "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/rapidocr_onnxruntime/models/ch_PP-OCRv4_det_infer.onnx",
+      "bytes": 4745517,
+      "sha256": "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/onnxruntime/datasets/logreg_iris.onnx",
+      "bytes": 670,
+      "sha256": "8224784c98d73412d9fd99abcd57a38568bd590980d0fbe5916464531c52e8fc"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/onnxruntime/datasets/mul_1.onnx",
+      "bytes": 130,
+      "sha256": "71f431c4e9321ec6fbeb158d02ed240459a7dcc98673fa79a4f439ce42efaf10"
+    },
+    {
+      "path": ".venv/lib/python3.12/site-packages/onnxruntime/datasets/sigmoid.onnx",
+      "bytes": 103,
+      "sha256": "5340aba67a7e3475162ad794378af55f1718f55f9a5d74b4af60ecc7f7a624b6"
+    }
+  ],
+  "notes": [
+    "Source is preserved in Git. Private backup is local only, not uploaded to the public repository.",
+    "Credentials, raw enrollment vectors and owner-provided or licensed models remain in the private archive.",
+    "Virtual environments, intermediate exports and logs are reproducible and excluded.",
+    "This record confirms backup verification, not completion of a factory reset."
+  ]
+}

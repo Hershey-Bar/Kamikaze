@@ -22,3 +22,5 @@ static/models/library/
 # offline device CAD cache + phone embeddings: rebuilt on the board by scripts/populate_device_cache.py
 models/cad_cache/
 models/phone_embeddings.npz
+# Private recovery archives may contain credentials and local-only licensed assets.
+board_backups/

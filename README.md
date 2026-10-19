@@ -103,6 +103,37 @@ Logitech Brio (USB 3.0 on the board, /dev/video0, V4L2 MJPG 1920x1080 @ 30 fps) 
 
 ## Board setup (once)
 
+### Recovering the final board snapshot
+
+The 2026-10-18 recovery inventory is in `deployments/ventunoq-20261018.json`. Source code is in Git; the minimal private
+archive is at `board_backups\ventunoq-20261018\minimal.tar.gz` in the original Windows checkout. **The archive is ignored
+by Git and is not uploaded to this public repository.** It contains credentials, owner-provided scans, enrollment
+vectors, cached CAD with attribution, deployed neural models and the offline viewer library.
+Rebuildable virtual environments, intermediate exports and logs are not part of this minimal recovery payload.
+Keep this archive private and copy it separately when moving the project to another computer.
+
+Every archived file was checked against the board's SHA-256 inventory. The public inventory records
+the archive checksum and model checksums; the detailed private manifest and verification report sit beside the archive.
+The two `deployments/requirements-ventunoq-*-frozen.txt` files record the actual ARM64 Python 3.12 environments.
+
+After installing the correct vendor image and the Ubuntu/Qualcomm/Arduino system packages, clone this repository
+to `/home/arduino/hackathon_iot` on the trusted VENTUNO Q. From the original Windows checkout:
+
+```powershell
+$snapshot = Get-Content deployments\ventunoq-20261018.json -Raw | ConvertFrom-Json
+$archive = 'board_backups\ventunoq-20261018\minimal.tar.gz'
+if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $snapshot.backup.sha256) {
+    throw 'Backup checksum mismatch; do not restore'
+}
+adb push $archive /tmp/kamikaze-board-restore.tar.gz
+adb shell "tar -xzf /tmp/kamikaze-board-restore.tar.gz -C /home/arduino/hackathon_iot"
+adb forward tcp:5000 tcp:5000
+```
+
+Recreate the Python environment using the board setup below and the frozen dependency inventory, then start
+`./run_receiver.sh --camera auto`. A factory reset requires a vendor image specifically supporting the VENTUNO Q;
+an UNO Q image is not interchangeable. The recovery inventory documents a backup, not proof of a completed reset.
+
 ```bash
 cd ~/hackathon_iot
 python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
