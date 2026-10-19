@@ -1,0 +1,19 @@
+# requirements-local.txt — install this on any dev machine (Windows / Mac / Linux)
+# for running tools/local_test_server.py + tools/stream_cam.py without a board.
+#
+# Usage:
+#   python -m venv venv
+#   # Windows:   .\venv\Scripts\activate
+#   # Mac/Linux: source venv/bin/activate
+#   pip install -r requirements-local.txt
+
+# Core streaming / inference dependencies
+numpy>=1.26
+Pillow>=10.0
+opencv-python>=4.9       # webcam capture in tools/stream_cam.py
+requests>=2.31           # HTTP sender in tools/stream_cam.py
+msgpack>=1.0.8           # RPC protocol tests in tests/test_msgpack_test.py
+python-dotenv>=1.0       # auto-loads .env at startup (same as the real receiver)
+
+# Lightweight dev extras
+pytest>=8.0              # run: pytest tests/
